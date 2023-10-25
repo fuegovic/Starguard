@@ -1,1 +1,1 @@
-# Discord-GH-bot
+# Discord-GitHub-bot
