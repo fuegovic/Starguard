@@ -33,15 +33,3 @@ def callback():
 
 if __name__ == '__main__':
   app.run(host='0.0.0.0', port=8080)
-
-# need access token with public repo permission
-# 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
-# curl.exe -X PUT -H "Accept: application/vnd.github.v3+json" -H "Authorization: Bearer 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" https://api.github.com/user/starred/Berry-13/LibreChat-DiscordBot
-
-#curl.exe -X PUT -H "Accept: application/vnd.github.v3+json" -H "Authorization: Bearer ghu_niJ8KRzNY6LN6vJhcPw6tLmcQ9nbir3BWog0" https://api.github.com/user/starred/Berry-13/LibreChat-DiscordBot
-
-
-curl -H "Authorization: Bearer OAUTH-TOKEN" https://api.github.com/users/codertocat -I
-HTTP/2 200
-X-OAuth-Scopes: repo, user
-X-Accepted-OAuth-Scopes: user
