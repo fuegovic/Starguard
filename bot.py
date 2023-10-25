@@ -100,7 +100,7 @@ async def librechat(ctx: SlashContext):
     await ctx.send("Useful LibreChat links:", components=librechat)
 
 # ⭐ GitHub
-@slash_command(name='GitHub', description='⭐ GitHub Commands')
+@slash_command(name='github', description='⭐ GitHub Commands')
 async def docker(ctx: SlashContext):
     docker = [
         ActionRow(
