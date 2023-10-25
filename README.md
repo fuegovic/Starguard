@@ -9,5 +9,5 @@
 - 🫵Make the bot assign a role
 - 📃Make `requirements.txt`
 - 📝Document usage and configuration
-- ...
+- ... 👀
 - 🐋Put everything in a docker container for easier deployment 
