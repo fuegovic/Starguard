@@ -1,13 +1,8 @@
 import interactions #Interactions.py 5.10.0 
 # https://interactions-py.github.io/interactions.py
 from interactions import *
-#import bot_config
 import logging
 import os
-#import time
-#import asyncio
-#import subprocess
-#import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,7 +12,8 @@ REPO = os.getenv('GITHUB_REPO')
 ROLE = os.getenv('ROLE_ID')
 GTOKEN = os.getenv('GITHUB_TOKEN') 
 CLIENT_ID = os.getenv('CLIENT_ID')
-GITHUB_CLIENT_ID= os.getenv('GITHUB_CLIENT_ID')
+GITHUB_CLIENT_ID = os.getenv('GITHUB_CLIENT_ID')
+DOMAIN = os.getenv('DOMAIN')
 
 logging.basicConfig()
 cls_log = logging.getLogger('MyLogger')
@@ -111,18 +107,23 @@ async def docker(ctx: SlashContext):
             ),
             Button(
                 style=ButtonStyle.RED,
-                label="Stop",
-                custom_id="stop",
+                label="2",
+                custom_id="2",
             ),
             Button(
                 style=ButtonStyle.BLUE,
-                label="Update",
-                custom_id="update",
+                label="3",
+                custom_id="3",
             ),
             Button(
                 style=ButtonStyle.GREY,
-                label="Status",
-                custom_id="status",
+                label="4",
+                custom_id="4",
+            ),
+            Button(
+                style=ButtonStyle.GREY,
+                label="5",
+                custom_id="5",
             )
         )
     ]
@@ -136,7 +137,7 @@ async def start_callback(ctx: ComponentContext):
 
     await ctx.send(content=f'Discord Username = "{user}"\nDiscord User ID = "{userid}"\nDiscord User Permissions = "{user_perm}"\n')
 
-    oauth_url = f"https://github.com/login/oauth/authorize?client_id={GITHUB_CLIENT_ID}"
+    oauth_url = f"{DOMAIN}/login"
 
     await ctx.send(content=f"Please authorize me to access your connected accounts by clicking this button:", components=[ActionRow(Button(style=ButtonStyle.LINK, label="Authorize", url=oauth_url))])
 
