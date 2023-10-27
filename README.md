@@ -9,7 +9,7 @@
   - example:
   ![image](https://github.com/fuegovic/Discord-GH-bot/assets/32828263/86b90c99-48f4-4c13-9b96-df552b9b9466)
 - 🫵 Make the bot assign a role
-- 📃 Make `requirements.txt`
+- ~~📃 Make `requirements.txt`~~
 - 📝 Document usage and configuration
 - ... 👀
 - 🐋 Put everything in a docker container for easier deployment 
