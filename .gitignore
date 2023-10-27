@@ -160,3 +160,7 @@ cython_debug/
 #.idea/
 
 server/mongo-data/
+
+mongo-data/
+
+.vscode/

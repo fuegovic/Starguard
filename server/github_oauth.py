@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 
 load_dotenv()
 
-app = Flask('app')
-app.template_folder = 'html'
+app = Flask(__name__, template_folder='./html')
+app.template_folder = './html'
 app.secret_key = os.getenv('SECRET_KEY')
 oauth = OAuth(app)
 
