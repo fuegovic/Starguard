@@ -161,6 +161,6 @@ cython_debug/
 
 server/mongo-data/
 
-mongo-data/
+# mongo-data/
 
 .vscode/
