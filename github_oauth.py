@@ -69,7 +69,6 @@ def authorize():
                 'username': username,
                 'email': email,
                 'token': token,
-                'created_at': existing_user.get('created_at', current_time),
                 'updated_at': current_time,
             }
 
