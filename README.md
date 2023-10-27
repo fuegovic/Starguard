@@ -2,7 +2,8 @@
 
 ## To Do:
 - 🪧Properly build the GitHub OAuth API to handle various requests from the bot
-- 🤔 Make sur the API handles multiple users using the bot at once 
+- 🤔 Make sur the API handles multiple users using the bot at once
+- 🔎 Implement a periodic check of the starred users or something like that
 - ~~🖼️ Better page for successful login~~
 - 🖲️ Add functions to the bot (<ins>5 buttons max</ins>)
   - example:
