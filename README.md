@@ -12,4 +12,4 @@
 - ~~📃 Make `requirements.txt`~~
 - 📝 Document usage and configuration
 - ... 👀
-- 🐋 Put everything in a docker container for easier deployment 
+- ~~🐋 Put everything in a docker container for easier deployment~~
