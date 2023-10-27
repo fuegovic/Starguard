@@ -1,6 +1,29 @@
-version: "3.4"
-
 services:
+  discord-bot:
+    container_name: discord-bot
+    image: discord-bot
+    build:
+      context: .
+      dockerfile: Dockerfile_bot
+    restart: always
+    env_file:
+      - .env
+    networks:
+      - Discord-GH-bot
+
+  server:
+    container_name: server
+    image: server-discord-bot
+    ports:
+     - 8080:8080
+    build:
+      context: .
+      dockerfile: Dockerfile_server
+    restart: always
+    env_file:
+      - .env
+    networks:
+      - Discord-GH-bot
 
   mongodb:
     container_name: mongodb
@@ -8,9 +31,11 @@ services:
     ports:
       - 27017:27017
     volumes:
-      - ./mongo-data:/data/db
+      - ./server/mongo-data:/data/db
     command: mongod --noauth
     restart: always
+    networks:
+      - Discord-GH-bot
 
   mongo-express:
     container_name: mongo-express
@@ -24,3 +49,8 @@ services:
       ME_CONFIG_BASICAUTH_USERNAME: user
       ME_CONFIG_BASICAUTH_PASSWORD: password
     restart: always
+    networks:
+      - Discord-GH-bot
+
+networks:
+  Discord-GH-bot:
