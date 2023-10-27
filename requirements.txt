@@ -1,0 +1,5 @@
+Flask==2.3.2
+python-dotenv==1.0.0
+authlib==1.2.1
+pymongo==4.5.0
+Interactions.py==5.8.0
