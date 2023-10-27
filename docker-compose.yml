@@ -1,0 +1,26 @@
+version: "3.4"
+
+services:
+
+  mongodb:
+    container_name: mongodb
+    image: mongo
+    ports:
+      - 27017:27017
+    volumes:
+      - ./mongo-data:/data/db
+    command: mongod --noauth
+    restart: always
+
+  mongo-express:
+    container_name: mongo-express
+    image: mongo-express
+    ports:
+      - 8085:8081
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_MONGODB_PORT: 27017
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
+      ME_CONFIG_BASICAUTH_USERNAME: user
+      ME_CONFIG_BASICAUTH_PASSWORD: password
+    restart: always
