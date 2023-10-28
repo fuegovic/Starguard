@@ -1,7 +1,3 @@
-"""
-This module contains a Flask application for handling GitHub OAuth.
-"""
-
 import os
 from datetime import datetime, timezone
 from flask import Flask, request, render_template, url_for, session
@@ -25,10 +21,12 @@ DB = None
 try:
     CLIENT = MongoClient(host=os.getenv('MONGO_HOST'))
     DB = CLIENT.get_database(os.getenv('MONGO_DATABASE'))
-except pymongo.errors.ConnectionError as connection_error:
-    print(f"Error connecting to MongoDB: {connection_error}")
-except Exception as error:
-    print(f"An error occurred: {error}")
+except pymongo.errors.ConfigurationError as configuration_error:
+    print(f"Error connecting to MongoDB: {configuration_error}")
+except pymongo.errors.OperationFailure as operation_error:
+    print(f"Error connecting to MongoDB: {operation_error}")
+except pymongo.errors.ServerSelectionTimeoutError as timeout_error:
+    print(f"Server selection timeout error: {timeout_error}")
 
 github = oauth.register(
     name='github',

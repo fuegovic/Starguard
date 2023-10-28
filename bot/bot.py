@@ -1,7 +1,19 @@
-import interactions
-import logging
 import os
+import logging
 from dotenv import load_dotenv
+from interactions import (
+    Client,
+    Intents,
+    listen,
+    slash_command,
+    SlashContext,
+    ActionRow,
+    Button,
+    ButtonStyle,
+    ComponentContext,
+    component_callback,
+    Embed
+)
 
 load_dotenv()
 
@@ -18,8 +30,8 @@ logging.basicConfig()
 cls_log = logging.getLogger('MyLogger')
 cls_log.setLevel(logging.DEBUG)
 
-client = interactions.Client(
-    intents=interactions.Intents.ALL,
+client = Client(
+    intents=Intents.ALL,
     token=TOKEN,
     sync_interactions=True,
     asyncio_debug=False,
@@ -28,7 +40,7 @@ client = interactions.Client(
 )
 
 
-@interactions.listen()
+@listen()
 async def on_startup():
     print(f'{client.user} connected to discord')
     print('----------------------------------------------------------------------------------------------------------------')
@@ -36,22 +48,21 @@ async def on_startup():
     print('----------------------------------------------------------------------------------------------------------------')
 
 
-@interactions.slash_command(name="ping", description="☎️ Ping")
-async def ping(ctx: interactions.SlashContext):
+@slash_command(name="ping", description="☎️ Ping")
+async def ping(ctx: SlashContext):
     latency_ms = round(client.latency * 1000, 2)
     await ctx.send(f"Ping: {latency_ms}ms", ephemeral=True)
 
 
-@interactions.slash_command(name="help", description="Show a list of available commands")
-async def help_command(ctx: interactions.SlashContext):
-    embed = interactions.Embed(
+@slash_command(name="help", description="Show a list of available commands")
+async def help_command(ctx: SlashContext):
+    embed = Embed(
         title="LibreChat Updater",
         description="Here is a list of available commands:",
         color=0x8000ff,
         url="https://github.com/Berry-13/LibreChat-DiscordBot"
     )
 
-    # Add fields for each command
     embed.add_field(
         name="/ping",
         value="☎️ Ping the bot\n"
@@ -79,79 +90,83 @@ async def help_command(ctx: interactions.SlashContext):
     await ctx.send(embed=embed, ephemeral=True)
 
 
-@interactions.slash_command(name=f"{os.getenv('COMMAND_NAME')}", description=f"{os.getenv('COMMAND_DESCRIPTION')}")
-async def links(ctx: interactions.SlashContext):
-    links = [
-        interactions.ActionRow(
-            interactions.Button(
-                style=interactions.ButtonStyle.URL,
+@slash_command(
+        name=f"{os.getenv('COMMAND_NAME')}",
+        description=f"{os.getenv('COMMAND_DESCRIPTION')}")
+async def hyperlinks(ctx: SlashContext):
+    hyperlinks_btns = [
+        ActionRow(
+            Button(
+                style=ButtonStyle.URL,
                 label=f"{os.getenv('BTN1')}",
                 url=f"{os.getenv('URL1')}"
             ),
-            interactions.Button(
-                style=interactions.ButtonStyle.URL,
+            Button(
+                style=ButtonStyle.URL,
                 label=f"{os.getenv('BTN2')}",
                 url=f"{os.getenv('URL2')}"
             ),
-            interactions.Button(
-                style=interactions.ButtonStyle.URL,
+            Button(
+                style=ButtonStyle.URL,
                 label=f"{os.getenv('BTN3')}",
                 url=f"{os.getenv('URL3')}"
             ),
-            interactions.Button(
-                style=interactions.ButtonStyle.URL,
+            Button(
+                style=ButtonStyle.URL,
                 label=f"{os.getenv('BTN4')}",
                 url=f"{os.getenv('URL4')}"
             )
         )
     ]
-    await ctx.send("Useful links:", components=links, ephemeral=True)
+    await ctx.send("Useful links:", components=hyperlinks_btns, ephemeral=True)
 
 
-@interactions.slash_command(name='github', description='💻 GitHub Commands')
-async def docker(ctx: interactions.SlashContext):
-    docker = [
-        interactions.ActionRow(
-            interactions.Button(
-                style=interactions.ButtonStyle.GREEN,
+@slash_command(
+        name='github',
+        description='💻 GitHub Commands')
+async def github(ctx: SlashContext):
+    git_btns = [
+        ActionRow(
+            Button(
+                style=ButtonStyle.GREEN,
                 label="Auth",
                 custom_id="auth",
             ),
-            interactions.Button(
-                style=interactions.ButtonStyle.RED,
+            Button(
+                style=ButtonStyle.RED,
                 label="🤷‍♂️",
                 custom_id="2",
             ),
-            interactions.Button(
-                style=interactions.ButtonStyle.URL,
+            Button(
+                style=ButtonStyle.URL,
                 label="⚠️ new issue",
                 url=f"https://github.com/{OWNER}/{REPO}/issues/new",
             ),
-            interactions.Button(
-                style=interactions.ButtonStyle.URL,
+            Button(
+                style=ButtonStyle.URL,
                 label="💬 new discussion",
                 url=f"https://github.com/{OWNER}/{REPO}/discussions/new/choose",
             ),
-            interactions.Button(
-                style=interactions.ButtonStyle.GREY,
+            Button(
+                style=ButtonStyle.GREY,
                 label="other button",
                 custom_id="5",
             )
         )
     ]
-    await ctx.send("💫 GitHub Commands:", components=docker, ephemeral=True)
+    await ctx.send("💫 GitHub Commands:", components=git_btns, ephemeral=True)
 
 
-@interactions.component_callback("auth")
-async def start_callback(ctx: interactions.ComponentContext):
+@component_callback("auth")
+async def start_callback(ctx: ComponentContext):
     user = ctx.author
     userid = ctx.author_id
 
     oauth_url = f"{DOMAIN}/login?id={userid}&name={user}"
 
     await ctx.send(
-        content=f"Please authorize me to access your connected GitHub account by clicking this button:",
-        components=[interactions.ActionRow(interactions.Button(style=interactions.ButtonStyle.LINK, label="Authorize", url=oauth_url))],
+        content="click this button to authorize me to access your connected GitHub account:",
+        components=[ActionRow(Button(style=ButtonStyle.LINK, label="Authorize", url=oauth_url))],
         ephemeral=True
     )
 
