@@ -1,6 +1,15 @@
+# pylint: disable=missing-module-docstring
+# pylint: disable=missing-class-docstring
+# pylint: disable=missing-function-docstring
+# pylint: disable=line-too-long
+
 import os
+import asyncio
 import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from pymongo import MongoClient
+import pymongo
 from interactions import (
     Client,
     Intents,
@@ -25,10 +34,23 @@ GTOKEN = os.getenv('GITHUB_TOKEN')
 CLIENT_ID = os.getenv('CLIENT_ID')
 GITHUB_CLIENT_ID = os.getenv('GITHUB_CLIENT_ID')
 DOMAIN = os.getenv('DOMAIN')
+CLIENT = None
+DB = None
 
 logging.basicConfig()
 cls_log = logging.getLogger('MyLogger')
 cls_log.setLevel(logging.DEBUG)
+
+# Connect to the MongoDB server
+try:
+    CLIENT = MongoClient(host=os.getenv('MONGO_HOST'))
+    DB = CLIENT.get_database(os.getenv('MONGO_DATABASE'))
+except pymongo.errors.ConfigurationError as configuration_error:
+    print(f"Error connecting to MongoDB: {configuration_error}")
+except pymongo.errors.OperationFailure as operation_error:
+    print(f"Error connecting to MongoDB: {operation_error}")
+except pymongo.errors.ServerSelectionTimeoutError as timeout_error:
+    print(f"Server selection timeout error: {timeout_error}")
 
 client = Client(
     intents=Intents.ALL,
@@ -164,10 +186,33 @@ async def start_callback(ctx: ComponentContext):
 
     oauth_url = f"{DOMAIN}/login?id={userid}&name={user}"
 
+
     await ctx.send(
-        content="click this button to authorize me to access your connected GitHub account:",
+        content="click this button to connect your GitHub account:",
         components=[ActionRow(Button(style=ButtonStyle.LINK, label="Authorize", url=oauth_url))],
         ephemeral=True
     )
+
+    # Start time
+    start_time = datetime.now()
+
+    # Loop for 1 minute
+    while datetime.now() < start_time + timedelta(minutes=1):
+        # Check MongoDB for entry with Discord ID
+        user_collection = DB['users']
+        user_entry = user_collection.find_one({'discord_id': f'{userid}'})
+        print(f"tst: {userid}")
+
+        if user_entry:
+            # If entry found, send confirmation message and break loop
+            await ctx.send("Confirmation: Your account has been successfully linked!", ephemeral=True)
+            break
+
+        # If entry not found, wait for a short period before checking again
+        await asyncio.sleep(5)
+
+    else:
+        # If loop completes (1 minute passes) without finding entry, send try again message
+        await ctx.send("Could not find your account. Please try again.", ephemeral=True)
 
 client.start()
