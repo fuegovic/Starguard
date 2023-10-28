@@ -1,4 +1,4 @@
-FROM python:3.9
+FROM python:3.10
 
 WORKDIR /app
 
@@ -7,6 +7,6 @@ COPY .env /app/
 
 RUN python -m pip install --upgrade pip
 
-RUN pip install discord-py-interactions python-dotenv
+RUN pip install discord-py-interactions python-dotenv interactions.py
 
 CMD ["python", "bot.py"]
