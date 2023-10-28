@@ -1,10 +1,14 @@
-from flask import Flask, request, render_template, url_for, session
+"""
+This module contains a Flask application for handling GitHub OAuth.
+"""
+
 import os
+from datetime import datetime, timezone  # Standard imports should come first
+from flask import Flask, request, render_template, url_for, session
 from dotenv import load_dotenv
 from authlib.integrations.flask_client import OAuth
 from authlib.integrations.flask_client import OAuthError
 from pymongo import MongoClient
-from datetime import datetime, timezone
 
 load_dotenv()
 
@@ -21,7 +25,6 @@ except Exception as e:
     print(f"Error connecting to MongoDB: {e}")
     raise
 
-
 github = oauth.register(
     name='github',
     client_id=os.getenv('GITHUB_CLIENT_ID'),
@@ -34,6 +37,9 @@ github = oauth.register(
 
 @app.route('/login')
 def login():
+    """
+    Initiates the GitHub OAuth login process.
+    """
     discord_username = request.args.get('name')
     discord_id = request.args.get('id')
     session['name'] = discord_username
@@ -43,6 +49,9 @@ def login():
 
 @app.route('/authorize')
 def authorize():
+    """
+    Handles the GitHub OAuth authorization and user data retrieval.
+    """
     discord_username = session.get('name')
     discord_id = session.get('id')
 
@@ -50,7 +59,7 @@ def authorize():
     try:
         token = github.authorize_access_token()
         if token:
-            # auth successful
+            # Auth successful
             message = "Authentication successful!"
             print(f"Auth Status: {message}")
 
@@ -61,7 +70,7 @@ def authorize():
             resp = github.get('user/emails', token=token)
             email = resp.json()[0]['email']
             print(f"User's email: {email}")
-            print(f"token: {token}")
+            print(f"Token: {token}")
 
             # Save user information to MongoDB
             user_collection = db['users']
@@ -89,7 +98,7 @@ def authorize():
                 user_collection.insert_one(user_data)
 
         else:
-            # auth failed
+            # Auth failed
             message = "Invalid link!"
             print(f"Auth Status: {message}")
 
@@ -101,6 +110,9 @@ def authorize():
 
 @app.route('/')
 def home():
+    """
+    Renders the home page.
+    """
     return render_template('home.html')
 
 if __name__ == '__main__':
