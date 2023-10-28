@@ -159,8 +159,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
+# MongoDB
 server/mongo-data/
-
 mongo-data/
 
+#VSCode
 .vscode/

@@ -3,3 +3,4 @@ python-dotenv==1.0.0
 authlib==1.2.1
 pymongo==4.5.0
 Interactions.py==5.8.0
+discord_py_interactions==5.10.0
