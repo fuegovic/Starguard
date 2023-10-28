@@ -1,10 +1,15 @@
-from flask import Flask, request, render_template, url_for, session
+"""
+This module contains a Flask application for handling GitHub OAuth.
+"""
+
 import os
+from datetime import datetime, timezone
+from flask import Flask, request, render_template, url_for, session
 from dotenv import load_dotenv
 from authlib.integrations.flask_client import OAuth
 from authlib.integrations.flask_client import OAuthError
 from pymongo import MongoClient
-from datetime import datetime, timezone
+import pymongo
 
 load_dotenv()
 
@@ -13,14 +18,17 @@ app.template_folder = './html'
 app.secret_key = os.getenv('SECRET_KEY')
 oauth = OAuth(app)
 
+CLIENT = None
+DB = None
+
 # Connect to the MongoDB server
 try:
-    client = MongoClient(host=os.getenv('MONGO_HOST'))
-    db = client.get_database(os.getenv('MONGO_DATABASE'))
-except Exception as e:
-    print(f"Error connecting to MongoDB: {e}")
-    raise
-
+    CLIENT = MongoClient(host=os.getenv('MONGO_HOST'))
+    DB = CLIENT.get_database(os.getenv('MONGO_DATABASE'))
+except pymongo.errors.ConnectionError as connection_error:
+    print(f"Error connecting to MongoDB: {connection_error}")
+except Exception as error:
+    print(f"An error occurred: {error}")
 
 github = oauth.register(
     name='github',
@@ -34,6 +42,9 @@ github = oauth.register(
 
 @app.route('/login')
 def login():
+    """
+    Initiates the GitHub OAuth login process.
+    """
     discord_username = request.args.get('name')
     discord_id = request.args.get('id')
     session['name'] = discord_username
@@ -43,14 +54,18 @@ def login():
 
 @app.route('/authorize')
 def authorize():
+    """
+    Handles the GitHub OAuth authorization and user data retrieval.
+    """
     discord_username = session.get('name')
     discord_id = session.get('id')
-
     message = ""
+    user_data = None
+
     try:
         token = github.authorize_access_token()
         if token:
-            # auth successful
+            # Auth successful
             message = "Authentication successful!"
             print(f"Auth Status: {message}")
 
@@ -61,10 +76,11 @@ def authorize():
             resp = github.get('user/emails', token=token)
             email = resp.json()[0]['email']
             print(f"User's email: {email}")
-            print(f"token: {token}")
+            print(f"Token: {token}")
+
 
             # Save user information to MongoDB
-            user_collection = db['users']
+            user_collection = DB['users']
 
             # Check if a document with the same email exists
             existing_user = user_collection.find_one({'github_email': email})
@@ -89,7 +105,7 @@ def authorize():
                 user_collection.insert_one(user_data)
 
         else:
-            # auth failed
+            # Auth failed
             message = "Invalid link!"
             print(f"Auth Status: {message}")
 
@@ -97,10 +113,13 @@ def authorize():
         message = f"OAuth error: {e.description}"
         print(f"Auth Status: {message}")
 
-    return render_template('result.html', message=message)
+    return render_template('result.html', message=message, user_data=user_data)
 
 @app.route('/')
 def home():
+    """
+    Renders the home page.
+    """
     return render_template('home.html')
 
 if __name__ == '__main__':
