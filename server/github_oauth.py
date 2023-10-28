@@ -3,12 +3,13 @@ This module contains a Flask application for handling GitHub OAuth.
 """
 
 import os
-from datetime import datetime, timezone  # Standard imports should come first
+from datetime import datetime, timezone
 from flask import Flask, request, render_template, url_for, session
 from dotenv import load_dotenv
 from authlib.integrations.flask_client import OAuth
 from authlib.integrations.flask_client import OAuthError
 from pymongo import MongoClient
+import pymongo
 
 load_dotenv()
 
@@ -17,13 +18,17 @@ app.template_folder = './html'
 app.secret_key = os.getenv('SECRET_KEY')
 oauth = OAuth(app)
 
+CLIENT = None
+DB = None
+
 # Connect to the MongoDB server
 try:
-    client = MongoClient(host=os.getenv('MONGO_HOST'))
-    db = client.get_database(os.getenv('MONGO_DATABASE'))
-except Exception as e:
-    print(f"Error connecting to MongoDB: {e}")
-    raise
+    CLIENT = MongoClient(host=os.getenv('MONGO_HOST'))
+    DB = CLIENT.get_database(os.getenv('MONGO_DATABASE'))
+except pymongo.errors.ConnectionError as connection_error:
+    print(f"Error connecting to MongoDB: {connection_error}")
+except Exception as error:
+    print(f"An error occurred: {error}")
 
 github = oauth.register(
     name='github',
@@ -54,8 +59,9 @@ def authorize():
     """
     discord_username = session.get('name')
     discord_id = session.get('id')
-
     message = ""
+    user_data = None
+
     try:
         token = github.authorize_access_token()
         if token:
@@ -72,8 +78,9 @@ def authorize():
             print(f"User's email: {email}")
             print(f"Token: {token}")
 
+
             # Save user information to MongoDB
-            user_collection = db['users']
+            user_collection = DB['users']
 
             # Check if a document with the same email exists
             existing_user = user_collection.find_one({'github_email': email})
@@ -106,7 +113,7 @@ def authorize():
         message = f"OAuth error: {e.description}"
         print(f"Auth Status: {message}")
 
-    return render_template('result.html', message=message)
+    return render_template('result.html', message=message, user_data=user_data)
 
 @app.route('/')
 def home():
