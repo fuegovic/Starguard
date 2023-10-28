@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template, redirect, url_for
+from flask import Flask, request, render_template, url_for, session
 import os
 from dotenv import load_dotenv
 from authlib.integrations.flask_client import OAuth
@@ -34,11 +34,18 @@ github = oauth.register(
 
 @app.route('/login')
 def login():
+    discord_username = request.args.get('name')
+    discord_id = request.args.get('id')
+    session['name'] = discord_username
+    session['id'] = discord_id
     redirect_uri = url_for('authorize', _external=True)
     return github.authorize_redirect(redirect_uri)
 
 @app.route('/authorize')
 def authorize():
+    discord_username = session.get('name')
+    discord_id = session.get('id')
+
     message = ""
     try:
         token = github.authorize_access_token()
@@ -60,21 +67,23 @@ def authorize():
             user_collection = db['users']
 
             # Check if a document with the same email exists
-            existing_user = user_collection.find_one({'email': email})
+            existing_user = user_collection.find_one({'github_email': email})
 
             # Get the current timestamp in UTC
             current_time = datetime.now(timezone.utc).isoformat()
 
             user_data = {
-                'username': username,
-                'email': email,
-                'token': token,
+                'discord_username': discord_username,
+                'discord_id': discord_id,
+                'github_username': username,
+                'github_email': email,
+                'github_token': token,
                 'updated_at': current_time,
             }
 
             if existing_user:
                 # Update the existing document
-                user_collection.update_one({'email': email}, {'$set': user_data})
+                user_collection.update_one({'github_email': email}, {'$set': user_data})
             else:
                 # Insert a new document
                 user_collection.insert_one(user_data)
@@ -95,4 +104,4 @@ def home():
     return render_template('home.html')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080)
+    app.run(host='0.0.0.0', port=8080, debug=True)

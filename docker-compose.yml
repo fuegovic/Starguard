@@ -12,10 +12,10 @@ services:
       - Discord-GH-bot
 
   server:
-    container_name: server
+    container_name: oauth-server
     image: server-discord-bot
     ports:
-     - 8080:8080
+      - 8080:8080
     build:
       context: .
       dockerfile: Dockerfile_server
@@ -46,7 +46,7 @@ services:
       ME_CONFIG_MONGODB_SERVER: mongodb
       ME_CONFIG_MONGODB_PORT: 27017
       ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
-      ME_CONFIG_BASICAUTH_USERNAME: user
+      ME_CONFIG_BASICAUTH_USERNAME: admin
       ME_CONFIG_BASICAUTH_PASSWORD: password
     restart: always
     networks:

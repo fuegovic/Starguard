@@ -9,6 +9,7 @@ load_dotenv()
 
 TOKEN = os.getenv('TOKEN')
 REPO = os.getenv('GITHUB_REPO')
+OWNER = os.getenv('REPO_OWNER')
 ROLE = os.getenv('ROLE_ID')
 GTOKEN = os.getenv('GITHUB_TOKEN') 
 CLIENT_ID = os.getenv('CLIENT_ID')
@@ -17,7 +18,7 @@ DOMAIN = os.getenv('DOMAIN')
 
 logging.basicConfig()
 cls_log = logging.getLogger('MyLogger')
-cls_log.setLevel(logging.INFO)
+cls_log.setLevel(logging.DEBUG)
 
 client = Client(intents=interactions.Intents.ALL, token=TOKEN, sync_interactions=True, asyncio_debug=False, logger=cls_log, send_command_tracebacks=False)
 
@@ -31,8 +32,8 @@ async def on_startup():
     print('----------------------------------------------------------------------------------------------------------------')
 
 
-# 📞 PING
-@slash_command(name="ping", description="📞 Ping")
+# ☎️ PING
+@slash_command(name="ping", description="☎️ Ping")
 async def ping(ctx: SlashContext):
     latency_ms = round(client.latency * 1000, 2)
     await ctx.send(f"Ping: {latency_ms}ms", ephemeral=True)
@@ -46,13 +47,18 @@ async def help_command(ctx: SlashContext):
     # Add fields for each command
     embed.add_field(
         name="/ping", 
-        value="📞 Ping the bot \n"
+        value="☎️ Ping the bot \n"
         "- ping the bot, returns the latency in milliseconds"
         )
     embed.add_field(
-        name="/librechat", 
-        value="🌐 Explore LibreChat URLs \n"
-        "- Quick access to LibreChat **GitHub**, **Documentation**, **Discord** and **YouTube**"
+        name="/github", 
+        value="💻 github command\n"
+        "- github verification and other useful github buttons"
+        )
+    embed.add_field(
+        name=f"{os.getenv('COMMAND_NAME')}", 
+        value=f"{os.getenv('COMMAND_DESCRIPTION')}\n"
+        f"{os.getenv('COMMAND_EXTENDED_DESCRIPTION')}"
         )
     embed.add_field(
         name="---",
@@ -60,43 +66,43 @@ async def help_command(ctx: SlashContext):
     )
     embed.add_field(
         name="Visit our GitHub page for the latest updates, additional information or to report any problems",
-        value="**[GitHub](https://github.com/fuegovic)**"
+        value="**[GitHub](https://github.com/fuegovic/Discord-GH-bot)**"
     )
 
     await ctx.send(embed=embed, ephemeral=True)
 
 
-# 🌐 LIBRECHAT HYPERLINKS 
-@slash_command(name='librechat', description='🌐 LibreChat URLs')
-async def librechat(ctx: SlashContext):
-    librechat = [
+# 🌐 HYPERLINKS 
+@slash_command(name=f"{os.getenv('COMMAND_NAME')}", description=f"{os.getenv('COMMAND_DESCRIPTION')}")
+async def links(ctx: SlashContext):
+    links = [
         ActionRow(
             Button(
                 style=ButtonStyle.URL,
-                label="GitHub",
-                url="https://librechat.ai"
+                label=f"{os.getenv('BTN1')}",
+                url=f"{os.getenv('URL1')}"
             ),
             Button(
                 style=ButtonStyle.URL,
-                label="Docs",
-                url="https://docs.librechat.ai"
+                label=f"{os.getenv('BTN2')}",
+                url=f"{os.getenv('URL2')}"
             ),
             Button(
                 style=ButtonStyle.URL,
-                label="Discord",
-                url="https://discord.librechat.ai"
+                label=f"{os.getenv('BTN3')}",
+                url=f"{os.getenv('URL3')}"
             ),
             Button(
                 style=ButtonStyle.URL,
-                label="Youtube",
-                url="https://www.youtube.com/@LibreChat"
+                label=f"{os.getenv('BTN4')}",
+                url=f"{os.getenv('URL4')}"
             )
         )
     ]
-    await ctx.send("Useful LibreChat links:", components=librechat)
+    await ctx.send("Useful links:", components=links, ephemeral=True)
 
-# ⭐ GitHub
-@slash_command(name='github', description='⭐ GitHub Commands')
+# 💻 GitHub
+@slash_command(name='github', description='💻 GitHub Commands')
 async def docker(ctx: SlashContext):
     docker = [
         ActionRow(
@@ -107,38 +113,36 @@ async def docker(ctx: SlashContext):
             ),
             Button(
                 style=ButtonStyle.RED,
-                label="2",
+                label="🤷‍♂️",
                 custom_id="2",
             ),
             Button(
-                style=ButtonStyle.BLUE,
-                label="3",
-                custom_id="3",
+                style=ButtonStyle.URL,
+                label="⚠️ new issue",
+                url=f"https://github.com/{OWNER}/{REPO}/issues/new",
+            ),
+            Button(
+                style=ButtonStyle.URL,
+                label="💬 new discussion",
+                url=f"https://github.com/{OWNER}/{REPO}/discussions/new/choose",
             ),
             Button(
                 style=ButtonStyle.GREY,
-                label="4",
-                custom_id="4",
-            ),
-            Button(
-                style=ButtonStyle.GREY,
-                label="5",
+                label="other button",
                 custom_id="5",
             )
         )
     ]
-    await ctx.send("⭐ GitHub Commands:", components=docker, ephemeral=True)
+    await ctx.send("💫 GitHub Commands:", components=docker, ephemeral=True)
+
 
 @component_callback("auth")
 async def start_callback(ctx: ComponentContext):
     user = ctx.author
     userid = ctx.author_id
-    user_perm = ctx.author_permissions
 
-    await ctx.send(content=f'Discord Username = "{user}"\nDiscord User ID = "{userid}"\nDiscord User Permissions = "{user_perm}"\n')
+    oauth_url = f"{DOMAIN}/login?id={userid}&name={user}"
 
-    oauth_url = f"{DOMAIN}/login"
-
-    await ctx.send(content=f"Please authorize me to access your connected accounts by clicking this button:", components=[ActionRow(Button(style=ButtonStyle.LINK, label="Authorize", url=oauth_url))])
+    await ctx.send(content=f"Please authorize me to access your connected GitHub account by clicking this button:", components=[ActionRow(Button(style=ButtonStyle.LINK, label="Authorize", url=oauth_url))], ephemeral=True)
 
 client.start()
