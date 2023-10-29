@@ -63,7 +63,7 @@ def authorize():
     discord_username = session.get('name')
     discord_id = session.get('id')
     message = ""
-    user_data = None
+    user_data = {}
 
     try:
         token = github.authorize_access_token()
@@ -81,6 +81,18 @@ def authorize():
             print(f"User's email: {email}")
             print(f"Token: {token}")
 
+            repo_owner = os.getenv('REPO_OWNER')
+            github_repo = os.getenv('GITHUB_REPO')
+
+            # Make a GET request to the "Check if a repository is starred" endpoint
+            starred_resp = github.get(f'user/starred/{repo_owner}/{github_repo}', token=token)
+            print(f"starred response = {starred_resp}")
+
+            # If the response status code is 204, the repository is starred
+            if starred_resp.status_code == 204:
+                starred_repo = True
+            else:
+                starred_repo = False
 
             # Save user information to MongoDB
             user_collection = DB['users']
@@ -96,6 +108,7 @@ def authorize():
                 'discord_id': discord_id,
                 'github_username': username,
                 'github_email': email,
+                'starred_repo': starred_repo,
                 'github_token': token,
                 'updated_at': current_time,
             }
