@@ -75,24 +75,16 @@ def authorize():
             print(f"User's email: {email}")
             print(f"Token: {token}")
 
-            repo_owner = os.getenv('REPO_OWNER')
-            github_repo = os.getenv('GITHUB_REPO')
+            owner = os.getenv('REPO_OWNER')
+            repo = os.getenv('GITHUB_REPO')
+            url = f"https://github.com/{owner}/{repo}/"
 
             # Make a GET request to the "Check if a repository is starred" endpoint
-            starred_resp = github.get(f'user/starred/{repo_owner}/{github_repo}', token=token)
+            starred_resp = github.get(f'user/starred/{owner}/{repo}', token=token)
             print(f"starred response = {starred_resp}")
 
             # If the response status code is 204, the repository is starred
-            if starred_resp.status_code == 204:
-                starred_repo = True
-            else:
-                starred_repo = False
-
-            # Save user information to MongoDB
-            user_collection = DB['users']
-
-            # Check if a document with the same email exists
-            existing_user = user_collection.find_one({'github_email': email})
+            starred_repo = starred_resp.status_code == 204
 
             # Get the current timestamp in UTC
             current_time = datetime.now(timezone.utc).isoformat()
@@ -102,17 +94,13 @@ def authorize():
                 'discord_id': discord_id,
                 'github_username': username,
                 'github_email': email,
+                'linked_repo': url,
                 'starred_repo': starred_repo,
                 'github_token': token,
                 'updated_at': current_time,
             }
 
-            if existing_user:
-                # Update the existing document
-                user_collection.update_one({'github_email': email}, {'$set': user_data})
-            else:
-                # Insert a new document
-                user_collection.insert_one(user_data)
+            save_user_data_to_db(user_data)
 
         else:
             # Auth failed
@@ -124,6 +112,20 @@ def authorize():
         print(f"Auth Status: {message}")
 
     return render_template('result.html', message=message, user_data=user_data)
+
+def save_user_data_to_db(user_data):
+    # Save user information to MongoDB
+    user_collection = DB['users']
+
+    # Check if a document with the same email exists
+    existing_user = user_collection.find_one({'github_email': user_data['github_email']})
+
+    if existing_user:
+        # Update the existing document
+        user_collection.update_one({'github_email': user_data['github_email']}, {'$set': user_data})
+    else:
+        # Insert a new document
+        user_collection.insert_one(user_data)
 
 @app.route('/')
 def home():

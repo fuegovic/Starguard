@@ -26,14 +26,12 @@ from interactions import (
 
 load_dotenv()
 
-TOKEN = os.getenv('TOKEN')
-REPO = os.getenv('GITHUB_REPO')
-OWNER = os.getenv('REPO_OWNER')
-ROLE = os.getenv('ROLE_ID')
-GTOKEN = os.getenv('GITHUB_TOKEN')
-CLIENT_ID = os.getenv('CLIENT_ID')
-GITHUB_CLIENT_ID = os.getenv('GITHUB_CLIENT_ID')
-DOMAIN = os.getenv('DOMAIN')
+token = os.getenv('TOKEN')
+repo = os.getenv('GITHUB_REPO')
+owner = os.getenv('REPO_OWNER')
+role = os.getenv('ROLE_ID')
+client_id = os.getenv('CLIENT_ID')
+domain = os.getenv('DOMAIN')
 CLIENT = None
 DB = None
 
@@ -54,7 +52,7 @@ except pymongo.errors.ServerSelectionTimeoutError as timeout_error:
 
 client = Client(
     intents=Intents.ALL,
-    token=TOKEN,
+    token=token,
     sync_interactions=True,
     asyncio_debug=False,
     logger=cls_log,
@@ -66,7 +64,7 @@ client = Client(
 async def on_startup():
     print(f'{client.user} connected to discord')
     print('----------------------------------------------------------------------------------------------------------------')
-    print(f'Bot invite link: https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&permissions=268453888&scope=bot')
+    print(f'Bot invite link: https://discord.com/api/oauth2/authorize?client_id={client_id}&permissions=268453888&scope=bot')
     print('----------------------------------------------------------------------------------------------------------------')
 
 
@@ -157,12 +155,12 @@ async def github(ctx: SlashContext):
             Button(
                 style=ButtonStyle.URL,
                 label="⚠️ new issue",
-                url=f"https://github.com/{OWNER}/{REPO}/issues/new",
+                url=f"https://github.com/{owner}/{repo}/issues/new",
             ),
             Button(
                 style=ButtonStyle.URL,
                 label="💬 new discussion",
-                url=f"https://github.com/{OWNER}/{REPO}/discussions/new/choose",
+                url=f"https://github.com/{owner}/{repo}/discussions/new/choose",
             )
         )
     ]
@@ -175,7 +173,7 @@ async def start_callback(ctx: ComponentContext):
     user = ctx.author
     userid = ctx.author_id
 
-    oauth_url = f"{DOMAIN}/login?id={userid}&name={user}"
+    oauth_url = f"{domain}/login?id={userid}&name={user}"
 
     await ctx.send(
         content="click this button to connect your GitHub account:",
@@ -183,30 +181,24 @@ async def start_callback(ctx: ComponentContext):
         ephemeral=True
     )
 
-    # Start time
     start_time = datetime.now()
 
-    # Loop for 1 minute
     while datetime.now() < start_time + timedelta(minutes=1):
-        # Check MongoDB for entry with Discord ID
         user_collection = DB['users']
-        user_entry = user_collection.find_one({'discord_id': f'{userid}'})
-        print(f"tst: {userid}")
+        user_entry = user_collection.find_one({'discord_id': f'{userid}', 'linked_repo': f"https://github.com/{owner}/{repo}/"})
 
         if user_entry:
-            # Check if 'starred_repo' is set to true and assign role
-            if user_entry['starred_repo']:
-                role = os.getenv('ROLE_ID')
-                await ctx.author.add_role(role, reason='auth')
-                await ctx.send("role activated")
+            if user_entry.get('starred_repo', False):
+                await ctx.author.add_role(role, reason='star')
                 await ctx.send("Confirmation: Your account has been successfully linked!", ephemeral=True)
+            else:
+                await ctx.author.remove_role(role, reason='no_star')
+                await ctx.send("Your account has been unlinked!", ephemeral=True)
             break
 
-        # If entry not found, wait for a short period before checking again
         await asyncio.sleep(5)
 
     else:
-        # If loop completes (1 minute passes) without finding entry, send try again message
         await ctx.send("Could not find your account. Please try again.", ephemeral=True)
 
 client.start()
