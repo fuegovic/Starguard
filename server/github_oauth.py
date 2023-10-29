@@ -14,6 +14,10 @@ import pymongo
 
 load_dotenv()
 
+owner = os.getenv('REPO_OWNER')
+repo = os.getenv('GITHUB_REPO')
+url = f"https://github.com/{owner}/{repo}/"
+
 app = Flask(__name__, template_folder='./html')
 app.template_folder = './html'
 app.secret_key = os.getenv('SECRET_KEY')
@@ -74,10 +78,6 @@ def authorize():
             email = resp.json()[0]['email']
             print(f"User's email: {email}")
             print(f"Token: {token}")
-
-            owner = os.getenv('REPO_OWNER')
-            repo = os.getenv('GITHUB_REPO')
-            url = f"https://github.com/{owner}/{repo}/"
 
             # Make a GET request to the "Check if a repository is starred" endpoint
             starred_resp = github.get(f'user/starred/{owner}/{repo}', token=token)

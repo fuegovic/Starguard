@@ -167,7 +167,6 @@ async def github(ctx: SlashContext):
     await ctx.send("💫 GitHub Commands:", components=git_btns, ephemeral=True)
 
 
-
 @component_callback("auth")
 async def start_callback(ctx: ComponentContext):
     user = ctx.author
