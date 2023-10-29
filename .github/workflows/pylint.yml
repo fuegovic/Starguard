@@ -21,4 +21,4 @@ jobs:
         pip install pylint
     - name: Analysing the code with pylint
       run: |
-        pylint --disable=missing-module-docstring --disable=missing-class-docstring --disable=missing-function-docstring --disable=line-too-long $(git ls-files '*.py')
+        pylint --disable=missing-module-docstring --disable=missing-class-docstring --disable=missing-function-docstring --disable=line-too-long --disable=duplicate-code $(git ls-files '*.py')
