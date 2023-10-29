@@ -45,9 +45,6 @@ github = oauth.register(
 
 @app.route('/login')
 def login():
-    """
-    Initiates the GitHub OAuth login process.
-    """
     discord_username = request.args.get('name')
     discord_id = request.args.get('id')
     session['name'] = discord_username
@@ -57,9 +54,6 @@ def login():
 
 @app.route('/authorize')
 def authorize():
-    """
-    Handles the GitHub OAuth authorization and user data retrieval.
-    """
     discord_username = session.get('name')
     discord_id = session.get('id')
     message = ""
@@ -133,9 +127,6 @@ def authorize():
 
 @app.route('/')
 def home():
-    """
-    Renders the home page.
-    """
     return render_template('home.html')
 
 if __name__ == '__main__':

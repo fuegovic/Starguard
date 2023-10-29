@@ -66,7 +66,7 @@ client = Client(
 async def on_startup():
     print(f'{client.user} connected to discord')
     print('----------------------------------------------------------------------------------------------------------------')
-    print(f'Bot invite link: https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&permissions=8&scope=bot')
+    print(f'Bot invite link: https://discord.com/api/oauth2/authorize?client_id={CLIENT_ID}&permissions=268453888&scope=bot')
     print('----------------------------------------------------------------------------------------------------------------')
 
 
@@ -155,11 +155,6 @@ async def github(ctx: SlashContext):
                 custom_id="auth",
             ),
             Button(
-                style=ButtonStyle.RED,
-                label="🤷‍♂️",
-                custom_id="2",
-            ),
-            Button(
                 style=ButtonStyle.URL,
                 label="⚠️ new issue",
                 url=f"https://github.com/{OWNER}/{REPO}/issues/new",
@@ -168,11 +163,6 @@ async def github(ctx: SlashContext):
                 style=ButtonStyle.URL,
                 label="💬 new discussion",
                 url=f"https://github.com/{OWNER}/{REPO}/discussions/new/choose",
-            ),
-            Button(
-                style=ButtonStyle.GREY,
-                label="other button",
-                custom_id="5",
             )
         )
     ]
@@ -204,19 +194,12 @@ async def start_callback(ctx: ComponentContext):
         print(f"tst: {userid}")
 
         if user_entry:
-            # If entry found, send confirmation message and break loop
-            await ctx.send("Confirmation: Your account has been successfully linked!", ephemeral=True)
-
-            # Check if 'starred_repo' is set to true
+            # Check if 'starred_repo' is set to true and assign role
             if user_entry['starred_repo']:
-                # Fetch the role
                 role = os.getenv('ROLE_ID')
-                #role = os.getenv('ROLE_ID')
-                print (f'1role = {role}')
-                # Assign the role
                 await ctx.author.add_role(role, reason='auth')
                 await ctx.send("role activated")
-                print (f'2role = {role}')
+                await ctx.send("Confirmation: Your account has been successfully linked!", ephemeral=True)
             break
 
         # If entry not found, wait for a short period before checking again
