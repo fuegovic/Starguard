@@ -1,6 +1,7 @@
 # Discord-GitHub-bot
 
 ## To Do:
+- ⛔Remove role if the user validation shows `starred_repo: false`
 - 🦋 Make it pretty (organize the slash commands)
 - 🪓 Split the user validation commands from the other github menu?
 - 😈 add "admin" command to force re-verification and update roles assignments
