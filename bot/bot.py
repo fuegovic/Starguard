@@ -179,13 +179,13 @@ async def github(ctx: SlashContext):
     await ctx.send("💫 GitHub Commands:", components=git_btns, ephemeral=True)
 
 
+
 @component_callback("auth")
 async def start_callback(ctx: ComponentContext):
     user = ctx.author
     userid = ctx.author_id
 
     oauth_url = f"{DOMAIN}/login?id={userid}&name={user}"
-
 
     await ctx.send(
         content="click this button to connect your GitHub account:",
@@ -206,6 +206,17 @@ async def start_callback(ctx: ComponentContext):
         if user_entry:
             # If entry found, send confirmation message and break loop
             await ctx.send("Confirmation: Your account has been successfully linked!", ephemeral=True)
+
+            # Check if 'starred_repo' is set to true
+            if user_entry['starred_repo']:
+                # Fetch the role
+                role = os.getenv('ROLE_ID')
+                #role = os.getenv('ROLE_ID')
+                print (f'1role = {role}')
+                # Assign the role
+                await ctx.author.add_role(role, reason='auth')
+                await ctx.send("role activated")
+                print (f'2role = {role}')
             break
 
         # If entry not found, wait for a short period before checking again
