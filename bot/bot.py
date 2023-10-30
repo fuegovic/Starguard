@@ -6,10 +6,11 @@
 import os
 import logging
 import random
+import requests
 from dotenv import load_dotenv
 from pymongo import MongoClient
 import pymongo
-from messages import THANKS #, SORRY  <- other set of messages for unstarring users
+from messages import THANKS, SORRY
 from interactions import (
     Client,
     Intents,
@@ -200,5 +201,81 @@ async def claim_callback(ctx: ComponentContext):
             await ctx.send(content="Please star the repo to get the role 🌟", ephemeral=True)
     else:
         await ctx.send(content="Please make sure to link your GitHub account by using the **Log in with GitHub** button.", ephemeral=True)
+
+
+@slash_command(name="checkstars", description="Check who has un-starred the repo and remove their role")
+async def check_stars_command(ctx: SlashContext):
+    # Get the role ID for the moderator or administrator role
+    admin_id = os.getenv('ADMIN_ID')
+
+    # Check if the user has the moderator role
+    if not ctx.author.has_role(admin_id):
+        await ctx.send(content="You do not have permission to use this command.", ephemeral=True)
+        return
+    else:
+        await check_star_status(ctx)
+        await ctx.send("Star status checked", ephemeral=True)
+
+async def check_star_status(ctx: SlashContext):
+    # The header to get the star time
+    headers = {"Accept": "application/vnd.github.v3.star+json"}
+    # The URL for the stargazers endpoint
+    url = f"https://api.github.com/repos/{owner}/{repo}/stargazers"
+
+    # A list to store the stargazers
+    stargazers = []
+    while True:
+        # Make a GET request to the URL
+        response = requests.get(url, headers=headers, timeout=60)
+
+        # Check if the response is successful
+        if response.status_code == 200:
+            # Parse the JSON data
+            data = response.json()
+
+            # Append the stargazers to the list
+            stargazers.extend([user for user in data])
+
+            # Get the next page URL from the Link header
+            link = response.headers.get("Link")
+
+            # If there is no next page, break the loop
+            if not link or "rel=\"next\"" not in link:
+                break
+
+            # Otherwise, update the URL with the next page
+            else:
+                url = link.split(";")[0].strip("<>")
+        else:
+            # If the response is not successful, print an error message and break the loop
+            print(f"Error: {response.status_code}")
+            break
+
+    # Get all users from the database
+    user_collection = DB['users']
+    users = user_collection.find()
+
+    for user in users:
+        # If the user has un-starred the repo
+        if user['github_username'] not in stargazers:
+            # Get the Discord member object
+            guild_id = os.getenv('GUILD_ID')
+            guild = client.get_guild(guild_id)
+            discord_member = guild.get_member(user['discord_id'])
+
+            # Check if the user already has the role removed
+            if not discord_member.has_role(role):
+                # User already has the role removed, do nothing
+                continue
+
+            # Remove the role from the user
+            await discord_member.remove_role(role, reason='no_star')
+            username = user['discord_username'].replace('@', '')
+            sorry_message = random.choice(SORRY).format(user['discord_id'])
+            await ctx.send(content=f"Removed role from **{username}** for un-starring the repo.", ephemeral=True)
+            await ctx.send(content=sorry_message)
+
+            # Update the user's star status in the database
+            user_collection.update_one({'github_username': user['github_username']}, {'$set': {'starred_repo': False}})
 
 client.start()
