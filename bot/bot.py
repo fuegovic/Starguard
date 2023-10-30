@@ -5,9 +5,11 @@
 
 import os
 import logging
+import random
 from dotenv import load_dotenv
 from pymongo import MongoClient
 import pymongo
+from messages import THANKS #, SORRY  <- other set of messages for unstarring users
 from interactions import (
     Client,
     Intents,
@@ -84,17 +86,17 @@ async def help_command(ctx: SlashContext):
     embed.add_field(
         name="> /ping",
         value="**Ping the bot**\n"
-              "- ☎️ Ping the bot, returns the latency in milliseconds"
+        "- ☎️ Ping the bot, returns the latency in milliseconds"
     )
     embed.add_field(
         name="> /verify",
         value="**GitHub verification**\n"
-              "- ✨ Star the repo\n- 🔑 Link your GitHub account\n- 🎁 Get a role"
+        "- ✨ Star the repo\n- 🔑 Link your GitHub account\n- 🎁 Get a role"
     )
     embed.add_field(
         name=f"> /{os.getenv('COMMAND_NAME')}",
         value=f"**{os.getenv('COMMAND_DESCRIPTION')}**\n"
-              f"- {os.getenv('COMMAND_EXTENDED_DESCRIPTION')}"
+        f"- {os.getenv('COMMAND_EXTENDED_DESCRIPTION')}"
     )
     embed.add_field(
         name="---",
@@ -108,6 +110,7 @@ async def help_command(ctx: SlashContext):
     await ctx.send(embed=embed, ephemeral=True)
 
 
+# 🛠️ CUSTOM COMMAND - See .env.example
 @slash_command(
         name=f"{os.getenv('COMMAND_NAME')}",
         description=f"{os.getenv('COMMAND_DESCRIPTION')}")
@@ -139,6 +142,7 @@ async def hyperlinks(ctx: SlashContext):
     await ctx.send("Useful links:", components=hyperlinks_btns, ephemeral=True)
 
 
+# 🔍 VERIFY USER AND GIVE A ROLE BUTTONS
 @slash_command(
         name='verify',
         description='💫 Self Verification')
@@ -170,9 +174,11 @@ async def verify(ctx: SlashContext):
     await ctx.send("💫 Self Verification:\n- 1: Make sure you've starred this repo\n- 2: Authenticate with GitHub\n- 3: Claim your role", components=ver_btns, ephemeral=True)
 
 
+# 🎁 CLAIM THE ROLE
 @component_callback("claim")
 async def claim_callback(ctx: ComponentContext):
     userid = ctx.author_id
+    user = ctx.author
     # Get user data from MongoDB
     user_collection = DB['users']
     user_entry = user_collection.find_one({'discord_id': f'{userid}', 'linked_repo': f"https://github.com/{owner}/{repo}/"})
@@ -180,11 +186,17 @@ async def claim_callback(ctx: ComponentContext):
     if user_entry:
         # Check if user has starred the repo
         if user_entry.get('starred_repo', False):
-            # Assign role
-            await ctx.author.add_role(role, reason='star')
-            await ctx.send(content="Role assigned successfully!", ephemeral=True)
+            # Check if user already has the role
+            if user.has_role(role):
+                # User already has the role, do nothing
+                await ctx.send(content="You already claimed your role 😁\n💫Thanks!", ephemeral=True)
+            else:
+                # User doesn't have the role, assign it and send the message
+                await user.add_role(role, reason='star')
+                thank_you_message = random.choice(THANKS).format(userid)
+                await ctx.send(content=thank_you_message)
         else:
-            await ctx.author.remove_role(role, reason='no_star')
+            await user.remove_role(role, reason='no_star')
             await ctx.send(content="You have not starred the repo.", ephemeral=True)
     else:
         await ctx.send(content="User not found.", ephemeral=True)
