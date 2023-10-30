@@ -142,62 +142,63 @@ async def hyperlinks(ctx: SlashContext):
 
 
 @slash_command(
-        name='github',
-        description='💻 GitHub Commands')
-async def github(ctx: SlashContext):
-    git_btns = [
-        ActionRow(
-            Button(
-                style=ButtonStyle.GREEN,
-                label="Auth",
-                custom_id="auth",
-            ),
-            Button(
-                style=ButtonStyle.URL,
-                label="⚠️ new issue",
-                url=f"https://github.com/{owner}/{repo}/issues/new",
-            ),
-            Button(
-                style=ButtonStyle.URL,
-                label="💬 new discussion",
-                url=f"https://github.com/{owner}/{repo}/discussions/new/choose",
-            )
-        )
-    ]
-    await ctx.send("💫 GitHub Commands:", components=git_btns, ephemeral=True)
+        name='verify',
+        description='💫 Self Verification')
 
-
-@component_callback("auth")
-async def start_callback(ctx: ComponentContext):
+async def verify(ctx: SlashContext):
     user = ctx.author
     userid = ctx.author_id
 
     oauth_url = f"{domain}/login?id={userid}&name={user}"
+    ver_btns = [
+        ActionRow(
+            Button(
+                style=ButtonStyle.URL,
+                label="1: Star this repo 🌟",
+                url=f"https://github.com/{owner}/{repo}/",
+            ),
+            Button(
+                style=ButtonStyle.URL,
+                label="2: Log in with GitHub 🔑",
+                url=oauth_url,
+            ),
+            Button(
+                style=ButtonStyle.BLUE,
+                label="3: Claim your role ❤️‍🔥",
+                custom_id="claim",
+#            ),
+#            Button(
+#                style=ButtonStyle.URL,
+#                label="⚠️ new issue",
+#                url=f"https://github.com/{owner}/{repo}/issues/new",
+#            ),
+#            Button(
+#                style=ButtonStyle.URL,
+#                label="💬 new discussion",
+#                url=f"https://github.com/{owner}/{repo}/discussions/new/choose",
+            )
+        )
+    ]
+    await ctx.send("💫 Self Verification:\n- 1: Make sure you've starred this repo\n- 2: Authenticate with GitHub\n- 3: Claim your role", components=ver_btns, ephemeral=True)
 
-    await ctx.send(
-        content="click this button to connect your GitHub account:",
-        components=[ActionRow(Button(style=ButtonStyle.LINK, label="Authorize", url=oauth_url))],
-        ephemeral=True
-    )
 
-    start_time = datetime.now()
+@component_callback("claim")
+async def claim_callback(ctx: ComponentContext):
+    userid = ctx.author_id
+    # Get user data from MongoDB
+    user_collection = DB['users']
+    user_entry = user_collection.find_one({'discord_id': f'{userid}', 'linked_repo': f"https://github.com/{owner}/{repo}/"})
 
-    while datetime.now() < start_time + timedelta(minutes=1):
-        user_collection = DB['users']
-        user_entry = user_collection.find_one({'discord_id': f'{userid}', 'linked_repo': f"https://github.com/{owner}/{repo}/"})
-
-        if user_entry:
-            if user_entry.get('starred_repo', False):
-                await ctx.author.add_role(role, reason='star')
-                await ctx.send("Confirmation: Your account has been successfully linked!", ephemeral=True)
-            else:
-                await ctx.author.remove_role(role, reason='no_star')
-                await ctx.send("Your account has been unlinked!", ephemeral=True)
-            break
-
-        await asyncio.sleep(5)
-
+    if user_entry:
+        # Check if user has starred the repo
+        if user_entry.get('starred_repo', False):
+            # Assign role
+            await ctx.author.add_role(role, reason='star')
+            await ctx.send(content="Role assigned successfully!", ephemeral=True)
+        else:
+            await ctx.author.remove_role(role, reason='no_star')
+            await ctx.send(content="You have not starred the repo.", ephemeral=True)
     else:
-        await ctx.send("Could not find your account. Please try again.", ephemeral=True)
+        await ctx.send(content="User not found.", ephemeral=True)
 
 client.start()
