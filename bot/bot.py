@@ -197,8 +197,8 @@ async def claim_callback(ctx: ComponentContext):
                 await ctx.send(content=thank_you_message)
         else:
             await user.remove_role(role, reason='no_star')
-            await ctx.send(content="You have not starred the repo.", ephemeral=True)
+            await ctx.send(content="Please star the repo to get the role 🌟", ephemeral=True)
     else:
-        await ctx.send(content="User not found.", ephemeral=True)
+        await ctx.send(content="Please make sure to link your GitHub account by using the **Log in with GitHub** button.", ephemeral=True)
 
 client.start()
