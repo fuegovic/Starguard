@@ -4,9 +4,7 @@
 # pylint: disable=line-too-long
 
 import os
-import asyncio
 import logging
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pymongo import MongoClient
 import pymongo
