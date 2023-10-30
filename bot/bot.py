@@ -75,26 +75,26 @@ async def ping(ctx: SlashContext):
 @slash_command(name="help", description="Show a list of available commands")
 async def help_command(ctx: SlashContext):
     embed = Embed(
-        title="LibreChat Updater",
+        title="GitHub 🌟 Verification Bot",
         description="Here is a list of available commands:",
         color=0x8000ff,
-        url="https://github.com/Berry-13/LibreChat-DiscordBot"
+        url="https://github.com/fuegovic/Discord-GH-bot"
     )
 
     embed.add_field(
-        name="/ping",
-        value="☎️ Ping the bot\n"
-              "- ping the bot, returns the latency in milliseconds"
+        name="> /ping",
+        value="**Ping the bot**\n"
+              "- ☎️ Ping the bot, returns the latency in milliseconds"
     )
     embed.add_field(
-        name="/github",
-        value="💻 github command\n"
-              "- github verification and other useful github buttons"
+        name="> /verify",
+        value="**GitHub verification**\n"
+              "- ✨ Star the repo\n- 🔑 Link your GitHub account\n- 🎁 Get a role"
     )
     embed.add_field(
-        name=f"{os.getenv('COMMAND_NAME')}",
-        value=f"{os.getenv('COMMAND_DESCRIPTION')}\n"
-              f"{os.getenv('COMMAND_EXTENDED_DESCRIPTION')}"
+        name=f"> /{os.getenv('COMMAND_NAME')}",
+        value=f"**{os.getenv('COMMAND_DESCRIPTION')}**\n"
+              f"- {os.getenv('COMMAND_EXTENDED_DESCRIPTION')}"
     )
     embed.add_field(
         name="---",
@@ -164,16 +164,6 @@ async def verify(ctx: SlashContext):
                 style=ButtonStyle.BLUE,
                 label="3: Claim your role ❤️‍🔥",
                 custom_id="claim",
-#            ),
-#            Button(
-#                style=ButtonStyle.URL,
-#                label="⚠️ new issue",
-#                url=f"https://github.com/{owner}/{repo}/issues/new",
-#            ),
-#            Button(
-#                style=ButtonStyle.URL,
-#                label="💬 new discussion",
-#                url=f"https://github.com/{owner}/{repo}/discussions/new/choose",
             )
         )
     ]
