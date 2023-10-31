@@ -72,6 +72,7 @@ async def on_startup():
     asyncio.create_task(check_star_status_loop())
 
 
+# 👁️ AUTOMATIC CHECK OF THE STAR STATUS
 async def check_star_status_loop():
     disable_loop = os.getenv('AUTOMATIC_CHECK', 'True')  # Default to 'True' if not set
     if disable_loop.lower() == 'false':
@@ -87,12 +88,14 @@ async def check_star_status_loop():
         await asyncio.sleep(loop_delay)
 
 
+# ☎️ PING
 @slash_command(name="ping", description="☎️ Ping")
 async def ping(ctx: SlashContext):
     latency_ms = round(client.latency * 1000, 2)
     await ctx.send(f"Ping: {latency_ms}ms", ephemeral=True)
 
 
+# 🙋 HELP
 @slash_command(name="help", description="Show a list of available commands")
 async def help_command(ctx: SlashContext):
     embed = Embed(
@@ -165,6 +168,7 @@ async def hyperlinks(ctx: SlashContext):
     await ctx.send("Useful links:", components=hyperlinks_btns, ephemeral=True)
 
 
+# ✨ OUTPUT THE NUMBER OF STAR A REPO HAS
 @slash_command(name="starcount", description="Get the total number of stargazers")
 async def starcount(ctx: SlashContext):
     await ctx.send("Counting stars...", ephemeral=True)
@@ -232,6 +236,7 @@ async def claim_callback(ctx: ComponentContext):
         await ctx.send(content="Please make sure to link your GitHub account by using the **Log in with GitHub** button.", ephemeral=True)
 
 
+#⭐ Check who has un-starred the repo and remove their role
 @slash_command(name="checkstars", description="⭐ Check who has un-starred the repo and remove their role")
 async def check_stars_command(ctx: SlashContext):
     await ctx.send("Checking star status...", ephemeral=True)
@@ -242,6 +247,8 @@ async def check_star_status(ctx: SlashContext, manual):
     channel_id = os.getenv('CHANNEL_ID')
     channel = client.get_channel(channel_id)
     stargazers = await get_stargazers()
+    if stargazers is None:
+        return
 
     user_collection = DB['users']
     users = user_collection.find()
@@ -267,6 +274,7 @@ async def check_star_status(ctx: SlashContext, manual):
             user_collection.update_one({'github_username': user['github_username']}, {'$set': {'starred_repo': False}})
 
 
+# 🤩 GET THE LIST OF STARGAZERS FOR THE SPECIFIED REPO
 async def get_stargazers():
     headers = {
         "Accept": "application/vnd.github.v3.star+json",
@@ -275,7 +283,7 @@ async def get_stargazers():
     url = f"https://api.github.com/repos/{os.getenv('REPO_OWNER')}/{os.getenv('GITHUB_REPO')}/stargazers"
     stargazers = []
     while True:
-        response = requests.get(url, headers=headers, timeout=10000)
+        response = requests.get(url, headers=headers, timeout=60)
         if response.status_code == 200:
             data = response.json()
             for user in data:
@@ -293,7 +301,7 @@ async def get_stargazers():
                 break
         else:
             print(f"Error: {response.status_code}")
-            break
+            return None
     return stargazers
 
 client.start()
