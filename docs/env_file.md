@@ -6,23 +6,27 @@ This file contains the environment variables for the discord bot. You need to fi
 
 - `TOKEN`: The discord app token for your bot. You can get it from https://discord.com/developers/applications
 - `CLIENT_ID`: The discord client ID for your bot. You can get it from https://discord.com/developers/applications
+
 For detailled instructions: [Discord dev](./discord_dev.md) 
 
 - `ROLE_ID`: The ID of the role that you want to give to users who have starred your GitHub repo. You can get it by enabling developer mode in discord and right-clicking on the role.
 - `GUILD_ID`: The ID of the server where you want to use the bot. You can get it by enabling developer mode in discord and right-clicking on the server.
 - `CHANNEL_ID`: The ID of the channel where you want the bot to post messages. You can get it by enabling developer mode in discord and right-clicking on the channel.
+
 For detailled instructions: [Discord Server](./discord.md) 
 
 ## GitHub Variables
 
 - `REPO_OWNER`: The username of the owner of the GitHub repo that you want to promote with the bot.
 - `GITHUB_REPO`: The name of the GitHub repo that you want to promote with the bot.
-- 
+
 - `GITHUB_CLIENT_ID`: The client ID of the GitHub OAuth app that you have created for the bot. You can create one at https://github.com/settings/apps
 - `GITHUB_CLIENT_SECRET`: The client secret of the GitHub OAuth app that you have created for the bot. You can get it from https://github.com/settings/apps
+
 For detailled instructions: [GitHub OAuth](./github_oauth.md)
 
 - `GITHUB_TOKEN`: GitHub Public Access Token needed to fetch the stargazers name from the specified repo.
+
 For detailled instructions: [GitHub PAT](./github_pat.md) 
 
 - `SECRET_KEY`: A random secret key that you have generated for securing the OAuth process. You can use any mix of letters, numbers, and symbols.
