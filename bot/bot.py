@@ -98,7 +98,7 @@ async def help_command(ctx: SlashContext):
     embed = Embed(
         title="GitHub 🌟 Verification Bot",
         description="Here is a list of available commands:",
-        color=0x8000ff,
+        color=0xffac33,
         url="https://github.com/fuegovic/Discord-GH-bot"
     )
 
@@ -111,6 +111,10 @@ async def help_command(ctx: SlashContext):
         name="> /verify",
         value="**GitHub verification**\n"
         "- ✨ Star the repo\n- 🔑 Link your GitHub account\n- 🎁 Get a role"
+    )
+    embed.add_field(
+        name="> /starcount",
+        value="**💫 Displays the number of stargazers for the specified repo**"
     )
     embed.add_field(
         name=f"> /{os.getenv('COMMAND_NAME')}",
@@ -159,6 +163,13 @@ async def hyperlinks(ctx: SlashContext):
         )
     ]
     await ctx.send("Useful links:", components=hyperlinks_btns, ephemeral=True)
+
+
+@slash_command(name="starcount", description="Get the total number of stargazers")
+async def starcount(ctx: SlashContext):
+    await ctx.send("Counting stars...", ephemeral=True)
+    stargazers = await get_stargazers()
+    await ctx.send(f"There are {len(stargazers)} stargazers! ✨", ephemeral=True)
 
 
 # 🔍 VERIFY USER AND GIVE A ROLE BUTTONS
@@ -221,12 +232,13 @@ async def claim_callback(ctx: ComponentContext):
         await ctx.send(content="Please make sure to link your GitHub account by using the **Log in with GitHub** button.", ephemeral=True)
 
 
-@slash_command(name="checkstars", description="Check who has un-starred the repo and remove their role")
+@slash_command(name="checkstars", description="⭐ Check who has un-starred the repo and remove their role")
 async def check_stars_command(ctx: SlashContext):
+    await ctx.send("Checking star status...", ephemeral=True)
     await check_star_status(ctx, manual=True)
     await ctx.send("Star status checked", ephemeral=True)
 
-async def check_star_status(ctx: SlashContext, manual=False):
+async def check_star_status(ctx: SlashContext, manual):
     channel_id = os.getenv('CHANNEL_ID')
     channel = client.get_channel(channel_id)
     stargazers = await get_stargazers()
@@ -256,18 +268,29 @@ async def check_star_status(ctx: SlashContext, manual=False):
 
 
 async def get_stargazers():
-    headers = {"Accept": "application/vnd.github.v3.star+json"}
-    url = f"https://api.github.com/repos/{owner}/{repo}/stargazers"
+    headers = {
+        "Accept": "application/vnd.github.v3.star+json",
+        "Authorization": f"token {os.getenv('GITHUB_TOKEN')}"
+    }
+    url = f"https://api.github.com/repos/{os.getenv('REPO_OWNER')}/{os.getenv('GITHUB_REPO')}/stargazers"
     stargazers = []
     while True:
-        response = requests.get(url, headers=headers, timeout=60)
+        response = requests.get(url, headers=headers, timeout=10000)
         if response.status_code == 200:
             data = response.json()
-            stargazers.extend(data)
+            for user in data:
+                stargazers.append(user['user']['login'])  # Add the username to the list
             link = response.headers.get("Link")
             if not link or "rel=\"next\"" not in link:
                 break
-            url = link.split(";")[0].strip("<>")
+            links = link.split(", ")
+            for link in links:
+                url, rel = link.split("; ")
+                if "next" in rel:
+                    url = url.strip("<>")
+                    break
+            else:
+                break
         else:
             print(f"Error: {response.status_code}")
             break
