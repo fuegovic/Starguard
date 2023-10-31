@@ -130,7 +130,7 @@ async def help_command(ctx: SlashContext):
     )
     embed.add_field(
         name="Visit our GitHub page for the latest updates, additional information, or to report any problems",
-        value="**[GitHub](https://github.com/fuegovic/Discord-GH-bot)**"
+        value="**[GitHub](https://github.com/fuegovic/Starguard)**"
     )
 
     await ctx.send(embed=embed, ephemeral=True)
