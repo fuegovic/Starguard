@@ -98,7 +98,7 @@ async def help_command(ctx: SlashContext):
     embed = Embed(
         title="GitHub 🌟 Verification Bot",
         description="Here is a list of available commands:",
-        color=0x8000ff,
+        color=0xffac33,
         url="https://github.com/fuegovic/Discord-GH-bot"
     )
 
@@ -111,6 +111,10 @@ async def help_command(ctx: SlashContext):
         name="> /verify",
         value="**GitHub verification**\n"
         "- ✨ Star the repo\n- 🔑 Link your GitHub account\n- 🎁 Get a role"
+    )
+    embed.add_field(
+        name="> /starcount",
+        value="**💫 Displays the number of stargazers for the specified repo**"
     )
     embed.add_field(
         name=f"> /{os.getenv('COMMAND_NAME')}",
@@ -163,9 +167,9 @@ async def hyperlinks(ctx: SlashContext):
 
 @slash_command(name="starcount", description="Get the total number of stargazers")
 async def starcount(ctx: SlashContext):
-    await ctx.send("Checking star status...", ephemeral=True)
+    await ctx.send("Counting stars...", ephemeral=True)
     stargazers = await get_stargazers()
-    await ctx.send(f"Total number of stargazers: {len(stargazers)}", ephemeral=True)
+    await ctx.send(f"There are {len(stargazers)} stargazers! ✨", ephemeral=True)
 
 
 # 🔍 VERIFY USER AND GIVE A ROLE BUTTONS
@@ -228,7 +232,7 @@ async def claim_callback(ctx: ComponentContext):
         await ctx.send(content="Please make sure to link your GitHub account by using the **Log in with GitHub** button.", ephemeral=True)
 
 
-@slash_command(name="checkstars", description="Check who has un-starred the repo and remove their role")
+@slash_command(name="checkstars", description="⭐ Check who has un-starred the repo and remove their role")
 async def check_stars_command(ctx: SlashContext):
     await ctx.send("Checking star status...", ephemeral=True)
     await check_star_status(ctx, manual=True)
