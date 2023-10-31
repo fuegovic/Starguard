@@ -1,17 +1,27 @@
 # Discord-GitHub-bot
 
-## To Do:
+Discord-GitHub-bot is a bot that integrates Discord with GitHub. It provides various functionalities such as user validation, role assignment, and periodic checks of starred users.
 
-- 📚 Documentation, how to use and configure
-- ~~⛔Remove role if the user validation shows `starred_repo: false`~~
-- ~~🦋 Make it pretty (organize the slash commands)~~
-- ~~🪓 Split the user validation commands from the other github menu?~~
-- ~~😈 add "admin" command to force re-verification and update roles assignments~~
-- ~~🔎 Implement a periodic check of the starred users or something like that~~
-- ~~🫵 Make the bot assign a role~~
-- ~~✅ Verify the users that used the github oauth~~
-- ~~📃 Make `requirements.txt`~~
-- ~~🐋 Put everything in a docker container for easier deployment~~
-- ~~🖼️ Better page for successful login~~
-- ~~🤔 Make sur the API handles multiple users using the bot at once~~
-- ... 👀
+## Features
+
+- User Validation: The bot verifies users who have used GitHub OAuth.
+- Role Assignment: The bot assigns roles based on certain criteria.
+- Periodic Checks: The bot periodically checks the starred users.
+
+## Installation
+
+1. Clone the repository.
+2. Configure the .env file
+3. Run the bot in a Docker container for easier deployment.
+
+## Usage
+
+The bot uses slash commands for operation. Here are some of the commands:
+
+- `/verify`: Validates a user and checks if they have starred the repository.
+- `/checkstars`: Forces re-verification and updates role assignments.
+- `/your-custom-name` A customizable command that displays 4 buttons to access 4 custom URLs of your choice
+
+## License
+
+[MIT](https://choosealicense.com/licenses/mit/)
