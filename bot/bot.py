@@ -4,6 +4,7 @@
 # pylint: disable=line-too-long
 
 import os
+import asyncio
 import logging
 import random
 import requests
@@ -67,6 +68,23 @@ async def on_startup():
     print('----------------------------------------------------------------------------------------------------------------')
     print(f'Bot invite link: https://discord.com/api/oauth2/authorize?client_id={client_id}&permissions=268453888&scope=bot')
     print('----------------------------------------------------------------------------------------------------------------')
+    # Start the task
+    asyncio.create_task(check_star_status_loop())
+
+
+async def check_star_status_loop():
+    disable_loop = os.getenv('AUTOMATIC_CHECK', 'True')  # Default to 'True' if not set
+    if disable_loop.lower() == 'false':
+        return
+    while True:
+        channel_id = os.getenv('CHANNEL_ID')
+        channel = client.get_channel(channel_id)
+        await check_star_status(channel, manual=False)
+        loop_delay = os.getenv('AUTOMATIC_CHECK_DELAY', '3600')  # Default to 3600 seconds (1 hour) if not set
+        loop_delay = int(loop_delay)  # Convert string to int
+        min_delay = 300  # Set minimum delay to 300 seconds (5 minutes)
+        loop_delay = max(loop_delay, min_delay)  # Choose maximum of loop_delay and min_delay
+        await asyncio.sleep(loop_delay)
 
 
 @slash_command(name="ping", description="☎️ Ping")
@@ -205,77 +223,54 @@ async def claim_callback(ctx: ComponentContext):
 
 @slash_command(name="checkstars", description="Check who has un-starred the repo and remove their role")
 async def check_stars_command(ctx: SlashContext):
-    # Get the role ID for the moderator or administrator role
-    admin_id = os.getenv('ADMIN_ID')
+    await check_star_status(ctx, manual=True)
+    await ctx.send("Star status checked", ephemeral=True)
 
-    # Check if the user has the moderator role
-    if not ctx.author.has_role(admin_id):
-        await ctx.send(content="You do not have permission to use this command.", ephemeral=True)
-        return
-    else:
-        await check_star_status(ctx)
-        await ctx.send("Star status checked", ephemeral=True)
+async def check_star_status(ctx: SlashContext, manual=False):
+    channel_id = os.getenv('CHANNEL_ID')
+    channel = client.get_channel(channel_id)
+    stargazers = await get_stargazers()
 
-async def check_star_status(ctx: SlashContext):
-    # The header to get the star time
-    headers = {"Accept": "application/vnd.github.v3.star+json"}
-    # The URL for the stargazers endpoint
-    url = f"https://api.github.com/repos/{owner}/{repo}/stargazers"
-
-    # A list to store the stargazers
-    stargazers = []
-    while True:
-        # Make a GET request to the URL
-        response = requests.get(url, headers=headers, timeout=60)
-
-        # Check if the response is successful
-        if response.status_code == 200:
-            # Parse the JSON data
-            data = response.json()
-
-            # Append the stargazers to the list
-            stargazers.extend([user for user in data])
-
-            # Get the next page URL from the Link header
-            link = response.headers.get("Link")
-
-            # If there is no next page, break the loop
-            if not link or "rel=\"next\"" not in link:
-                break
-
-            # Otherwise, update the URL with the next page
-            else:
-                url = link.split(";")[0].strip("<>")
-        else:
-            # If the response is not successful, print an error message and break the loop
-            print(f"Error: {response.status_code}")
-            break
-
-    # Get all users from the database
     user_collection = DB['users']
     users = user_collection.find()
 
     for user in users:
-        # If the user has un-starred the repo
         if user['github_username'] not in stargazers:
             # Get the Discord member object
             guild_id = os.getenv('GUILD_ID')
             guild = client.get_guild(guild_id)
             discord_member = guild.get_member(user['discord_id'])
 
-            # Check if the user already has the role removed
             if not discord_member.has_role(role):
-                # User already has the role removed, do nothing
                 continue
 
-            # Remove the role from the user
             await discord_member.remove_role(role, reason='no_star')
             username = user['discord_username'].replace('@', '')
             sorry_message = random.choice(SORRY).format(user['discord_id'])
-            await ctx.send(content=f"Removed role from **{username}** for un-starring the repo.", ephemeral=True)
-            await ctx.send(content=sorry_message)
+            await channel.send(content=sorry_message)
 
-            # Update the user's star status in the database
+            if manual:
+                await ctx.send(content=f"Removed role from **{username}** for un-starring the repo.", ephemeral=True)
+
             user_collection.update_one({'github_username': user['github_username']}, {'$set': {'starred_repo': False}})
+
+
+async def get_stargazers():
+    headers = {"Accept": "application/vnd.github.v3.star+json"}
+    url = f"https://api.github.com/repos/{owner}/{repo}/stargazers"
+    stargazers = []
+    while True:
+        response = requests.get(url, headers=headers, timeout=60)
+        if response.status_code == 200:
+            data = response.json()
+            stargazers.extend(data)
+            link = response.headers.get("Link")
+            if not link or "rel=\"next\"" not in link:
+                break
+            url = link.split(";")[0].strip("<>")
+        else:
+            print(f"Error: {response.status_code}")
+            break
+    return stargazers
 
 client.start()
