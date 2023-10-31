@@ -1,18 +1,18 @@
-# GitHub Star ⭐ Discord Validation bot
+# GitHub Star ⭐ Discord Verification bot
 
-Discord-GitHub-bot is a bot that integrates Discord with GitHub. It provides various functionalities such as user validation, role assignment, and periodic checks of starred users.
+This bot integrates Discord with GitHub. It provides various functionalities such as user validation, role assignment, and periodic checks of starred users.
 
 ## Features
 
-- User Validation: The bot verifies users with GitHub OAuth.
-- Role Assignment: The bot assigns a role if the users have starred a specified repo.
-- Periodic Checks: The bot periodically checks the starred users.
+- ✔️ User Validation: The bot verifies users with GitHub OAuth.
+- 💫 Role Assignment: The bot assigns a role **if** the users have starred a specified repo.
+- 🔍 Periodic Checks: The bot periodically checks the starred users.
 
 ## Installation
 
-1. Clone the repository.
-2. Configure the .env file
-3. Run the bot in a Docker container for easier deployment.
+1. 🧑‍🤝‍🧑 Clone the repository.
+2. ✏️ Configure the .env file
+3. 🐳 Run the bot in a Docker container for easier deployment.
 
 ## Usage
 
