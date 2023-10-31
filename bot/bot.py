@@ -39,7 +39,7 @@ DB = None
 
 logging.basicConfig()
 cls_log = logging.getLogger('MyLogger')
-cls_log.setLevel(logging.DEBUG)
+cls_log.setLevel(logging.INFO)
 
 # Connect to the MongoDB server
 try:
