@@ -18,7 +18,9 @@ The bot uses slash commands for operation. Here are some of the commands:
 - `/your-custom-name` A customizable command that displays 4 buttons to access 4 custom URLs of your choice
 - `/help`: Command names and usage
 
-Here's an example of how the `/verify` command works:
+Here's an example of the `/verify` command:
+
+![image](https://github.com/fuegovic/Starguard/assets/32828263/92bf7d36-b36f-4832-868f-9eeed53926c3)
 
 
 ## Installation
