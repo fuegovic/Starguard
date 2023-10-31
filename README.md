@@ -1,4 +1,4 @@
-# Discord GitHub Star based Validation bot
+# GitHub Star ⭐ Discord Validation bot
 
 Discord-GitHub-bot is a bot that integrates Discord with GitHub. It provides various functionalities such as user validation, role assignment, and periodic checks of starred users.
 
