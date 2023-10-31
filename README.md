@@ -4,8 +4,8 @@ Discord-GitHub-bot is a bot that integrates Discord with GitHub. It provides var
 
 ## Features
 
-- User Validation: The bot verifies users who have used GitHub OAuth.
-- Role Assignment: The bot assigns roles based on certain criteria.
+- User Validation: The bot verifies users with GitHub OAuth.
+- Role Assignment: The bot assigns a role if the users have starred a specified repo.
 - Periodic Checks: The bot periodically checks the starred users.
 
 ## Installation
