@@ -20,7 +20,9 @@ The bot uses slash commands for operation. Here are some of the commands:
 
 - `/verify`: Validates a user and checks if they have starred the repository.
 - `/checkstars`: Forces re-verification and updates role assignments.
+- `/starcount`: Output the te total amount of stargazers for specified repo
 - `/your-custom-name` A customizable command that displays 4 buttons to access 4 custom URLs of your choice
+- `help`: Command name and usage
 
 ## License
 
