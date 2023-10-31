@@ -1,3 +1,8 @@
+# pylint: disable=missing-module-docstring
+# pylint: disable=missing-class-docstring
+# pylint: disable=missing-function-docstring
+# pylint: disable=line-too-long
+
 import os
 from datetime import datetime, timezone
 from flask import Flask, request, render_template, url_for, session
@@ -8,6 +13,10 @@ from pymongo import MongoClient
 import pymongo
 
 load_dotenv()
+
+owner = os.getenv('REPO_OWNER')
+repo = os.getenv('GITHUB_REPO')
+url = f"https://github.com/{owner}/{repo}/"
 
 app = Flask(__name__, template_folder='./html')
 app.template_folder = './html'
@@ -40,9 +49,6 @@ github = oauth.register(
 
 @app.route('/login')
 def login():
-    """
-    Initiates the GitHub OAuth login process.
-    """
     discord_username = request.args.get('name')
     discord_id = request.args.get('id')
     session['name'] = discord_username
@@ -52,13 +58,10 @@ def login():
 
 @app.route('/authorize')
 def authorize():
-    """
-    Handles the GitHub OAuth authorization and user data retrieval.
-    """
     discord_username = session.get('name')
     discord_id = session.get('id')
     message = ""
-    user_data = None
+    user_data = {}
 
     try:
         token = github.authorize_access_token()
@@ -76,12 +79,12 @@ def authorize():
             print(f"User's email: {email}")
             print(f"Token: {token}")
 
+            # Make a GET request to the "Check if a repository is starred" endpoint
+            starred_resp = github.get(f'user/starred/{owner}/{repo}', token=token)
+            print(f"starred response = {starred_resp}")
 
-            # Save user information to MongoDB
-            user_collection = DB['users']
-
-            # Check if a document with the same email exists
-            existing_user = user_collection.find_one({'github_email': email})
+            # If the response status code is 204, the repository is starred
+            starred_repo = starred_resp.status_code == 204
 
             # Get the current timestamp in UTC
             current_time = datetime.now(timezone.utc).isoformat()
@@ -91,16 +94,13 @@ def authorize():
                 'discord_id': discord_id,
                 'github_username': username,
                 'github_email': email,
+                'linked_repo': url,
+                'starred_repo': starred_repo,
                 'github_token': token,
                 'updated_at': current_time,
             }
 
-            if existing_user:
-                # Update the existing document
-                user_collection.update_one({'github_email': email}, {'$set': user_data})
-            else:
-                # Insert a new document
-                user_collection.insert_one(user_data)
+            save_user_data_to_db(user_data)
 
         else:
             # Auth failed
@@ -113,12 +113,23 @@ def authorize():
 
     return render_template('result.html', message=message, user_data=user_data)
 
+def save_user_data_to_db(user_data):
+    # Save user information to MongoDB
+    user_collection = DB['users']
+
+    # Check if a document with the same email exists
+    existing_user = user_collection.find_one({'github_email': user_data['github_email']})
+
+    if existing_user:
+        # Update the existing document
+        user_collection.update_one({'github_email': user_data['github_email']}, {'$set': user_data})
+    else:
+        # Insert a new document
+        user_collection.insert_one(user_data)
+
 @app.route('/')
 def home():
-    """
-    Renders the home page.
-    """
     return render_template('home.html')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=True)
+    app.run(host='0.0.0.0', port=8080, debug=False)
