@@ -1,7 +1,7 @@
 services:
   discord-bot:
-    container_name: discord-bot
-    image: discord-bot
+    container_name: Starguard-Bot
+    image: starguard-bot
     build:
       context: .
       dockerfile: Dockerfile_bot
@@ -9,11 +9,11 @@ services:
     env_file:
       - .env
     networks:
-      - Discord-GH-bot
+      - Starguard
 
   server:
-    container_name: oauth-server
-    image: server-discord-bot
+    container_name: Starguard-Server
+    image: starguard-server
     ports:
       - 8080:8080
     build:
@@ -23,7 +23,7 @@ services:
     env_file:
       - .env
     networks:
-      - Discord-GH-bot
+      - Starguard
 
   mongodb:
     container_name: mongodb
@@ -35,7 +35,7 @@ services:
     command: mongod --noauth
     restart: always
     networks:
-      - Discord-GH-bot
+      - Starguard
 
   mongo-express:
     container_name: mongo-express
@@ -50,7 +50,7 @@ services:
       ME_CONFIG_BASICAUTH_PASSWORD: password
     restart: always
     networks:
-      - Discord-GH-bot
+      - Starguard
 
 networks:
-  Discord-GH-bot:
+  Starguard:
