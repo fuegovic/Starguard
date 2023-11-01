@@ -53,7 +53,8 @@ def login():
     discord_id = request.args.get('id')
     session['name'] = discord_username
     session['id'] = discord_id
-    redirect_uri = url_for('authorize', _external=True, _scheme='https') # REMOVE `_scheme='https'` TO TEST WITH LOCALHOST
+    scheme = 'https' if os.getenv('DOMAIN').startswith('https') else 'http'
+    redirect_uri = url_for('authorize', _external=True, _scheme=scheme)
     return github.authorize_redirect(redirect_uri)
 
 @app.route('/authorize')
