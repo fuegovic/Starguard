@@ -1,5 +1,6 @@
 # Starguard 
-<p align="center"> <img src="https://github.com/fuegovic/Starguard/assets/32828263/3bf5e660-bdb3-43c6-9dcc-614723d68bef" width="200" height="200"/> </p>
+<p align="center"> <img src="https://github.com/fuegovic/Starguard/assets/32828263/969a9e91-6c40-4f77-ad6b-379fbfa28bbe" width="200" height="200"/> </p>
+
 
 Discord Starguard is a bot that integrates Discord with GitHub. It provides various functionalities such as user validation, role assignment, and periodic checks of starred users. It's perfect for developers who want to reward their supporters and grow their community.
 
@@ -21,7 +22,7 @@ The bot uses slash commands for operation. Here are some of the commands:
 
 Here's an example of the `/verify` command:
 
-![image](https://github.com/fuegovic/Starguard/assets/32828263/14745e6b-4d8d-48ca-b057-4799b6758d29)
+![image](https://github.com/fuegovic/Starguard/assets/32828263/0790e3e3-5ff8-45df-9b25-91e32069c273)
 
 
 
