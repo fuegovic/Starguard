@@ -102,7 +102,7 @@ async def help_command(ctx: SlashContext):
         title="GitHub 🌟 Verification Bot",
         description="Here is a list of available commands:",
         color=0xffac33,
-        url="https://github.com/fuegovic/Discord-GH-bot"
+        url="https://github.com/fuegovic/Starguard"
     )
 
     embed.add_field(
