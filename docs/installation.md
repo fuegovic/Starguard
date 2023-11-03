@@ -20,20 +20,35 @@ To install Discord Starguard on your server, you need to follow these steps:
 
 ## Step 3: Create a GitHub OAuth app
 
-- Go to [https://github.com/settings/apps](https://github.com/settings/apps), select New App.
-- Fill in the required fields, such as application name, homepage URL, description, etc.
+- Go to https://github.com/settings/apps and log in with your GitHub account.
+- Click on the "New OAuth App" button and give your app a name, a homepage URL, and a callback URL. You can also add a description and a logo if you want.
 - For the **Authorization callback URL**, enter `http://your-domain/authorize`. You need to use a public domain to make the oauth accessible to your users.
+- - In `Permissions`, select `Account permissions`, set `Email addresses` and `Starring` to `Read-only`
 - Click on the **Register application** button and copy your client ID and client secret. You will need them later.
-- In `Permissions`, select `Account permissions`, set `Email addresses` and `Starring` to `Read-only`
+- Copy and paste the **client ID** to the `GITHUB_CLIENT_ID` variable and the **client secret** to the `GITHUB_CLIENT_SECRET` variable in your .env file.
 - Create the GitHub app and save your changes.
 
-## Step 4: Configure the .env file
+## Step 4: Create a classic GitHub public access token (PAT)
+
+- Go to your GitHub account settings, select Developer settings, then Personal access tokens, then Generate new token (classic).
+- Choose a name for your token and the scopes you want to grant to it. The scopes determine what resources and actions the token can access on GitHub.
+- Click Generate token and copy the token to your clipboard. You can also view or delete your tokens at any time on the Personal access tokens page.
+- Copy and paste the token to the `GITHUB_TOKEN` variable in your .env file.
+
+# Step 5: Get the role ID, guild ID, and channel ID from Discord
+
+- Enable developer mode in discord. You can do this by going to User Settings > Advanced > Developer Mode and toggling it on.
+- Right-click on the role that you want to give to users who have starred your GitHub repo. You will see a "Copy ID" option. Click on it and paste it to the `ROLE_ID` variable in your .env file.
+- Right-click on the server where you want to use the bot. You will see a "Copy ID" option. Click on it and paste it to the `GUILD_ID` variable in your .env file.
+- Right-click on the channel where you want the bot to post messages. You will see a "Copy ID" option. Click on it and paste it to the `CHANNEL_ID` variable in your .env file.
+
+## Step 6: Configure the .env file
 
 - Clone the repository: `git clone https://github.com/fuegovic/discord-starguard.git`
 - Rename the file `.env.example` to `.env` in the root directory of the project and add the necessary variables
 **see: [.env configuration](./env_file.md)**
 
-## Step 6: Run the bot in a Docker container
+## Step 7: Run the bot in a Docker container
 
 - Install Docker desktop or Docker and Docker Compose on your machine if you don't have them already.
 - Run this command in the root directory of the project: `docker-compose up -d`
