@@ -7,13 +7,13 @@ This file contains the environment variables for the discord bot. You need to fi
 - `TOKEN`: The discord app token for your bot. You can get it from https://discord.com/developers/applications
 - `CLIENT_ID`: The discord client ID for your bot. You can get it from https://discord.com/developers/applications
 
-For detailled instructions: [Discord dev](./discord_dev.md) 
+For detailled instructions: [Discord dev](./installation.md#step-1-obtain-the-app-token-and-client-id-from-the-discord-dev-portal) 
 
 - `ROLE_ID`: The ID of the role that you want to give to users who have starred your GitHub repo. You can get it by enabling developer mode in discord and right-clicking on the role.
 - `GUILD_ID`: The ID of the server where you want to use the bot. You can get it by enabling developer mode in discord and right-clicking on the server.
 - `CHANNEL_ID`: The ID of the channel where you want the bot to post messages. You can get it by enabling developer mode in discord and right-clicking on the channel.
 
-For detailled instructions: [Discord Server](./discord.md) 
+For detailled instructions: [Discord Server](./installation.md#step-5-get-the-role-id-guild-id-and-channel-id-from-discord) 
 
 ## GitHub Variables
 
@@ -23,18 +23,24 @@ For detailled instructions: [Discord Server](./discord.md)
 - `GITHUB_CLIENT_ID`: The client ID of the GitHub OAuth app that you have created for the bot. You can create one at https://github.com/settings/apps
 - `GITHUB_CLIENT_SECRET`: The client secret of the GitHub OAuth app that you have created for the bot. You can get it from https://github.com/settings/apps
 
-For detailled instructions: [GitHub OAuth](./github_oauth.md)
+For detailled instructions: [GitHub OAuth](./installation.md#step-3-create-a-github-oauth-app)
 
 - `GITHUB_TOKEN`: GitHub Public Access Token needed to fetch the stargazers name from the specified repo.
 
-For detailled instructions: [GitHub PAT](./github_pat.md) 
+For detailled instructions: [GitHub PAT](./installation.md#step-4-create-a-classic-github-public-access-token-pat) 
 
 - `SECRET_KEY`: A random secret key that you have generated for securing the OAuth process. You can use any mix of letters, numbers, and symbols.
 
 ## MongoDB Variables
 
-- `MONGO_HOST`: The host name of the MongoDB database that you want to use for storing user data. If you are using docker, set it to `mongodb`. Otherwise, use `localhost`.
+- `MONGO_HOST`: The host name of the MongoDB database that you want to use for storing user data. If you are using docker, set it to `mongodb`.
 - `MONGO_DATABASE`: The name of the MongoDB database that you want to use for storing user data. The default is `mongodb`
+
+## Mongo-Express
+- You can access the database by visiting `http://localhost:8085/`. Please change the default credentials for something more secure.
+
+- `ME_CONFIG_BASICAUTH_USERNAME`: The username used to connect to the database with mongo-express
+- `ME_CONFIG_BASICAUTH_PASSWORD`: The password used to connect to the database with mongo-express
 
 ## Other Variables
 
