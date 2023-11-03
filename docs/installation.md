@@ -54,4 +54,7 @@ To install Discord Starguard on your server, you need to follow these steps:
 - Run this command in the root directory of the project: `docker-compose up -d`
 - Wait for the bot to start and log in to your Discord server. You should see your bot online and ready to use.
 
+## Step 8: Advanced permissions
+- On your server, in `Server Settings`, in the `Integrations` tab, you can limit the bot usage to a specific channel and limit the bot commands to specific user(s)/role(s)
+
 🎉 Congratulations! You have successfully installed Discord Starguard on your server. You can now use slash commands to interact with it. 
