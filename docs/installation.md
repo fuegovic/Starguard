@@ -35,7 +35,7 @@ To install Discord Starguard on your server, you need to follow these steps:
 - Click Generate token and copy the token to your clipboard. You can also view or delete your tokens at any time on the Personal access tokens page.
 - Copy and paste the token to the `GITHUB_TOKEN` variable in your .env file.
 
-# Step 5: Get the role ID, guild ID, and channel ID from Discord
+## Step 5: Get the role ID, guild ID, and channel ID from Discord
 
 - Enable developer mode in discord. You can do this by going to User Settings > Advanced > Developer Mode and toggling it on.
 - Right-click on the role that you want to give to users who have starred your GitHub repo. You will see a "Copy ID" option. Click on it and paste it to the `ROLE_ID` variable in your .env file.
