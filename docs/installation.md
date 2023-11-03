@@ -4,7 +4,7 @@ Starguard is a bot that integrates Discord with GitHub. It provides various func
 
 To install Discord Starguard on your server, you need to follow these steps:
 
-## Obtain the app token and client ID from the Discord Dev Portal
+## Step 1: Obtain the app token and client ID from the Discord Dev Portal
 
 - Go to the [Discord Developer Portal](https://discord.com/developers/applications) and log in with your Discord account.
 - Click on the **New Application** button and give your application a name.
