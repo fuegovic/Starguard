@@ -20,10 +20,12 @@ To install Discord Starguard on your server, you need to follow these steps:
 
 ## Step 3: Create a GitHub OAuth app
 
-- Go to your GitHub account settings, select Developer settings, then OAuth Apps, then New OAuth App.
+- Go to [https://github.com/settings/apps](https://github.com/settings/apps), select New App.
 - Fill in the required fields, such as application name, homepage URL, description, etc.
-- For the **Authorization callback URL**, enter `http://localhost:8080/authorize`. You can change this if you deploy your bot to a different host.
+- For the **Authorization callback URL**, enter `http://your-domain/authorize`. You need to use a public domain to make the oauth accessible to your users.
 - Click on the **Register application** button and copy your client ID and client secret. You will need them later.
+- In `Permissions`, select `Account permissions`, set `Email addresses` and `Starring` to `Read-only`
+- Create the GitHub app and save your changes.
 
 ## Step 4: Configure the .env file
 
