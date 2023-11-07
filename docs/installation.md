@@ -61,16 +61,8 @@ To install Discord Starguard on your server, you need to follow these steps:
 
 ## NGINX 
 - There is a docker image that includes `nginx-proxy-manager`, you can use it with: `docker-compose -f ./deploy-compose.yml up --build`
-- Example config:
-```shell
-location / {
-    proxy_pass http://your-local-ip:5000;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    proxy_set_header X-Forwarded-Host $host;
-}
-```
+- Access `nginx-proxy-manager` at http://localhost:81
+  - login with: email: `admin@example.com` | password: `changeme`
+  - Immediately after logging in with this default user you will be asked to modify your details and change your password.
 
 🎉 Congratulations! You have successfully installed Discord Starguard on your server. You can now use slash commands to interact with it. 
