@@ -59,4 +59,18 @@ To install Discord Starguard on your server, you need to follow these steps:
 ## Step 9: Advanced permissions
 - On your server, in `Server Settings`, in the `Integrations` tab, you can limit the bot usage to a specific channel and limit the bot commands to specific user(s)/role(s)
 
+## NGINX 
+- There is a docker image that includes `nginx-proxy-manager`, you can use it with: `docker-compose -f ./deploy-compose.yml up --build`
+- Example config:
+```shell
+location / {
+    proxy_pass http://your-local-ip:5000;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+}
+```
+
 🎉 Congratulations! You have successfully installed Discord Starguard on your server. You can now use slash commands to interact with it. 

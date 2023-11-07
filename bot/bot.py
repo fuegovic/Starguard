@@ -39,7 +39,7 @@ DB = None
 
 logging.basicConfig()
 cls_log = logging.getLogger('MyLogger')
-cls_log.setLevel(logging.INFO)
+cls_log.setLevel(logging.DEBUG)
 
 # Connect to the MongoDB server
 try:
@@ -113,11 +113,13 @@ async def help_command(ctx: SlashContext):
     embed.add_field(
         name="> /verify",
         value="**GitHub verification**\n"
-        "- ✨ Star the repo\n- 🔑 Link your GitHub account\n- 🎁 Get a role"
+        f"- ✨ Star **{repo}**\n"
+        "- 🔑 Link your GitHub account\n"
+        "- 🎁 Get a role"
     )
     embed.add_field(
         name="> /starcount",
-        value="**💫 Displays the number of stargazers for the specified repo**"
+        value=f"**💫 Displays the number of stargazers for:\nhttps://github.com/{owner}/{repo}/**"
     )
     embed.add_field(
         name=f"> /{os.getenv('COMMAND_NAME')}",

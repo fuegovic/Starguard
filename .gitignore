@@ -163,5 +163,9 @@ cython_debug/
 server/mongo-data/
 mongo-data/
 
+# nginx-proxy-manager
+data/
+letsencrypt/
+
 #VSCode
 .vscode/
