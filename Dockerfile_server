@@ -7,4 +7,4 @@ COPY .env /app/
 
 RUN pip install Flask python-dotenv authlib pymongo requests
 
-CMD ["python", "github_oauth.py"]
+CMD ["python", "server.py"]

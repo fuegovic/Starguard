@@ -16,6 +16,9 @@ This file contains the environment variables for the discord bot. You need to fi
 - `REPO_OWNER`: The username of the owner of the GitHub repo that you want to promote with the bot.
 - `GITHUB_REPO`: The name of the GitHub repo that you want to promote with the bot.
 
+- `SERVER_PORT`: The port for for the oauth server. The default is `5000`
+- `DOMAIN`: The domain for the oauth server. You need to use a domain to make it usable outside your home network.
+- 
 - `GITHUB_CLIENT_ID`: The client ID of the GitHub OAuth app that you have created for the bot. You can create one at https://github.com/settings/apps
 - `GITHUB_CLIENT_SECRET`: The client secret of the GitHub OAuth app that you have created for the bot. You can get it from https://github.com/settings/apps
 
@@ -27,12 +30,15 @@ This file contains the environment variables for the discord bot. You need to fi
 
 - `MONGO_HOST`: The host name of the MongoDB database used for storing user data. If you are using docker, set it to `mongodb`.
 - `MONGO_DATABASE`: The name of the MongoDB database used for storing user data. The default is `mongodb`
+- `MONGO_PORT`: The external port for the MongoDB The default is `27017` 
+- Note: The external access is disabled by default, but you can enable it by editing the `docker-compose.yml` file
 
 ## Mongo-Express
-- You can access the database by visiting `http://localhost:8085/`. Please change the default credentials for something more secure.
+- You can access the database by visiting `http://localhost:8081/`. Please change the default credentials for something more secure.
 
-- `ME_CONFIG_BASICAUTH_USERNAME`: The username used to connect to the database with mongo-express. The default is `admin` 
-- `ME_CONFIG_BASICAUTH_PASSWORD`: The password used to connect to the database with mongo-express. The default is `password`
+- `MONGO_EXPRESS_USERNAME`: The username used to connect to the database with mongo-express. The default is `admin` 
+- `MONGO_EXPRESS_PASSWORD`: The password used to connect to the database with mongo-express. The default is `password`
+- `MONGO_EXPRESS_PORT`: The port used to access mongo-express. The default is `8081`
 
 ## Other Variables
 

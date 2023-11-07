@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from authlib.integrations.flask_client import OAuth
 from authlib.integrations.flask_client import OAuthError
 from pymongo import MongoClient
+from werkzeug.middleware.proxy_fix import ProxyFix
 import pymongo
 
 load_dotenv()
@@ -19,6 +20,7 @@ repo = os.getenv('GITHUB_REPO')
 url = f"https://github.com/{owner}/{repo}/"
 
 app = Flask(__name__, template_folder='./html')
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
 app.template_folder = './html'
 app.secret_key = os.getenv('SECRET_KEY')
 oauth = OAuth(app)
@@ -53,8 +55,7 @@ def login():
     discord_id = request.args.get('id')
     session['name'] = discord_username
     session['id'] = discord_id
-    scheme = 'https' if os.getenv('DOMAIN').startswith('https') else 'http'
-    redirect_uri = url_for('authorize', _external=True, _scheme=scheme)
+    redirect_uri = url_for('authorize', _external=True)
     return github.authorize_redirect(redirect_uri)
 
 @app.route('/authorize')
@@ -133,4 +134,4 @@ def home():
     return render_template('home.html')
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    app.run(host='0.0.0.0', port=os.getenv('SERVER_PORT'), debug=True)
