@@ -28,12 +28,12 @@ This file contains the environment variables for the discord bot. You need to fi
 
 ## MongoDB Variables
 
-- `MONGO_HOST`: The host name of the MongoDB database used for storing user data. If you are using docker, set it to `mongodb`.
-- `MONGO_DATABASE`: The name of the MongoDB database used for storing user data. The default is `mongodb`
-- `MONGO_PORT`: The external port for the MongoDB The default is `27017` 
-- Note: The external access is disabled by default, but you can enable it by editing the `docker-compose.yml` file
+- `MONGO_HOST`: The host name of the MongoDB database used for storing user data. If you are using docker mongo (from the `override.example`), set it to `mongodb`.
+- `MONGO_DATABASE`: The name of the MongoDB database used for storing user data. The default is `starguard`
+- Note: The external access is disabled by default, but you can enable it by editing the `docker-compose.override.yml` file, See the `override.example` file.
 
 ## Mongo-Express
+You can enable this by editing the `docker-compose.override.yml` file, See the `override.example` file.
 - You can access the database by visiting `http://localhost:8081/`. Please change the default credentials for something more secure.
 
 - `MONGO_EXPRESS_USERNAME`: The username used to connect to the database with mongo-express. The default is `admin` 

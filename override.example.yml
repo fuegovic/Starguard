@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+  mongodb:
+    container_name: mongo
+    image: mongo:4.4.18 # for compatibility with older hardware, feel free to use :latest
+    # uncomment the 2 following lines to make accessible from outside docker
+    # ports:
+    #   - 27017:27017
+    volumes:
+      - ./server/mongo-data:/data/db
+    command: mongod --noauth
+    restart: always
+    networks:
+      - Starguard
+
+  mongo-express:
+    container_name: mongo-express
+    image: mongo-express
+    ports:
+      - ${MONGO_EXPRESS_PORT}:8081
+    environment:
+      ME_CONFIG_MONGODB_SERVER: mongodb
+      ME_CONFIG_MONGODB_PORT: 27017
+      ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
+      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USERNAME}
+      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASSWORD}
+    restart: always
+    networks:
+      - Starguard
+
+# To enable docker mongodb and mongo express (for secure management of the database)
+# 1. Duplicate this file and rename it "docker-compose.override.yml"
+# 2. Use "docker compose up -d" as you would normally

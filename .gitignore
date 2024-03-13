@@ -3,6 +3,10 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Docker Override file
+docker-compose.override.yaml
+docker-compose.override.yml
+
 # C extensions
 *.so
 
