@@ -6,22 +6,24 @@ on:
       - main
 
 jobs:
+
   build-and-push-image-bot:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
+              
       - name: Set up Docker
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v2.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+          node-version: '20'
 
       - name: Build and push Docker image for bot
         run: |
@@ -36,20 +38,21 @@ jobs:
 
   build-and-push-image-server:
     runs-on: ubuntu-latest
-
+    
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
+              
       - name: Set up Docker
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v2
+        uses: docker/login-action@v2.1.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+          node-version: '20'
 
       - name: Build and push Docker image for server
         run: |
