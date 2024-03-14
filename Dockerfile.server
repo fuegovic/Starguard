@@ -3,7 +3,7 @@ FROM python:3.10
 WORKDIR /app
 
 COPY server/ /app/
-COPY .env /app/
+COPY .env.example /app/.env
 
 RUN pip install Flask python-dotenv authlib pymongo requests
 
