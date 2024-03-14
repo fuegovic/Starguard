@@ -3,7 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Docker Override file
+# Docker Override
 docker-compose.override.yaml
 docker-compose.override.yml
 
