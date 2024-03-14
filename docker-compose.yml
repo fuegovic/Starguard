@@ -1,7 +1,7 @@
 version: "3.9"
 services:
   discord-bot:
-    container_name: Bot
+    container_name: StarGuardBot
     image: bot
     build:
       context: .
@@ -13,7 +13,7 @@ services:
       - Starguard
 
   server:
-    container_name: Server
+    container_name: StarGuardServer
     image: server
     ports:
       - ${SERVER_PORT}:5000
