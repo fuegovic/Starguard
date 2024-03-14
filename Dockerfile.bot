@@ -4,7 +4,7 @@ WORKDIR /app
 
 COPY bot/bot.py /app/
 COPY bot/messages.py /app/
-COPY .env /app/
+COPY .env.example /app/.env
 
 RUN python -m pip install --upgrade pip
 
