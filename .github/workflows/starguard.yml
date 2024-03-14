@@ -30,7 +30,7 @@ jobs:
 
       - name: Tag and push bot image
         run: |
-          docker tag starguard-bot:latest ghcr.io/${{ github.repository_owner }}/starguard:bot:${{ github.sha }}
+          docker tag starguard-bot:latest ghcr.io/${{ github.repository_owner }}/starguardbot:${{ github.sha }}
           docker push ghcr.io/${{ github.repository_owner }}/starguard:bot:${{ github.sha }}
 
   build-and-push-image-server:
@@ -56,5 +56,5 @@ jobs:
 
       - name: Tag and push server image
         run: |
-          docker tag starguard-server:latest ghcr.io/${{ github.repository_owner }}/starguard:server:${{ github.sha }}
+          docker tag starguard-server:latest ghcr.io/${{ github.repository_owner }}/starguardserver:${{ github.sha }}
           docker push ghcr.io/${{ github.repository_owner }}/starguard:server:${{ github.sha }}
