@@ -23,7 +23,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-          node-version: '20'
 
       - name: Build and push Docker image for bot
         run: |
@@ -52,7 +51,6 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-          node-version: '20'
 
       - name: Build and push Docker image for server
         run: |
