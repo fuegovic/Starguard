@@ -8,6 +8,8 @@ This file contains the environment variables for the discord bot. You need to fi
 - `CLIENT_ID`: The discord client ID for your bot. You can get it from https://discord.com/developers/applications
 
 - `ROLE_ID`: The ID of the role that you want to give to users who have starred your GitHub repo. You can get it by enabling developer mode in discord and right-clicking on the role.
+- `CONTRIBUTOR_ROLE_ID`: The ID of the role that you want to give to users who contributed to your GitHub repo. Omit or set to an empty value if you don't want to use this feature.
+
 - `GUILD_ID`: The ID of the server where you want to use the bot. You can get it by enabling developer mode in discord and right-clicking on the server.
 - `CHANNEL_ID`: The ID of the channel where you want the bot to post messages. You can get it by enabling developer mode in discord and right-clicking on the channel.
 

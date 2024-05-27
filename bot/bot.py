@@ -32,6 +32,7 @@ token = os.getenv('TOKEN')
 repo = os.getenv('GITHUB_REPO')
 owner = os.getenv('REPO_OWNER')
 role = os.getenv('ROLE_ID')
+contributor_role = os.getenv('CONTRIBUTOR_ROLE_ID')
 client_id = os.getenv('CLIENT_ID')
 domain = os.getenv('DOMAIN')
 CLIENT = None
@@ -220,20 +221,45 @@ async def claim_callback(ctx: ComponentContext):
     user_entry = user_collection.find_one({'discord_id': f'{userid}', 'linked_repo': f"https://github.com/{owner}/{repo}/"})
 
     if user_entry:
+        roles_assigned = []
+        num_roles_already_claimed = 0
+        num_roles_all = 1
+        
         # Check if user has starred the repo
         if user_entry.get('starred_repo', False):
-            # Check if user already has the role
+            # Check if user already has the star role
             if user.has_role(role):
                 # User already has the role, do nothing
-                await ctx.send(content="You already claimed your role 😁\n💫Thanks!", ephemeral=True)
+                num_roles_already_claimed += 1
             else:
-                # User doesn't have the role, assign it and send the message
                 await user.add_role(role, reason='star')
-                thank_you_message = random.choice(THANKS).format(userid)
-                await ctx.send(content=thank_you_message)
+                roles_assigned.append('Star Role')
         else:
             await user.remove_role(role, reason='no_star')
-            await ctx.send(content="Please star the repo to get the role 🌟", ephemeral=True)
+
+        # Should contributor roles be assigned?
+        if contributor_role is not None and contributor_role != '':
+            num_roles_all += 1
+            
+            # Check if user is a contributor
+            if await is_contributor(user_entry.get('github_username')):
+                # Check if user already has the contributor role
+                if user.has_role(contributor_role):
+                    # User already has the role, do nothing
+                    num_roles_already_claimed += 1
+                else:
+                    await user.add_role(contributor_role, reason='contributor')
+                    roles_assigned.append('Contributor Role')
+
+        if roles_assigned:
+            thank_you_message = random.choice(THANKS).format(userid)
+            await ctx.send(content=f"{thank_you_message}\n\nRoles assigned: {', '.join(roles_assigned)}", ephemeral=True)
+        else:
+            if num_roles_already_claimed == num_roles_all:
+                # User already has all the roles, do nothing
+                await ctx.send(content="You already claimed all roles that you are eligible for. 😁\n💫 Thanks!", ephemeral=True)
+            else:
+                await ctx.send(content="You have not met the criteria for any roles. 🌟🛠️", ephemeral=True)
     else:
         await ctx.send(content="Please make sure to link your GitHub account by using the **Log in with GitHub** button.", ephemeral=True)
 
@@ -305,5 +331,20 @@ async def get_stargazers():
             print(f"Error: {response.status_code}")
             return None
     return stargazers
+
+# 🤗 CHECK IF THE USER IS A CONTRIBUTOR
+async def is_contributor(username):
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "Authorization": f"token {os.getenv('GITHUB_TOKEN')}"
+    }
+    url = f"https://api.github.com/repos/{owner}/{repo}/contributors"
+    response = requests.get(url, headers=headers, timeout=60)
+    if response.status_code == 200:
+        contributors = response.json()
+        for contributor in contributors:
+            if contributor['login'] == username:
+                return True
+    return False
 
 client.start()
