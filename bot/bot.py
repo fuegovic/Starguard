@@ -230,7 +230,7 @@ async def claim_callback(ctx: ComponentContext):
                 # User doesn't have the role, assign it and send the message
                 await user.add_role(role, reason='star')
                 thank_you_message = random.choice(THANKS).format(userid)
-                await ctx.send(content=thank_you_message)
+                await ctx.channel.send(content=thank_you_message)
         else:
             await user.remove_role(role, reason='no_star')
             await ctx.send(content="Please star the repo to get the role 🌟", ephemeral=True)
