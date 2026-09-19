@@ -1,0 +1,20 @@
+[MAIN]
+# The bot and the server both live at the repository root.
+init-hook = 'import sys; sys.path.insert(0, ".")'
+
+[MESSAGES CONTROL]
+disable =
+    duplicate-code,
+    too-few-public-methods,
+    too-many-arguments,
+    too-many-positional-arguments,
+    too-many-return-statements
+
+[FORMAT]
+max-line-length = 100
+
+[BASIC]
+good-names = i, j, k, db, ex, _, id, log, app
+
+[DESIGN]
+max-locals = 20

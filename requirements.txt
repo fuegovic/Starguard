@@ -1,7 +1,11 @@
-authlib==1.2.1
-discord_py_interactions==5.10.0
-Flask==2.3.2
-Interactions.py==5.8.0
-pymongo==4.6.3
-python-dotenv==1.0.0
-requests==2.31.0
+# Runtime dependencies, shared by the bot and the OAuth server.
+# The Docker images install from this file, so the pins here are what actually
+# ships (they used to be bypassed by a hand-written pip install line).
+authlib==1.8.0
+Flask==3.1.3
+interactions.py==5.16.0
+itsdangerous==2.2.0
+pymongo==4.18.1
+python-dotenv==1.1.1
+requests==2.34.2
+waitress==3.0.2
