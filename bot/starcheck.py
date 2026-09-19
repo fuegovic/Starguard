@@ -173,6 +173,18 @@ class StarChecker:
         return self._lock.locked()
 
     @property
+    def lock(self) -> asyncio.Lock:
+        """The mutex that serialises every role change this process makes.
+
+        Handed to the role-sync drain so the sweep and the drain take turns
+        over the same members. A lock of the drain's own would be no
+        exclusion at all: two mutexes held independently let both loops into
+        the same member at once, which is precisely the double role change
+        and double announcement this one was added to stop.
+        """
+        return self._lock
+
+    @property
     def last_completed(self) -> float | None:
         """``time.monotonic()`` of the last cycle that finished, or None."""
         return self._last_completed
