@@ -12,6 +12,7 @@ from common.config import (
     env_int,
     optional_env,
     require_env,
+    require_https_url,
     require_secret_key,
     require_snowflake,
 )
@@ -62,8 +63,16 @@ def test_env_int_rejects_nonsense(monkeypatch):
 
 @pytest.mark.parametrize(
     "raw,expected",
-    [("true", True), ("TRUE", True), ("1", True), ("yes", True),
-     ("false", False), ("FALSE", False), ("0", False), ("off", False)],
+    [
+        ("true", True),
+        ("TRUE", True),
+        ("1", True),
+        ("yes", True),
+        ("false", False),
+        ("FALSE", False),
+        ("0", False),
+        ("off", False),
+    ],
 )
 def test_env_bool_spellings(monkeypatch, raw, expected):
     monkeypatch.setenv("FLAG", raw)
@@ -115,3 +124,31 @@ def test_secret_key_rejects_missing(monkeypatch):
     monkeypatch.delenv("SECRET_KEY", raising=False)
     with pytest.raises(ConfigError, match="SECRET_KEY"):
         require_secret_key()
+
+
+def test_require_https_url_returns_it_without_a_trailing_slash(monkeypatch):
+    monkeypatch.setenv("DOMAIN", "https://starguard.example.com/")
+    assert require_https_url("DOMAIN") == "https://starguard.example.com"
+
+
+@pytest.mark.parametrize(
+    "raw", ["example.com", "http://example.com", "https:///login", "not a url"]
+)
+def test_require_https_url_rejects_anything_a_button_cannot_use(monkeypatch, raw):
+    # Discord refuses to render a button whose URL has no scheme, and the
+    # failure is silent unless the variable is named here.
+    monkeypatch.setenv("DOMAIN", raw)
+    with pytest.raises(ConfigError, match="absolute https URL"):
+        require_https_url("DOMAIN")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["https://example.com/?next=/admin", "https://example.com/#fragment"],
+)
+def test_require_https_url_rejects_a_query_string_or_fragment(monkeypatch, raw):
+    # The server appends its own query string to this value, so anything
+    # already there would produce a URL with two of them.
+    monkeypatch.setenv("DOMAIN", raw)
+    with pytest.raises(ConfigError, match="no query string or fragment"):
+        require_https_url("DOMAIN")

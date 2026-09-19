@@ -6,6 +6,8 @@ variable, instead of crashing later with an opaque error.
 """
 
 import os
+from typing import Final, overload
+from urllib.parse import urlsplit
 
 
 class ConfigError(RuntimeError):
@@ -15,19 +17,36 @@ class ConfigError(RuntimeError):
 # Values shipped in .env.example or commonly pasted from tutorials. A Flask
 # secret key that anyone can guess lets an attacker forge session cookies, so
 # these are rejected outright rather than merely warned about.
-PLACEHOLDER_SECRET_KEYS = frozenset({
-    "secretkey",
-    "changeme",
-    "change-me",
-    "secret",
-    "your-secret-key",
-    "please-change-me",
-})
+PLACEHOLDER_SECRET_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "secretkey",
+        "changeme",
+        "change-me",
+        "secret",
+        "your-secret-key",
+        "please-change-me",
+    }
+)
 
-MIN_SECRET_KEY_LENGTH = 16
+MIN_SECRET_KEY_LENGTH: Final = 16
 
 
-def optional_env(name, default=None):
+# The overloads exist so that ``optional_env(name, "")`` is a str at the call
+# site rather than ``str | None``. Half the callers pass a default precisely so
+# they never have to handle None, and without these they would all have to.
+@overload
+def optional_env(name: str) -> str | None: ...
+
+
+@overload
+def optional_env(name: str, default: str) -> str: ...
+
+
+@overload
+def optional_env(name: str, default: str | None) -> str | None: ...
+
+
+def optional_env(name: str, default: str | None = None) -> str | None:
     """Return the stripped value of ``name``, or ``default`` when unset/blank."""
     value = os.getenv(name)
     if value is None:
@@ -36,7 +55,7 @@ def optional_env(name, default=None):
     return value if value else default
 
 
-def require_env(name, hint=None):
+def require_env(name: str, hint: str | None = None) -> str:
     """Return the value of ``name``, raising :class:`ConfigError` when unset."""
     value = optional_env(name)
     if value is None:
@@ -47,7 +66,7 @@ def require_env(name, hint=None):
     return value
 
 
-def env_int(name, default, minimum=None):
+def env_int(name: str, default: int, minimum: int | None = None) -> int:
     """Return ``name`` as an int, clamped to ``minimum`` when one is given."""
     raw = optional_env(name)
     if raw is None:
@@ -56,15 +75,13 @@ def env_int(name, default, minimum=None):
         try:
             value = int(raw)
         except ValueError as exc:
-            raise ConfigError(
-                f"{name} must be a whole number, got {raw!r}."
-            ) from exc
+            raise ConfigError(f"{name} must be a whole number, got {raw!r}.") from exc
     if minimum is not None and value < minimum:
         return minimum
     return value
 
 
-def env_bool(name, default=False):
+def env_bool(name: str, default: bool = False) -> bool:
     """Return ``name`` as a bool, accepting the usual true/false spellings."""
     raw = optional_env(name)
     if raw is None:
@@ -74,12 +91,10 @@ def env_bool(name, default=False):
         return True
     if lowered in ("0", "false", "no", "off"):
         return False
-    raise ConfigError(
-        f"{name} must be a boolean such as true/false, got {raw!r}."
-    )
+    raise ConfigError(f"{name} must be a boolean such as true/false, got {raw!r}.")
 
 
-def require_snowflake(name):
+def require_snowflake(name: str) -> int:
     """Return a Discord ID as an int.
 
     Discord IDs arrive from the environment as strings. The library's cache is
@@ -95,7 +110,30 @@ def require_snowflake(name):
         ) from exc
 
 
-def require_secret_key():
+def require_https_url(name: str) -> str:
+    """Return ``name`` as an absolute https URL, with no trailing slash.
+
+    Members are sent to this address by a Discord button, so a malformed value
+    breaks the whole verification flow with nothing useful in the log: Discord
+    refuses to render a button whose URL has no scheme, and GitHub refuses an
+    OAuth redirect_uri it was not configured with. Failing here names the
+    variable instead.
+    """
+    raw = require_env(name)
+    parts = urlsplit(raw)
+    if parts.scheme != "https" or not parts.netloc:
+        raise ConfigError(
+            f"{name} must be an absolute https URL such as "
+            f"https://starguard.example.com, got {raw!r}."
+        )
+    if parts.query or parts.fragment:
+        raise ConfigError(
+            f"{name} must be a plain URL with no query string or fragment, got {raw!r}."
+        )
+    return raw.rstrip("/")
+
+
+def require_secret_key() -> str:
     """Return SECRET_KEY, rejecting unset, placeholder, and too-short values.
 
     The bot signs verification links with this key and the server verifies
@@ -104,7 +142,7 @@ def require_secret_key():
     """
     key = require_env(
         "SECRET_KEY",
-        hint="Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\"",
+        hint='Generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))"',
     )
     if key.lower() in PLACEHOLDER_SECRET_KEYS:
         raise ConfigError(
@@ -113,7 +151,6 @@ def require_secret_key():
         )
     if len(key) < MIN_SECRET_KEY_LENGTH:
         raise ConfigError(
-            f"SECRET_KEY must be at least {MIN_SECRET_KEY_LENGTH} characters, "
-            f"got {len(key)}."
+            f"SECRET_KEY must be at least {MIN_SECRET_KEY_LENGTH} characters, got {len(key)}."
         )
     return key

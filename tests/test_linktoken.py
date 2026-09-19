@@ -9,9 +9,11 @@ import json
 import time
 
 import pytest
+from itsdangerous import URLSafeTimedSerializer
 
 from common.linktoken import (
     DEFAULT_MAX_AGE_SECONDS,
+    SALT,
     LinkTokenError,
     issue_link_token,
     read_link_token,
@@ -41,12 +43,12 @@ def test_token_signed_with_another_key_is_rejected():
 def test_tampered_payload_is_rejected():
     # Rewriting the payload is the attack that matters: it is how someone would
     # swap in another user's Discord ID.
-    payload, timestamp, signature = issue_link_token(
-        SECRET, 123456789, "someone"
-    ).split(".")
-    forged_payload = base64.urlsafe_b64encode(
-        json.dumps({"id": "987654321", "name": "someone"}).encode()
-    ).rstrip(b"=").decode()
+    payload, timestamp, signature = issue_link_token(SECRET, 123456789, "someone").split(".")
+    forged_payload = (
+        base64.urlsafe_b64encode(json.dumps({"id": "987654321", "name": "someone"}).encode())
+        .rstrip(b"=")
+        .decode()
+    )
     assert forged_payload != payload
 
     with pytest.raises(LinkTokenError):
@@ -54,9 +56,7 @@ def test_tampered_payload_is_rejected():
 
 
 def test_tampered_signature_is_rejected():
-    payload, timestamp, signature = issue_link_token(
-        SECRET, 123456789, "someone"
-    ).split(".")
+    payload, timestamp, signature = issue_link_token(SECRET, 123456789, "someone").split(".")
     flipped = "".join("A" if c != "A" else "B" for c in signature[:4])
     with pytest.raises(LinkTokenError):
         read_link_token(SECRET, f"{payload}.{timestamp}.{flipped}{signature[4:]}")
@@ -65,9 +65,7 @@ def test_tampered_signature_is_rejected():
 def test_expired_token_is_rejected(monkeypatch):
     token = issue_link_token(SECRET, 123456789, "someone")
     real_time = time.time
-    monkeypatch.setattr(
-        time, "time", lambda: real_time() + DEFAULT_MAX_AGE_SECONDS + 60
-    )
+    monkeypatch.setattr(time, "time", lambda: real_time() + DEFAULT_MAX_AGE_SECONDS + 60)
     with pytest.raises(LinkTokenError, match="expired"):
         read_link_token(SECRET, token)
 
@@ -89,3 +87,21 @@ def test_non_numeric_discord_id_is_rejected():
 def test_missing_secret_key_is_an_error():
     with pytest.raises(LinkTokenError):
         issue_link_token("", 1, "a")
+
+
+def test_a_token_whose_payload_is_not_an_object_is_rejected():
+    # The signature says the value came from us, not that it has the shape
+    # this code expects, so the shape is checked before it is read.
+    signed = URLSafeTimedSerializer(SECRET, salt=SALT).dumps(["123456789"])
+    with pytest.raises(LinkTokenError, match="not valid"):
+        read_link_token(SECRET, signed)
+
+
+def test_a_token_from_another_purpose_is_rejected():
+    # The salt namespaces the signature, so a session cookie signed with the
+    # same SECRET_KEY cannot be replayed as a verification link.
+    signed = URLSafeTimedSerializer(SECRET, salt="some-other-purpose").dumps(
+        {"id": "123456789", "name": "someone"}
+    )
+    with pytest.raises(LinkTokenError):
+        read_link_token(SECRET, signed)

@@ -6,167 +6,202 @@ that user has starred the configured repository.
 
 The GitHub access token is used for the duration of the request and then
 discarded. It is never written to the database or to the logs.
+
+Importing this module does nothing. Everything is built by
+:func:`create_app`, which is what lets the tests construct an application with
+an injected configuration instead of reloading the module with a doctored
+environment, and what stops ``import server.server`` from trying to reach
+MongoDB.
 """
 
+import enum
 import logging
-import os
 import sys
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Final, Literal, Protocol, TypedDict
 
 from authlib.integrations.flask_client import OAuth, OAuthError
 from dotenv import load_dotenv
-from flask import Flask, render_template, request, session, url_for
+from flask import (
+    Flask,
+    Response,
+    current_app,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from waitress import serve
 from werkzeug.middleware.proxy_fix import ProxyFix
+from werkzeug.wrappers import Response as WerkzeugResponse
 
-from common.config import ConfigError, env_int, require_env, require_secret_key
+from common.config import ConfigError
 from common.linktoken import LinkTokenError, read_link_token
-from common.storage import AccountAlreadyLinkedError, connect, link_account
-
-load_dotenv()
-
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+from common.logging_setup import configure_logging
+from common.ratelimit import RateLimiter
+from common.storage import (
+    AccountAlreadyLinkedError,
+    UserCollection,
+    connect,
+    link_account,
 )
+from server import messages
+from server.config import ServerConfig, load_server_config
+from server.security import install_security
+
 log = logging.getLogger("starguard.server")
 
 # The scope needed to read a public profile and check whether the authenticated
 # user starred a public repository. This used to request `repo`, which grants
 # read and write access to every private repository the user owns: far beyond
 # what a Discord role bot needs, and a serious thing to ask of a visitor.
-GITHUB_OAUTH_SCOPE = "read:user"
+GITHUB_OAUTH_SCOPE: Final = "read:user"
 
 # GitHub answers "is this repo starred by me" with 204 (yes) or 404 (no).
-STARRED_STATUS = 204
+STARRED_STATUS: Final = 204
+
+RATE_LIMITED_ENDPOINTS: Final[tuple[str, ...]] = ("login", "authorize")
 
 
-def load_config():
-    """Read and validate every setting the server needs."""
-    return {
-        "owner": require_env("REPO_OWNER"),
-        "repo": require_env("GITHUB_REPO"),
-        "secret_key": require_secret_key(),
-        "client_id": require_env("GITHUB_CLIENT_ID"),
-        "client_secret": require_env("GITHUB_CLIENT_SECRET"),
-        "mongo_host": require_env("MONGO_HOST"),
-        "mongo_database": require_env("MONGO_DATABASE"),
-        # The port inside the container. docker-compose publishes it on the
-        # host as ${SERVER_PORT}; the two are deliberately separate, because
-        # binding to SERVER_PORT while the compose file mapped it to 5000 made
-        # every value other than 5000 unreachable.
-        "port": env_int("SERVER_BIND_PORT", 5000, minimum=1),
-        "link_token_max_age": env_int("LINK_TOKEN_MAX_AGE", 900, minimum=60),
-    }
+# Distinguishes "no collection was passed" from "the database is down", which
+# are different states that both look like None. A one-member enum rather
+# than a bare object() so the sentinel has a type a checker can tell apart
+# from a real collection; `is` comparisons behave exactly as they did.
+class _NotSupplied(enum.Enum):
+    TOKEN = enum.auto()
 
 
-try:
-    CONFIG = load_config()
-except ConfigError as config_error:
-    log.error("Configuration error: %s", config_error)
-    sys.exit(1)
-
-REPO_URL = f"https://github.com/{CONFIG['owner']}/{CONFIG['repo']}/"
-
-app = Flask(__name__, template_folder="./html")
-# The server sits behind a reverse proxy, which terminates TLS. Without this
-# the OAuth redirect_uri would be built as http:// and GitHub would reject it.
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-app.secret_key = CONFIG["secret_key"]
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=True,
-)
-
-oauth = OAuth(app)
-github = oauth.register(
-    name="github",
-    client_id=CONFIG["client_id"],
-    client_secret=CONFIG["client_secret"],
-    authorize_url="https://github.com/login/oauth/authorize",
-    access_token_url="https://github.com/login/oauth/access_token",
-    api_base_url="https://api.github.com/",
-    client_kwargs={"scope": GITHUB_OAUTH_SCOPE},
-)
-
-MONGO_CLIENT = None
-USERS = None
-try:
-    MONGO_CLIENT, USERS = connect(
-        CONFIG["mongo_host"], CONFIG["mongo_database"], MongoClient
-    )
-except PyMongoError as mongo_error:
-    log.error("Error connecting to MongoDB: %s", mongo_error)
+_NOT_SUPPLIED: Final = _NotSupplied.TOKEN
 
 
-def render_result(message):
+class GitHubProfile(TypedDict):
+    """The two fields of GitHub's ``/user`` response that Starguard reads.
+
+    A missing key still raises KeyError at the point of use, which is what
+    the caller catches; this only says what the two present keys hold.
+    """
+
+    login: str
+    id: int
+
+
+class OAuthResponse(Protocol):
+    """The slice of an Authlib HTTP response that the routes look at."""
+
+    @property
+    def status_code(self) -> int:
+        """The HTTP status GitHub answered with."""
+
+    # Any because this is the raw parsed JSON body. Each call site below
+    # immediately gives it a shape: GitHubProfile for the profile fetch, and
+    # nothing at all for the starred check, which only reads the status.
+    def json(self) -> Any:  # noqa: ANN401
+        """The parsed JSON body."""
+
+
+class OAuthClient(Protocol):
+    """The slice of the Authlib OAuth client that the routes use.
+
+    Authlib ships no type information and has no stub package, so naming the
+    three methods Starguard actually calls is more useful than an Any that
+    would accept a typo.
+    """
+
+    def authorize_redirect(self, redirect_uri: str) -> WerkzeugResponse:
+        """Send the visitor to GitHub's authorize page."""
+
+    def authorize_access_token(self) -> Mapping[str, object] | None:
+        """Exchange the callback's code for an access token."""
+
+    def get(self, url: str, *, token: Mapping[str, object]) -> OAuthResponse:
+        """Call a GitHub API path with ``token``."""
+
+
+@dataclass(frozen=True)
+class ServerContext:
+    """The per-application objects the routes need."""
+
+    config: ServerConfig
+    users: UserCollection | None
+    github: OAuthClient
+
+
+def _context() -> ServerContext:
+    """Return the current application's :class:`ServerContext`."""
+    context: ServerContext = current_app.extensions["starguard"]
+    return context
+
+
+def render_result(message: str, status: int = 200) -> Response:
     """Render the result page with a single user-facing message."""
-    return render_template("result.html", message=message)
+    return current_app.response_class(
+        render_template("result.html", message=message),
+        status=status,
+        mimetype="text/html",
+    )
 
 
-@app.route("/login")
-def login():
+def login() -> WerkzeugResponse:
     """Begin the OAuth flow for the Discord user named in the link token."""
+    context = _context()
     try:
         discord_id, discord_username = read_link_token(
-            app.secret_key,
+            context.config.secret_key,
             request.args.get("token"),
-            max_age=CONFIG["link_token_max_age"],
+            max_age=context.config.link_token_max_age,
         )
     except LinkTokenError as exc:
         log.info("Rejected verification link: %s", exc)
-        return render_result(str(exc)), 400
+        return render_result(str(exc), 400)
 
     session["discord_id"] = discord_id
     session["discord_username"] = discord_username
 
     redirect_uri = url_for("authorize", _external=True)
-    return github.authorize_redirect(redirect_uri)
+    return context.github.authorize_redirect(redirect_uri)
 
 
-@app.route("/authorize")
-def authorize():
+def authorize() -> Response:
     """Complete the OAuth flow and record the user's star status."""
+    context = _context()
     discord_id = session.pop("discord_id", None)
     discord_username = session.pop("discord_username", None)
 
     if not discord_id:
-        return render_result(
-            "Your verification session has expired. Run /verify in Discord again."
-        ), 400
+        return render_result(messages.SESSION_EXPIRED, 400)
 
-    if USERS is None:
+    if context.users is None:
         log.error("Cannot record a link: no database connection.")
-        return render_result(
-            "The database is unavailable right now. Please try again later."
-        ), 503
+        return render_result(messages.DATABASE_UNAVAILABLE, 503)
 
     try:
-        token = github.authorize_access_token()
+        token = context.github.authorize_access_token()
     except OAuthError as exc:
         log.info("OAuth error for Discord ID %s: %s", discord_id, exc.description)
-        return render_result(f"GitHub sign-in failed: {exc.description}"), 400
+        return render_result(
+            messages.SIGN_IN_FAILED_REASON.format(reason=exc.description), 400
+        )
 
     if not token:
-        return render_result("GitHub sign-in failed. Please try again."), 400
+        return render_result(messages.SIGN_IN_FAILED, 400)
 
     try:
-        profile = github.get("user", token=token).json()
+        profile: GitHubProfile = context.github.get("user", token=token).json()
         github_username = profile["login"]
         github_id = profile["id"]
 
         # 204 means the authenticated user has starred the repository.
-        starred_response = github.get(
-            f"user/starred/{CONFIG['owner']}/{CONFIG['repo']}", token=token
+        starred_response = context.github.get(
+            f"user/starred/{context.config.owner}/{context.config.repo}",
+            token=token,
         )
         starred = starred_response.status_code == STARRED_STATUS
     except (OAuthError, KeyError, ValueError) as exc:
         log.warning("Could not read the GitHub profile: %s", exc)
-        return render_result(
-            "Could not read your GitHub profile. Please try again."
-        ), 502
+        return render_result(messages.PROFILE_UNREADABLE, 502)
 
     log.info(
         "Linking Discord ID %s to GitHub user %s (starred=%s)",
@@ -177,12 +212,12 @@ def authorize():
 
     try:
         link_account(
-            USERS,
+            context.users,
             discord_id=discord_id,
             discord_username=discord_username,
             github_id=github_id,
             github_username=github_username,
-            linked_repo=REPO_URL,
+            linked_repo=context.config.repo_url,
             starred_repo=starred,
         )
     except AccountAlreadyLinkedError:
@@ -192,41 +227,135 @@ def authorize():
             discord_id,
         )
         return render_result(
-            f"The GitHub account {github_username} is already linked to another "
-            "Discord user. Each GitHub account can only be used once."
-        ), 409
+            messages.ALREADY_LINKED.format(github_username=github_username), 409
+        )
     except PyMongoError as exc:
         log.error("Could not save the link: %s", exc)
-        return render_result(
-            "Could not save your verification right now. Please try again later."
-        ), 503
+        return render_result(messages.SAVE_FAILED, 503)
 
     if starred:
-        return render_result(
-            "Authentication successful! Head back to Discord and claim your role."
-        )
+        return render_result(messages.VERIFIED_AND_STARRED)
     return render_result(
-        f"Authentication successful, but you have not starred {CONFIG['owner']}/"
-        f"{CONFIG['repo']} yet. Star it, then claim your role in Discord."
+        messages.VERIFIED_NOT_STARRED.format(
+            owner=context.config.owner, repo=context.config.repo
+        )
     )
 
 
-@app.route("/healthz")
-def healthz():
+def healthz() -> tuple[dict[str, str], int]:
     """Liveness probe that also reports database reachability."""
-    if USERS is None:
+    if _context().users is None:
         return {"status": "degraded", "database": "unavailable"}, 503
     return {"status": "ok"}, 200
 
 
-@app.route("/")
-def home():
+def home() -> str:
     """Deliberately uninformative landing page."""
     return render_template("home.html")
 
 
-if __name__ == "__main__":
+def connect_users(config: ServerConfig) -> UserCollection | None:
+    """Return the users collection, or None when MongoDB is unreachable."""
+    try:
+        _, users = connect(config.mongo_host, config.mongo_database, MongoClient)
+        return users
+    except PyMongoError as exc:
+        log.error("Error connecting to MongoDB: %s", exc)
+        return None
+
+
+def create_app(
+    config: ServerConfig | None = None,
+    users: UserCollection | Literal[_NotSupplied.TOKEN] | None = _NOT_SUPPLIED,
+) -> Flask:
+    """Build the Flask application.
+
+    ``config`` defaults to reading the environment, and ``users`` defaults to
+    connecting to MongoDB. Passing either one skips that work, which is how
+    the tests build a real application without a real database.
+    """
+    config = load_server_config() if config is None else config
+    if users is _NOT_SUPPLIED:
+        users = connect_users(config)
+
+    app = Flask(__name__, template_folder="./html")
+    # The server sits behind a reverse proxy, which terminates TLS. Without
+    # this the OAuth redirect_uri would be built as http:// and GitHub would
+    # reject it. The hop count is configurable because ProxyFix counts from
+    # the right, so a second proxy in front silently shifts the client
+    # address the rate limiter sees.
+    hops = config.trusted_proxy_count
+    # Replacing wsgi_app is Flask's documented way to wrap the application in
+    # WSGI middleware; mypy only objects because the attribute is declared as
+    # a method on the class.
+    app.wsgi_app = ProxyFix(  # type: ignore[method-assign]
+        app.wsgi_app, x_for=hops, x_proto=hops, x_host=hops
+    )
+    app.secret_key = config.secret_key
+    app.config.update(
+        SESSION_COOKIE_HTTPONLY=True,
+        SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=True,
+    )
+
+    oauth = OAuth(app)
+    github = oauth.register(
+        name="github",
+        client_id=config.client_id,
+        client_secret=config.client_secret,
+        authorize_url="https://github.com/login/oauth/authorize",
+        # B106: the name ends in "token" so bandit reads it as a
+        # hardcoded credential, but this is GitHub's public endpoint URL.
+        # The real secret is config.client_secret, read from the environment.
+        access_token_url="https://github.com/login/oauth/access_token",  # nosec B106
+        api_base_url="https://api.github.com/",
+        client_kwargs={"scope": GITHUB_OAUTH_SCOPE},
+    )
+
+    app.extensions["starguard"] = ServerContext(
+        config=config, users=users, github=github
+    )
+
+    install_security(
+        app,
+        limiter=RateLimiter(config.rate_limit, config.rate_limit_window),
+        rate_limited_endpoints=RATE_LIMITED_ENDPOINTS,
+        render_error=render_result,
+    )
+
+    app.add_url_rule("/", view_func=home)
+    app.add_url_rule("/login", view_func=login)
+    app.add_url_rule("/authorize", view_func=authorize)
+    app.add_url_rule("/healthz", view_func=healthz)
+
+    return app
+
+
+def main() -> None:
+    """Load the environment and serve the application."""
+    load_dotenv()
+    configure_logging()
+
+    try:
+        config = load_server_config()
+    except ConfigError as exc:
+        log.error("Configuration error: %s", exc)
+        sys.exit(1)
+
+    app = create_app(config)
+
     # waitress is a production WSGI server. Flask's built-in app.run() is a
     # development server and explicitly not meant to face the internet.
-    log.info("Starguard OAuth server listening on port %s", CONFIG["port"])
-    serve(app, host="0.0.0.0", port=CONFIG["port"], ident="Starguard")
+    log.info("Starguard OAuth server listening on port %s", config.port)
+    # B104: binding to every interface is the point. This process runs
+    # in a container and is reached from another one, so loopback would make
+    # it unreachable; what is and is not published is the compose file's job.
+    # Bandit prints "nosec encountered (B104), but no failed test" here. That
+    # warning is wrong: delete the suppression and B104 fires on this line. A
+    # bare "# nosec" silences the warning but would also hide any future
+    # finding on this line, so the scoped form stays.
+    serve(app, host="0.0.0.0", port=config.port, ident="Starguard")  # nosec B104
+
+
+if __name__ == "__main__":
+    main()
