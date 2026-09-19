@@ -1,13 +1,21 @@
-FROM python:3.10
+FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY bot/bot.py /app/
-COPY bot/messages.py /app/
-COPY .env.example /app/.env
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
-RUN python -m pip install --upgrade pip
+# Dependencies first so code changes do not invalidate the install layer.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 
-RUN pip install discord-py-interactions python-dotenv interactions.py requests pymongo
+COPY common/ ./common/
+COPY bot/ ./bot/
 
-CMD ["python", "bot.py"]
+# The configuration is supplied at run time via env_file; baking .env.example
+# into the image shipped a publicly known SECRET_KEY.
+RUN useradd --create-home --uid 10001 starguard
+USER starguard
+
+CMD ["python", "-m", "bot.bot"]

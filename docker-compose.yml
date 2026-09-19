@@ -1,8 +1,9 @@
-version: "3.9"
+# Bot + OAuth server only. Point MONGO_HOST at your own MongoDB, or add the
+# bundled one by copying override.example.yml to docker-compose.override.yml.
 services:
   discord-bot:
     container_name: StarGuardBot
-    image: bot
+    image: starguard-bot
     build:
       context: .
       dockerfile: Dockerfile.bot
@@ -14,15 +15,25 @@ services:
 
   server:
     container_name: StarGuardServer
-    image: server
+    image: starguard-server
     ports:
-      - ${SERVER_PORT}:5000
+      # SERVER_PORT is the port published on the host. The application always
+      # listens on 5000 inside the container; it used to bind SERVER_PORT while
+      # this mapping assumed 5000, so any value other than 5000 was unreachable.
+      - ${SERVER_PORT:-5000}:5000
     build:
       context: .
       dockerfile: Dockerfile.server
     restart: always
     env_file:
       - .env
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     networks:
       - Starguard
 

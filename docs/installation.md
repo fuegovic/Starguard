@@ -24,10 +24,10 @@ To install Discord Starguard on your server, you need to follow these steps:
 
 ## Step 4: Create a GitHub OAuth app
 
-- Go to https://github.com/settings/apps and log in with your GitHub account.
+- Go to https://github.com/settings/developers and log in with your GitHub account.
 - Click on the "New OAuth App" button and give your app a name, a homepage URL, and a callback URL. You can also add a description and a logo if you want.
-- For the **Authorization callback URL**, enter `http://your-domain/authorize`. You need to use a public domain to make the oauth accessible to your users.
-- - In `Permissions`, select `Account permissions`, set `Email addresses` and `Starring` to `Read-only`
+- For the **Authorization callback URL**, enter `https://your-domain/authorize`. You need a public domain with HTTPS to make the OAuth flow accessible to your users.
+- Starguard requests only the `read:user` scope, which is enough to read the signed-in user's public profile and check whether they starred a public repository. You do not need to grant it anything else.
 - Click on the **Register application** button and copy your client ID and client secret. You will need them later.
 - Copy and paste the **client ID** to the `GITHUB_CLIENT_ID` variable and the **client secret** to the `GITHUB_CLIENT_SECRET` variable in your .env file.
 - Create the GitHub app and save your changes.
@@ -35,7 +35,8 @@ To install Discord Starguard on your server, you need to follow these steps:
 ## Step 5: Create a classic GitHub public access token (PAT)
 
 - Go to your GitHub account settings, select Developer settings, then Personal access tokens, then Generate new token (classic).
-- Choose a name for your token and the scopes you want to grant to it. The scopes determine what resources and actions the token can access on GitHub.
+- Choose a name for your token. **No scopes are required** for a public repository — this token is used only to list the repository's stargazers, which is public information. For a private repository, grant `repo`.
+- This token is optional. Without it GitHub allows only 60 requests per hour, which is not enough for a repository with more than a few thousand stargazers.
 - Click Generate token and copy the token to your clipboard. You can also view or delete your tokens at any time on the Personal access tokens page.
 - Copy and paste the token to the `GITHUB_TOKEN` variable in your .env file.
 
@@ -48,21 +49,56 @@ To install Discord Starguard on your server, you need to follow these steps:
 
 ## Step 7: Configure the .env file
 - see: [env_file.md](./env_file.md) for more informations about the .env configuration
-- Rename the file `.env.example` to `.env` in the root directory of the project and add the necessary variables
+- Copy the file `.env.example` to `.env` in the root directory of the project and fill in the necessary variables
+- Generate a real `SECRET_KEY`. Both containers refuse to start without one:
+  ```sh
+  python -c "import secrets; print(secrets.token_urlsafe(32))"
+  ```
+- If a required variable is missing or invalid, the container exits immediately with a message naming it. Check the logs with `docker compose logs`.
 
 ## Step 8: Run the bot in a Docker container
 
 - Install Docker desktop or Docker and Docker Compose on your machine if you don't have them already.
-- Run this command in the root directory of the project: `docker-compose up -d`
+- You also need a MongoDB. To use the bundled one, copy `override.example.yml` to `docker-compose.override.yml` and set `MONGO_HOST=mongodb://mongodb:27017/` in your `.env`.
+- Run this command in the root directory of the project: `docker compose up -d`
 - Wait for the bot to start and log in to your Discord server. You should see your bot online and ready to use.
 
 ## Step 9: Advanced permissions
 - On your server, in `Server Settings`, in the `Integrations` tab, you can limit the bot usage to a specific channel and limit the bot commands to specific user(s)/role(s)
 
 ## NGINX 
-- There is a docker image that includes `nginx-proxy-manager`, you can use it with: `docker-compose -f ./deploy-compose.yml up --build`
+- There is a compose file that includes `nginx-proxy-manager`, MongoDB and Mongo Express. Use it with: `docker compose -f docker-compose.alt.yml up -d --build`
 - Access `nginx-proxy-manager` at http://localhost:81
   - login with: email: `admin@example.com` | password: `changeme`
   - Immediately after logging in with this default user you will be asked to modify your details and change your password.
 
 🎉 Congratulations! You have successfully installed Discord Starguard on your server. You can now use slash commands to interact with it. 
+
+## Upgrading from an older version
+
+Two changes need your attention when upgrading an existing deployment.
+
+**1. Revoke the OAuth tokens the old version stored.** Earlier versions requested
+the `repo` scope and saved each user's access token in the database in clear
+text. On first start the server removes those stored tokens automatically and
+logs how many it deleted, but tokens already handed out stay valid until they
+are revoked. Revoke them from your OAuth app's page under
+https://github.com/settings/developers, and reduce the app's requested scope to
+`read:user`.
+
+**2. Set a real `SECRET_KEY`.** It is now required, must be at least 16
+characters, and must be the same for the bot and the server. Placeholder values
+such as the `SecretKey` that used to ship in `.env.example` are rejected.
+
+Existing verified users do not need to do anything else: their rows are kept,
+and the next `/verify` fills in the new fields. Users are now linked by Discord
+ID rather than by email address, and a GitHub account can only be linked to one
+Discord user at a time.
+
+## Running the tests
+
+```sh
+pip install -r requirements-dev.txt
+pytest
+pylint $(git ls-files '*.py')
+```

@@ -16,37 +16,42 @@ This file contains the environment variables for the discord bot. You need to fi
 - `REPO_OWNER`: The username of the owner of the GitHub repo that you want to promote with the bot.
 - `GITHUB_REPO`: The name of the GitHub repo that you want to promote with the bot.
 
-- `SERVER_PORT`: The port for for the oauth server. The default is `5000`
-- `DOMAIN`: The domain for the oauth server. You need to use a domain to make it usable outside your home network.
-- 
-- `GITHUB_CLIENT_ID`: The client ID of the GitHub OAuth app that you have created for the bot. You can create one at https://github.com/settings/apps
-- `GITHUB_CLIENT_SECRET`: The client secret of the GitHub OAuth app that you have created for the bot. You can get it from https://github.com/settings/apps
+- `SERVER_PORT`: The port published on the **host** for the OAuth server. The default is `5000`. The application always listens on port `5000` inside its container, so you can change this freely.
+- `DOMAIN`: The public HTTPS address of the OAuth server, e.g. `https://starguard.example.com`. Users are sent here from Discord, so it has to be reachable from outside your network.
 
-- `GITHUB_TOKEN`: GitHub Public Access Token needed to fetch the stargazers name from the specified repo.
+- `GITHUB_CLIENT_ID`: The client ID of the GitHub OAuth app that you have created for the bot. You can create one at https://github.com/settings/developers
+- `GITHUB_CLIENT_SECRET`: The client secret of the GitHub OAuth app that you have created for the bot.
 
-- `SECRET_KEY`: A random secret key that you have generated for securing the OAuth process. You can use any mix of letters, numbers, and symbols.
+- `GITHUB_TOKEN`: A GitHub personal access token, used **only** to list the repository's stargazers. Optional for a public repo, but without it GitHub allows just 60 requests per hour, which is not enough beyond a few thousand stargazers. No scopes are required for a public repo.
+
+- `SECRET_KEY`: **Required.** Signs session cookies *and* the personal verification links handed out by `/verify`, so it must be unguessable and **identical for the bot and the server**. The application refuses to start on a placeholder or on anything shorter than 16 characters. Generate one with:
+  ```sh
+  python -c "import secrets; print(secrets.token_urlsafe(32))"
+  ```
+
+- `LINK_TOKEN_MAX_AGE`: How long a `/verify` link stays usable, in seconds. The default is `900` (15 minutes), the minimum is `60`.
 
 ## MongoDB Variables
 
-- `MONGO_HOST`: The host name of the MongoDB database used for storing user data. If you are using docker mongo (from the `override.example`), set it to `mongodb`.
+- `MONGO_HOST`: The MongoDB connection string. If you are using the bundled docker mongo (from `override.example.yml`), set it to `mongodb://mongodb:27017/`.
 - `MONGO_DATABASE`: The name of the MongoDB database used for storing user data. The default is `starguard`
 - Note: The external access is disabled by default, but you can enable it by editing the `docker-compose.override.yml` file, See the `override.example` file.
 
 ## Mongo-Express
 You can enable this by editing the `docker-compose.override.yml` file, See the `override.example` file.
-- You can access the database by visiting `http://localhost:8081/`. Please change the default credentials for something more secure.
+- Mongo Express is published on the **loopback interface only**, so it is not reachable from the internet. Access it at `http://localhost:8081/`, or over an SSH tunnel from another machine.
 
-- `MONGO_EXPRESS_USERNAME`: The username used to connect to the database with mongo-express. The default is `admin` 
-- `MONGO_EXPRESS_PASSWORD`: The password used to connect to the database with mongo-express. The default is `password`
+- `MONGO_EXPRESS_USERNAME`: The username for mongo-express. **Required** when the service is enabled; compose refuses to start without it (it used to fall back to `admin`).
+- `MONGO_EXPRESS_PASSWORD`: The password for mongo-express. **Required** when the service is enabled (it used to fall back to `password`).
 - `MONGO_EXPRESS_PORT`: The port used to access mongo-express. The default is `8081`
 
 ## Other Variables
 
-- `AUTOMATIC_CHECK`: A boolean value (`True` or `False`) that indicates whether you want the bot to automatically check if the verified users have removed their star from your GitHub repo, and then remove their role on discord and update their status in the database.
+- `AUTOMATIC_CHECK`: A boolean value (`true` or `false`) that indicates whether you want the bot to automatically check if the verified users have removed their star from your GitHub repo, and then remove their role on discord and update their status in the database.
 
 - `AUTOMATIC_CHECK_DELAY`: A numeric value (in seconds) that indicates how often you want the bot to perform the automatic check. The minimum value is 300 (5 minutes). The default value is 3600 (1 hour).
 
-- `COMMAND_NAME`: The name of the custom command that you want to create for displaying useful links. It only supports lowercase letters.
+- `COMMAND_NAME`: The name of the custom command that you want to create for displaying useful links. It only supports lowercase letters. **Optional** — leave it empty and the command is simply not registered (it used to crash the bot).
 
 - `COMMAND_DESCRIPTION`: A short description of what the custom command does.
 
@@ -54,4 +59,6 @@ You can enable this by editing the `docker-compose.override.yml` file, See the `
 
 - `BTN1`, `BTN2`, `BTN3`, and `BTN4`: The labels of the buttons that you want to display for each link.
 
-- `URL1`, `URL2`, `URL3`, and `URL4`: The URLs of the links that you want to display for each button.
+- `URL1`, `URL2`, `URL3`, and `URL4`: The URLs of the links that you want to display for each button. Only buttons that have **both** a label and a URL are shown.
+
+- `LOG_LEVEL`: Logging verbosity — `DEBUG`, `INFO` (default), `WARNING` or `ERROR`.

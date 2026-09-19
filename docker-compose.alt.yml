@@ -1,43 +1,63 @@
-version: "3.9"
-
-# Includes Nginx Proxy Manager, Mongodb and Mongo Express
+# Everything in one file: bot, OAuth server, MongoDB, Mongo Express and
+# Nginx Proxy Manager for TLS termination.
+#
+# Run with: docker compose -f docker-compose.alt.yml up -d
 services:
   discord-bot:
     container_name: Bot
-    image: bot
+    image: starguard-bot
     build:
       context: .
-      dockerfile: Dockerfile_bot
+      # This used to name Dockerfile_bot, which does not exist in this repo,
+      # so the alternative stack could never be built.
+      dockerfile: Dockerfile.bot
     restart: always
     env_file:
       - .env
+    depends_on:
+      - mongodb
     networks:
       - Starguard
 
   server:
     container_name: Server
-    image: server
+    image: starguard-server
     ports:
-      - ${SERVER_PORT}:5000
+      # Host port only. The application always listens on 5000 internally.
+      - ${SERVER_PORT:-5000}:5000
     build:
       context: .
-      dockerfile: Dockerfile_server
+      dockerfile: Dockerfile.server
     restart: always
     env_file:
       - .env
+    depends_on:
+      - mongodb
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     networks:
       - Starguard
 
   mongodb:
     container_name: mongo
-    image: mongo:4.4.18 # for compatibility with older hardware, feel free to use latest
-    # uncomment the 2 following lines to make accessible from outside docker
-    # ports:
-    #   - ${MONGO_PORT}:27017
+    # MongoDB 5.0 and newer require a CPU with AVX support. The 4.x series is
+    # past end of life and no longer receives security fixes.
+    image: mongo:7
     volumes:
       - ./server/mongo-data:/data/db
     command: mongod --noauth
     restart: always
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     networks:
       - Starguard
 
@@ -45,13 +65,16 @@ services:
     container_name: mongo-express
     image: mongo-express
     ports:
-      - ${MONGO_EXPRESS_PORT}:8081
+      # Loopback only: the database admin UI should not face the internet.
+      - 127.0.0.1:${MONGO_EXPRESS_PORT:-8081}:8081
     environment:
       ME_CONFIG_MONGODB_SERVER: mongodb
       ME_CONFIG_MONGODB_PORT: 27017
       ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
-      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USERNAME}
-      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASSWORD}
+      ME_CONFIG_BASICAUTH_USERNAME: "${MONGO_EXPRESS_USERNAME:?set MONGO_EXPRESS_USERNAME in .env}"
+      ME_CONFIG_BASICAUTH_PASSWORD: "${MONGO_EXPRESS_PASSWORD:?set MONGO_EXPRESS_PASSWORD in .env}"
+    depends_on:
+      - mongodb
     restart: always
     networks:
       - Starguard
@@ -61,9 +84,9 @@ services:
     image: 'jc21/nginx-proxy-manager:latest'
     restart: unless-stopped
     ports:
-      - '80:80' # Public HTTP Port
-      - '443:443' # Public HTTPS Port
-      - '81:81' # Admin Web Port
+      - '80:80'    # Public HTTP Port
+      - '443:443'  # Public HTTPS Port
+      - '127.0.0.1:81:81'  # Admin UI, loopback only
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt

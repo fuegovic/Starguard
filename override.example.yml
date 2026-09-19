@@ -1,16 +1,27 @@
-version: "3.9"
-
+# Adds MongoDB and Mongo Express alongside the bot and the OAuth server.
+#
+# 1. Copy this file to "docker-compose.override.yml"
+# 2. Set MONGO_HOST=mongodb://mongodb:27017/ in your .env
+# 3. Run "docker compose up -d" as usual
 services:
   mongodb:
     container_name: mongo
-    image: mongo:4.4.18 # for compatibility with older hardware, feel free to use :latest
-    # uncomment the 2 following lines to make accessible from outside docker
-    # ports:
-    #   - 27017:27017
+    # MongoDB 5.0 and newer require a CPU with AVX support. If yours does not
+    # have it you will need an older image, but note that the 4.x series is
+    # past end of life and no longer receives security fixes.
+    image: mongo:7
     volumes:
       - ./server/mongo-data:/data/db
+    # Not published on the host: only the bot and the server need to reach it,
+    # and they do so over the internal network.
     command: mongod --noauth
     restart: always
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
     networks:
       - Starguard
 
@@ -18,17 +29,20 @@ services:
     container_name: mongo-express
     image: mongo-express
     ports:
-      - ${MONGO_EXPRESS_PORT}:8081
+      # Bound to the loopback interface so the database admin UI is not exposed
+      # to the internet. Reach it through an SSH tunnel, or change this to
+      # ${MONGO_EXPRESS_PORT}:8081 only if it sits behind your own auth.
+      - 127.0.0.1:${MONGO_EXPRESS_PORT:-8081}:8081
     environment:
       ME_CONFIG_MONGODB_SERVER: mongodb
       ME_CONFIG_MONGODB_PORT: 27017
       ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
-      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USERNAME}
-      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASSWORD}
+      # Required: compose refuses to start if these are unset, rather than
+      # silently falling back to admin/password.
+      ME_CONFIG_BASICAUTH_USERNAME: "${MONGO_EXPRESS_USERNAME:?set MONGO_EXPRESS_USERNAME in .env}"
+      ME_CONFIG_BASICAUTH_PASSWORD: "${MONGO_EXPRESS_PASSWORD:?set MONGO_EXPRESS_PASSWORD in .env}"
+    depends_on:
+      - mongodb
     restart: always
     networks:
       - Starguard
-
-# To enable docker mongodb and mongo express (for secure management of the database)
-# 1. Duplicate this file and rename it "docker-compose.override.yml"
-# 2. Use "docker compose up -d" as you would normally
