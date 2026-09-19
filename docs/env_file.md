@@ -1,64 +1,610 @@
-# Bot Configuration
+# Environment file reference
 
-This file contains the environment variables for the discord bot. You need to fill in the values for each variable according to your needs. Do not share this file with anyone, as it contains sensitive information such as tokens and secrets. 🔒
+Starguard is configured entirely through a single `.env` file in the root of
+the repository. Copy `.env.example` to `.env` and fill it in. Do not share
+this file or commit it: it holds your Discord bot token, your GitHub OAuth
+client secret and your database password. 🔒
 
-## Discord Variables
-### For detailled instructions: [Discord dev](./installation.md#step-1-obtain-the-app-token-and-client-id-from-the-discord-dev-portal), [Discord Server](./installation.md#step-5-get-the-role-id-guild-id-and-channel-id-from-discord) 
-- `TOKEN`: The discord app token for your bot. You can get it from https://discord.com/developers/applications
-- `CLIENT_ID`: The discord client ID for your bot. You can get it from https://discord.com/developers/applications
+The sections below are in the same order as `.env.example`, so the two can be
+read side by side.
 
-- `ROLE_ID`: The ID of the role that you want to give to users who have starred your GitHub repo. You can get it by enabling developer mode in discord and right-clicking on the role.
-- `GUILD_ID`: The ID of the server where you want to use the bot. You can get it by enabling developer mode in discord and right-clicking on the server.
-- `CHANNEL_ID`: The ID of the channel where you want the bot to post messages. You can get it by enabling developer mode in discord and right-clicking on the channel.
+## How the file is read
 
-## GitHub Variables
-### For detailled instructions: [GitHub OAuth](./installation.md#step-3-create-a-github-oauth-app), [GitHub PAT](./installation.md#step-4-create-a-classic-github-public-access-token-pat) 
-- `REPO_OWNER`: The username of the owner of the GitHub repo that you want to promote with the bot.
-- `GITHUB_REPO`: The name of the GitHub repo that you want to promote with the bot.
+`.env` is consumed in two different ways, which is why some variables never
+reach the application itself:
 
-- `SERVER_PORT`: The port published on the **host** for the OAuth server. The default is `5000`. The application always listens on port `5000` inside its container, so you can change this freely.
-- `DOMAIN`: The public HTTPS address of the OAuth server, e.g. `https://starguard.example.com`. Users are sent here from Discord, so it has to be reachable from outside your network.
+- **Docker Compose** reads `.env` from the project directory to expand
+  `${VARIABLE}` references inside the compose files, and hands the whole file
+  to the `discord-bot` and `server` containers through `env_file:`.
+- **The application** reads `.env` through `python-dotenv` when you run
+  `python -m bot.bot` or `python -m server.server` directly, outside Docker.
 
-- `GITHUB_CLIENT_ID`: The client ID of the GitHub OAuth app that you have created for the bot. You can create one at https://github.com/settings/developers
-- `GITHUB_CLIENT_SECRET`: The client secret of the GitHub OAuth app that you have created for the bot.
+Variables marked **Compose only** below are consumed by Docker Compose or by
+another image (MongoDB, Mongo Express, Nginx Proxy Manager). Starguard's own
+code never looks at them, so setting them changes nothing when you run the two
+processes directly.
 
-- `GITHUB_TOKEN`: A GitHub personal access token, used **only** to list the repository's stargazers. Optional for a public repo, but without it GitHub allows just 60 requests per hour, which is not enough beyond a few thousand stargazers. No scopes are required for a public repo.
+## How values are validated
 
-- `SECRET_KEY`: **Required.** Signs session cookies *and* the personal verification links handed out by `/verify`, so it must be unguessable and **identical for the bot and the server**. The application refuses to start on a placeholder or on anything shorter than 16 characters. Generate one with:
-  ```sh
-  python -c "import secrets; print(secrets.token_urlsafe(32))"
-  ```
+Both processes validate their configuration in `main()`, before anything else
+happens. A missing or unusable value is reported by name and the process exits
+with status 1:
 
-- `LINK_TOKEN_MAX_AGE`: How long a `/verify` link stays usable, in seconds. The default is `900` (15 minutes), the minimum is `60`.
+```
+2026-01-01 12:00:00 ERROR starguard.bot: Configuration error: Required environment variable TOKEN is not set.
+```
 
-## MongoDB Variables
+Under Docker this looks like a container that starts and immediately exits,
+with `restart: always` putting it into a restart loop. Read the reason with
+`docker compose logs discord-bot` or `docker compose logs server`.
 
-- `MONGO_HOST`: The MongoDB connection string. If you are using the bundled docker mongo (from `override.example.yml`), set it to `mongodb://mongodb:27017/`.
-- `MONGO_DATABASE`: The name of the MongoDB database used for storing user data. The default is `starguard`
-- Note: The external access is disabled by default, but you can enable it by editing the `docker-compose.override.yml` file, See the `override.example` file.
+Three kinds of validation appear below:
 
-## Mongo-Express
-You can enable this by editing the `docker-compose.override.yml` file, See the `override.example` file.
-- Mongo Express is published on the **loopback interface only**, so it is not reachable from the internet. Access it at `http://localhost:8081/`, or over an SSH tunnel from another machine.
+- **Required.** Unset or blank is a fatal error. Leading and trailing
+  whitespace is stripped from every value, so a line of spaces counts as
+  blank.
+- **Clamped.** A number below the documented minimum is silently raised to
+  that minimum. This is not an error and is not logged.
+- **Falls back.** An unrecognised value is silently replaced with the default.
+  This applies only to `LOG_LEVEL` and `LOG_FORMAT`.
 
-- `MONGO_EXPRESS_USERNAME`: The username for mongo-express. **Required** when the service is enabled; compose refuses to start without it (it used to fall back to `admin`).
-- `MONGO_EXPRESS_PASSWORD`: The password for mongo-express. **Required** when the service is enabled (it used to fall back to `password`).
-- `MONGO_EXPRESS_PORT`: The port used to access mongo-express. The default is `8081`
+Anything else that cannot be parsed, such as a non-numeric value where a
+number is expected, is a fatal error.
 
-## Other Variables
+## Discord
 
-- `AUTOMATIC_CHECK`: A boolean value (`true` or `false`) that indicates whether you want the bot to automatically check if the verified users have removed their star from your GitHub repo, and then remove their role on discord and update their status in the database.
+### `TOKEN`
 
-- `AUTOMATIC_CHECK_DELAY`: A numeric value (in seconds) that indicates how often you want the bot to perform the automatic check. The minimum value is 300 (5 minutes). The default value is 3600 (1 hour).
+**Required.** Read by the bot. No default.
 
-- `COMMAND_NAME`: The name of the custom command that you want to create for displaying useful links. It only supports lowercase letters. **Optional** — leave it empty and the command is simply not registered (it used to crash the bot).
+The Discord app token, from the **Bot** tab of your application at
+<https://discord.com/developers/applications>.
 
-- `COMMAND_DESCRIPTION`: A short description of what the custom command does.
+If it is unset the bot exits with
+`Required environment variable TOKEN is not set.` If it is set but wrong or
+revoked, configuration passes and the bot then fails to log in, raising
+`LoginError: An improper token was passed` and restarting in a loop.
 
-- `COMMAND_EXTENDED_DESCRIPTION`: A longer description of what the custom command does, supports some formatting options such as emojis and bold text.
+### `CLIENT_ID`
 
-- `BTN1`, `BTN2`, `BTN3`, and `BTN4`: The labels of the buttons that you want to display for each link.
+**Optional.** Read by the bot. Default: empty.
 
-- `URL1`, `URL2`, `URL3`, and `URL4`: The URLs of the links that you want to display for each button. Only buttons that have **both** a label and a URL are shown.
+The application ID of your Discord app. It is used for one thing only: logging
+an invite URL on startup. Leaving it empty simply omits that line.
 
-- `LOG_LEVEL`: Logging verbosity — `DEBUG`, `INFO` (default), `WARNING` or `ERROR`.
+### `ROLE_ID`
+
+**Required.** Read by the bot. No default. Must be a numeric Discord ID.
+
+The role granted to members who have starred the repository. Enable Developer
+Mode in Discord (User Settings, Advanced, Developer Mode), then right-click
+the role and choose **Copy ID**.
+
+A non-numeric value is fatal:
+
+```
+Configuration error: ROLE_ID must be a Discord ID (a number), got '@Stargazer'. Enable Developer Mode in Discord and use 'Copy ID'.
+```
+
+A numeric but wrong value, or a role positioned above the bot's own highest
+role, passes validation and fails at the moment the role is granted. See
+[the role assignment section of the troubleshooting
+guide](./troubleshooting.md#the-bot-cannot-assign-or-remove-the-role).
+
+### `GUILD_ID`
+
+**Required.** Read by the bot. No default. Must be a numeric Discord ID.
+
+The server the bot operates in. Right-click the server icon and choose
+**Copy ID**.
+
+If this names a server the bot is not a member of, every star check logs
+`Guild <id> is not in the cache; skipping.` and does nothing.
+
+### `CHANNEL_ID`
+
+**Required.** Read by the bot. No default. Must be a numeric Discord ID.
+
+The channel where the bot announces that someone lost the role after
+un-starring. If the bot cannot post there it logs
+`Could not post to the announcement channel: <reason>` and continues; the role
+change itself still happens.
+
+### `AUTOMATIC_CHECK`
+
+**Optional.** Read by the bot. Default: `true`.
+
+Whether to periodically re-check every linked member and remove the role from
+anyone who has un-starred the repository. Accepted values, in any case:
+`1`, `true`, `yes`, `on`, `0`, `false`, `no`, `off`.
+
+Anything else is fatal:
+
+```
+Configuration error: AUTOMATIC_CHECK must be a boolean such as true/false, got 'yes please'.
+```
+
+With this off, `/checkstars` still works on demand, and the bot's health
+endpoint reports `"star_check": "disabled"` rather than tracking staleness.
+
+### `AUTOMATIC_CHECK_DELAY`
+
+**Optional.** Read by the bot. Default: `3600` (one hour). Whole number of
+seconds, **clamped** to a minimum of `300` (five minutes).
+
+How long to wait between automatic checks. Each cycle costs at least one
+GitHub API call per 100 stargazers, so a short interval on a popular
+repository burns through the API rate limit. Useful values: `300` (5 minutes),
+`3600` (1 hour), `86400` (1 day), `604800` (1 week).
+
+A non-numeric value is fatal:
+`AUTOMATIC_CHECK_DELAY must be a whole number, got '1h'.`
+
+This value also sets the bot health endpoint's staleness threshold: a
+completed check older than `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds makes the
+endpoint report `degraded` and return 503.
+
+### `COMMAND_NAME`
+
+**Optional.** Read by the bot. Default: empty, meaning the command is not
+registered at all.
+
+The name of the optional "useful links" slash command. Discord only accepts
+lowercase names, so whatever you write here is lowercased before it is
+registered.
+
+The command is only registered when this is set **and** at least one complete
+button pair exists. See `BTN1` below.
+
+### `COMMAND_DESCRIPTION`
+
+**Optional.** Read by the bot. Default: `Useful links`.
+
+The one-line description Discord shows next to the command.
+
+### `COMMAND_EXTENDED_DESCRIPTION`
+
+**Optional.** Read by the bot. Default: empty.
+
+A longer description, shown only in the `/help` embed. Discord message
+formatting such as bold text and emoji works here.
+
+### `BTN1`, `BTN2`, `BTN3`, `BTN4` and `URL1`, `URL2`, `URL3`, `URL4`
+
+**Optional.** Read by the bot. No defaults. Four pairs, no more.
+
+Each pair is one button: `BTN1` is its label, `URL1` is the address it opens.
+**Only pairs where both halves are set are shown.** A label with no URL, or a
+URL with no label, is skipped rather than registered as a button Discord would
+reject.
+
+Each URL must be a complete address including the scheme, for example
+`https://github.com/`.
+
+## Bot health check
+
+The bot serves `GET /healthz` inside its own container. The `discord-bot`
+healthcheck in both compose files calls it. It returns:
+
+- **503** with `{"status": "starting", ..., "gateway": "connecting"}` until
+  the Discord gateway connects.
+- **200** with `{"status": "ok", ...}` once connected, plus `"star_check"` set
+  to `disabled`, `pending` or `ok`.
+- **503** with `{"status": "degraded", ..., "star_check": "stale"}` when
+  automatic checks are on but the last completed one is older than
+  `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds.
+
+Every response also carries `uptime_seconds`, and an `ok` one carries
+`last_check_age_seconds`.
+
+### `BOT_HEALTH_ENABLED`
+
+**Optional.** Read by the bot. Default: `true`. Same accepted spellings as
+`AUTOMATIC_CHECK`.
+
+Whether to serve the health endpoint at all.
+
+**Setting this to `false` does not disable the compose healthcheck.** The
+healthcheck keeps calling a port nothing is listening on, so after three
+failures Docker marks the container `unhealthy` and leaves it that way
+forever. If you turn the endpoint off, also override the `healthcheck` block
+for the `discord-bot` service, for example with `disable: true` in your
+`docker-compose.override.yml`.
+
+### `BOT_HEALTH_HOST`
+
+**Optional.** Read by the bot. Default: `127.0.0.1`.
+
+The address the health endpoint binds to. The default is loopback, which is
+reachable from the container healthcheck (it runs inside the container) and
+from nowhere else. Set it to `0.0.0.0` only if you also publish the port and
+want to scrape the endpoint from outside, for example from a monitoring
+system.
+
+### `BOT_HEALTH_PORT`
+
+**Optional.** Read by the bot **and by Docker Compose**. Default: `8080`.
+Whole number, **clamped** to a minimum of `1`.
+
+The port the health endpoint listens on. Both compose files interpolate this
+into the healthcheck command, so changing it here moves both sides together.
+
+If the port cannot be bound, the bot logs
+`Could not start the health endpoint on <host>:<port>: <reason>` and carries
+on without it. The bot keeps working; the container is reported unhealthy.
+
+## GitHub OAuth and the callback server
+
+### `REPO_OWNER`
+
+**Required.** Read by both the bot and the server. No default.
+
+The user or organisation that owns the repository members are asked to star,
+for example `fuegovic` in `fuegovic/Starguard`.
+
+### `GITHUB_REPO`
+
+**Required.** Read by both the bot and the server. No default.
+
+The repository name on its own, **not** `owner/repo`. For
+`fuegovic/Starguard` this is `Starguard`.
+
+Getting either of these wrong passes validation and fails on the first GitHub
+call:
+
+```
+Repository not found (404). Check REPO_OWNER and GITHUB_REPO, and note that a private repository needs a GITHUB_TOKEN that can read it.
+```
+
+### `SERVER_PORT`
+
+**Optional. Compose only.** Default: `5000`.
+
+The port published on the **host** machine for the OAuth server. Change it
+freely if something else on the host already uses 5000. The application never
+reads this.
+
+### `SERVER_BIND_PORT`
+
+**Optional.** Read by the server **and by Docker Compose**. Default: `5000`.
+Whole number, **clamped** to a minimum of `1`.
+
+The port the server listens on **inside** its container. Leave it at 5000
+unless something else in your setup needs that port internally. Both compose
+files interpolate it into the port mapping and into the server healthcheck, so
+the host mapping and the probe follow it automatically.
+
+### `DOMAIN`
+
+**Required by the bot.** Not read by the server. No default.
+
+The public address of the OAuth server, for example
+`https://starguard.example.com`. The bot builds each member's personal login
+link from it, so it has to be reachable from outside your network and it has
+to match the **Authorization callback URL** registered on your GitHub OAuth
+app, which must be this value with `/authorize` appended.
+
+It is validated strictly, because a malformed value breaks the whole flow with
+nothing useful in the log: Discord refuses to render a button whose URL has no
+scheme, and GitHub refuses a `redirect_uri` it was not configured with. The
+value must be an absolute `https://` URL with a host, and must carry no query
+string and no fragment. A trailing slash is accepted and stripped.
+
+```
+Configuration error: DOMAIN must be an absolute https URL such as https://starguard.example.com, got 'http://starguard.example.com'.
+Configuration error: DOMAIN must be an absolute https URL such as https://starguard.example.com, got 'starguard.example.com'.
+Configuration error: DOMAIN must be a plain URL with no query string or fragment, got 'https://starguard.example.com/?a=1'.
+```
+
+Plain HTTP is refused deliberately. The session cookie the OAuth flow depends
+on is marked `Secure`, so no browser would send it back over HTTP and the
+callback would fail for every user. Terminate TLS in front of the server, then
+point `DOMAIN` at the HTTPS address.
+
+Note that the **server** does not read `DOMAIN` at all. It derives the OAuth
+`redirect_uri` from the incoming request instead, which is why
+`TRUSTED_PROXY_COUNT` has to be right for the callback to be built as
+`https://`.
+
+### `GITHUB_CLIENT_ID`
+
+**Required.** Read by the server. No default.
+
+The client ID of your GitHub OAuth app, from
+<https://github.com/settings/developers>.
+
+### `GITHUB_CLIENT_SECRET`
+
+**Required.** Read by the server. No default.
+
+The matching client secret. If either of these is wrong, verification fails at
+the callback and the visitor sees `GitHub sign-in failed: <reason>` with HTTP
+400.
+
+### `GITHUB_TOKEN`
+
+**Optional.** Read by the bot. No default.
+
+A GitHub personal access token, used only to list the repository's
+stargazers. **No scopes are needed for a public repository**; `public_repo` is
+enough if you prefer to grant one. A private repository needs a token that can
+read it.
+
+The listing is fetched 100 stargazers per request. Without a token, GitHub
+allows 60 requests per hour from your server's address, so a single full pass
+over a repository with 6000 stargazers exhausts the hour's budget. The bot
+warns about this at startup:
+
+```
+GITHUB_TOKEN is not set. Unauthenticated GitHub requests are limited to 60 per hour, which is not enough for a repository with more than a few thousand stargazers.
+```
+
+With a token the limit is 5000 requests per hour. An invalid or revoked token
+produces `GitHub rejected GITHUB_TOKEN (401). Check that it is valid.`
+
+### `SECRET_KEY`
+
+**Required.** Read by both the bot and the server. No default. At least 16
+characters.
+
+Signs the Flask session cookie and the personal, expiring verification links
+handed out by `/verify`. The bot signs a link and the server verifies it, so
+**the two processes must have exactly the same value**. A predictable key
+would let anyone mint a verification link for any Discord account.
+
+Generate one with:
+
+```sh
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Three things are rejected:
+
+```
+Configuration error: Required environment variable SECRET_KEY is not set. Generate one with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+Configuration error: SECRET_KEY is still set to a placeholder value. Generate a real one with: python -c "import secrets; print(secrets.token_urlsafe(32))"
+Configuration error: SECRET_KEY must be at least 16 characters, got 8.
+```
+
+The rejected placeholders are `secretkey`, `changeme`, `change-me`, `secret`,
+`your-secret-key` and `please-change-me`, compared without regard to case.
+
+If the bot and the server hold different keys, both start normally and every
+verification link fails with `This verification link is not valid.`
+
+Changing the key invalidates all outstanding verification links and signs
+every existing session out. Nobody loses their role or their link record.
+
+### `LINK_TOKEN_MAX_AGE`
+
+**Optional.** Read by the server. Default: `900` (15 minutes). Whole number of
+seconds, **clamped** to a minimum of `60`.
+
+How long a `/verify` link stays usable. After that the visitor sees
+`This verification link has expired.` and can press **Get a new link 🔄** back
+in Discord.
+
+The bot's own wording is fixed text that says fifteen minutes, so if you
+change this value the message will no longer match. Edit
+`VERIFY_STEPS` and `RELINK_SENT` in `bot/messages.py` if that matters to you.
+
+### `TRUSTED_PROXY_COUNT`
+
+**Optional.** Read by the server. Default: `1`. Whole number, **clamped** to a
+minimum of `1`.
+
+How many reverse proxies **you operate** sit directly in front of the server.
+The server passes this to Werkzeug's `ProxyFix`, which rewrites the request's
+scheme, host and client address from the last N entries of the
+`X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` headers. Two
+things depend on getting it right: the OAuth `redirect_uri` is rebuilt as
+`https://` from the forwarded scheme, and the per-address rate limit on
+`/login` and `/authorize` keys on the resulting client address.
+
+Count the hops, starting at the server and working outwards, that you control:
+
+| Your setup | Value |
+| --- | --- |
+| The bundled Nginx Proxy Manager from `docker-compose.alt.yml`, nothing in front of it | `1` |
+| Your own Nginx, Caddy or Traefik in front of the container | `1` |
+| A CDN or load balancer (Cloudflare, an ALB) in front of your own proxy | `2` |
+| Two of your own proxies plus a CDN | `3` |
+
+Do not count proxies that are not yours, and do not count the client.
+
+Setting it **too low** means every visitor behind your own proxy is seen as
+that proxy's address, so one busy proxy trips the rate limit for everyone.
+Setting it **too high** is the dangerous direction: `ProxyFix` counts entries
+from the right, so a client that prepends forged entries to `X-Forwarded-For`
+can make the server read an address the client chose, defeating the rate limit
+entirely and putting a value of the attacker's choosing into the logs.
+
+If you are unsure, start at `1`, make a request through your real front door,
+and check the address the server logged for it.
+
+### `LOGIN_RATE_LIMIT`
+
+**Optional.** Read by the server. Default: `10`. Whole number, **clamped** to
+a minimum of `1`.
+
+How many requests to `/login` and `/authorize` a single client address may
+make within `LOGIN_RATE_LIMIT_WINDOW`. Over the limit, the visitor gets HTTP
+429 with a `Retry-After` header and the page
+`Too many verification attempts from your address. Please wait a moment and
+try again.`, and the server logs
+`Rate limited <endpoint> for <address>`.
+
+The limiter is a sliding window held in memory by the single server process.
+It resets when the server restarts, and it counts per process rather than
+across replicas.
+
+### `LOGIN_RATE_LIMIT_WINDOW`
+
+**Optional.** Read by the server. Default: `60`. Whole number of seconds,
+**clamped** to a minimum of `1`.
+
+The width of the window `LOGIN_RATE_LIMIT` applies over.
+
+## MongoDB
+
+### `MONGO_HOST`
+
+**Required.** Read by both the bot and the server. No default.
+
+The MongoDB connection string. Examples:
+
+```
+mongodb://<user>:<password>@mongodb:27017/?authSource=admin
+mongodb://127.0.0.1:27017/
+mongodb+srv://user:password@cluster.example.mongodb.net/
+```
+
+The first is the bundled container from `override.example.yml` or
+`docker-compose.alt.yml`. **That database requires authentication**, so the
+credentials must be present and must match `MONGO_INITDB_ROOT_USERNAME` and
+`MONGO_INITDB_ROOT_PASSWORD` below.
+
+Keep `?authSource=admin`. The driver authenticates against the database named
+in the connection string's path, falling back to `admin` when the path is
+empty, and the bundled image creates its root user in `admin`. So the form
+above works either way, but the moment anyone appends a database name, as in
+`mongodb://user:password@mongodb:27017/starguard`, the driver would look for
+the user in `starguard` and authentication would start failing. Saying
+`authSource` explicitly makes that impossible.
+
+If the password contains any of `: / ? # [ ] @`, percent-encode it, or use a
+password that avoids them.
+
+Neither process refuses to start when MongoDB is unreachable. Both log
+`Could not prepare the users collection: <reason>` and keep going, and each
+database operation then fails as it is attempted. A connection string the
+driver cannot parse at all is different: that one is logged as
+`Error connecting to MongoDB: <reason>` and leaves the server answering
+`/healthz` with 503. See
+[MongoDB connection and authentication failures](./troubleshooting.md#mongodb-connection-and-authentication-failures).
+
+### `MONGO_DATABASE`
+
+**Required.** Read by both the bot and the server. `.env.example` ships
+`starguard`, but the value is not optional: blanking it is a fatal error.
+
+The database name. Starguard uses one collection inside it, `users`.
+
+### `MONGO_INITDB_ROOT_USERNAME`
+
+**Required with the bundled MongoDB. Compose only.** No default.
+
+Read by `override.example.yml` and `docker-compose.alt.yml`, and consumed by
+the official `mongo` image, which creates this user with the `root` role in
+the `admin` database and starts `mongod` with authentication enabled. Both
+compose files refuse to start without it:
+`set MONGO_INITDB_ROOT_USERNAME in .env`.
+
+It must match the username in `MONGO_HOST`.
+
+**The user is only created when the data directory is empty.** If you are
+adding these variables to a deployment that already has data in
+`./server/mongo-data`, read
+[the MongoDB authentication section of the upgrade
+guide](./installation.md#3-the-bundled-mongodb-now-requires-authentication)
+before restarting anything.
+
+### `MONGO_INITDB_ROOT_PASSWORD`
+
+**Required with the bundled MongoDB. Compose only.** No default.
+
+The password for the user above. Must match the password in `MONGO_HOST`.
+Setting only one of the two makes the `mongo` image exit with
+`error: missing 'MONGO_INITDB_ROOT_USERNAME' or 'MONGO_INITDB_ROOT_PASSWORD'`.
+
+## Mongo Express
+
+These are read only by `override.example.yml` and `docker-compose.alt.yml`,
+both of which publish the Mongo Express UI on the **loopback interface only**.
+Reach it at `http://localhost:8081/`, or over an SSH tunnel from another
+machine. Do not publish it on a public interface.
+
+### `MONGO_EXPRESS_USERNAME`
+
+**Required when the mongo-express service is present. Compose only.** No
+default.
+
+The basic-auth username for the UI. Compose refuses to start without it rather
+than falling back to `admin`, which is what earlier versions did.
+
+### `MONGO_EXPRESS_PASSWORD`
+
+**Required when the mongo-express service is present. Compose only.** No
+default.
+
+The basic-auth password. Compose refuses to start without it rather than
+falling back to `password`.
+
+### `MONGO_EXPRESS_PORT`
+
+**Optional. Compose only.** Default: `8081`.
+
+The loopback port the UI is published on.
+
+## Nginx Proxy Manager
+
+Read only by `docker-compose.alt.yml`.
+
+### `NPM_INITIAL_ADMIN_EMAIL`
+
+**Optional but strongly recommended. Compose only.** Default: empty.
+
+Seeds the first administrator account. Without it, Nginx Proxy Manager uses
+its well-known default login (`admin@example.com` / `changeme`) until somebody
+signs in and changes it, which on a listener published on ports 80 and 443 is
+a real window. If you leave both of these empty, sign in and change the
+credentials before exposing those ports.
+
+### `NPM_INITIAL_ADMIN_PASSWORD`
+
+**Optional but strongly recommended. Compose only.** Default: empty.
+
+The password for the account above.
+
+## Logging
+
+Both processes log to stderr, which Docker collects. Both compose files cap
+the JSON log driver at three 10 MB files per container.
+
+### `LOG_LEVEL`
+
+**Optional.** Read by both the bot and the server. Default: `INFO`.
+
+One of `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL`, in any case. An
+unrecognised value **falls back** to `INFO` silently rather than failing, so a
+typo here costs you nothing but is also not reported.
+
+### `LOG_FORMAT`
+
+**Optional.** Read by both the bot and the server. Default: `text`.
+
+Either `text` or `json`. An unrecognised value **falls back** to `text`
+silently.
+
+`text` produces one readable line per record, with the request ID appended on
+the server's request-scoped lines:
+
+```
+2026-01-01 12:00:00,123 INFO starguard.server: Linking Discord ID 1234 to GitHub user someone (starred=True) [request_id=6f1c...]
+```
+
+`json` produces one JSON object per line, which a log shipper can index
+without reversing the text format. Structured fields are typed rather than
+embedded in the message, which is what makes the per-cycle star check summary
+queryable:
+
+```json
+{"timestamp": "2026-01-01T12:00:00+0000", "level": "INFO", "logger": "starguard.bot", "message": "Star check complete: examined=42 roles_removed=1 ...", "examined": 42, "roles_removed": 1, "api_calls": 3, "pages_fetched": 1, "pages_unchanged": 2, "rate_limit_remaining": 4987, "duration_seconds": 1.8}
+```
+
+## See also
+
+- [Installation guide](./installation.md), including the upgrade path from
+  older versions.
+- [Troubleshooting](./troubleshooting.md), for what each failure looks like in
+  the logs.
