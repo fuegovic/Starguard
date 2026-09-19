@@ -20,6 +20,9 @@ You need:
   not have one yet, [Step 9](#step-9-start-the-stack) includes a compose file
   that brings up Nginx Proxy Manager to obtain and terminate TLS for you.
 - Optionally, a GitHub personal access token to raise the API rate limit.
+- Optionally, admin access to the repository, to add the star webhook in
+  [Step 12](#step-12-set-up-the-star-webhook-optional). Without it the bot
+  still works; it just learns about stars on a timer instead of immediately.
 
 ## Step 1: Clone the repository
 
@@ -132,7 +135,10 @@ and Mongo Express refuses to start without `MONGO_EXPRESS_USERNAME` and
 **Option B: your own MongoDB.** Leave `docker-compose.override.yml` out and
 point `MONGO_HOST` at your instance, for example a
 `mongodb+srv://` connection string for Atlas. Starguard needs read and write
-access to one collection, `users`, in `MONGO_DATABASE`.
+access to two collections in `MONGO_DATABASE`: `users`, and
+`webhook_deliveries` if you set up the optional star webhook in
+[Step 12](#step-12-set-up-the-star-webhook-optional). It creates both, and
+their indexes, at startup.
 
 ## Step 8: Configure the .env file
 
@@ -237,6 +243,154 @@ In **Server Settings**, **Integrations**, select the bot. You can limit its
 commands to specific channels and specific roles or members there. Restricting
 `/checkstars` to moderators is worth doing: it forces a full pass over the
 stargazer list and therefore spends GitHub API budget.
+
+## Step 12: Set up the star webhook (optional)
+
+Everything so far works without this step. Skip it and the bot notices a star
+appearing or disappearing at the next sweep, up to `AUTOMATIC_CHECK_DELAY`
+seconds later, and pays one GitHub API request per 100 stargazers each time.
+On a repository with 45,000 stars an hourly sweep is 450 requests an hour, and
+that number grows every time somebody stars it.
+
+With the webhook, GitHub tells the server the moment a star changes. The
+delivery costs no GitHub API budget at all, and the member's role moves within
+`ROLE_SYNC_INTERVAL` seconds instead of within `AUTOMATIC_CHECK_DELAY`.
+
+You need admin access to the repository to add a webhook, and the public
+HTTPS address from [Step 9](#step-9-start-the-stack) has to be reachable from
+GitHub.
+
+### 1. Generate the secret
+
+This is a **second** secret, separate from `SECRET_KEY`. Generate it the same
+way:
+
+```sh
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Put it in `.env` and keep the terminal open, because you need the same value
+on GitHub in a moment:
+
+```ini
+GITHUB_WEBHOOK_SECRET=<the value you just generated>
+```
+
+Only the server reads it. Both containers load the same `.env`, so there is
+nothing extra to do for the bot.
+
+### 2. Restart the server
+
+```sh
+docker compose up -d server
+```
+
+The receiver is registered **only** when the secret is set, so this restart is
+what creates the route. Until the server has restarted, GitHub's test delivery
+in step 4 will come back 404.
+
+Confirm it started cleanly:
+
+```sh
+docker compose logs -n 20 server
+```
+
+A rejected secret stops the server outright, with the variable named:
+
+```
+Configuration error: GITHUB_WEBHOOK_SECRET must be at least 16 characters, got 8.
+```
+
+### 3. Add the webhook on GitHub
+
+Go to your repository, then **Settings**, **Webhooks**, **Add webhook**.
+
+| Field | Value |
+| --- | --- |
+| **Payload URL** | Your public HTTPS address with `/webhooks/github` appended, for example `https://starguard.example.com/webhooks/github` |
+| **Content type** | `application/json` |
+| **Secret** | The value you put in `GITHUB_WEBHOOK_SECRET` |
+| **SSL verification** | Leave it enabled |
+| **Which events** | **Let me select individual events**, then tick **Stars** and nothing else |
+| **Active** | Ticked |
+
+Two of those are worth being deliberate about.
+
+**The content type must be `application/json`.** With
+`application/x-www-form-urlencoded` GitHub wraps the payload in a
+`payload=<json>` form field, so the body is no longer a JSON object. The
+signature still verifies and the `ping` in step 4 still comes back green,
+which makes this one easy to miss: it is only the real `star` deliveries that
+then fail, every one of them with 400 and `Body is not a JSON object.`
+
+**Do not choose "Send me everything".** The receiver answers 204 and does
+nothing for every event that is not `star`, so nothing breaks, but you would
+be sending your entire repository event stream to a process that discards
+almost all of it. Untick **Pushes**, which GitHub selects by default, when you
+switch to individual events.
+
+Click **Add webhook**.
+
+### 4. Confirm the ping delivery
+
+GitHub sends a `ping` event as soon as the webhook is created, and its result
+is the one piece of evidence worth waiting for. Open the webhook, go to
+**Recent Deliveries**, and open the `ping` entry.
+
+A green tick and **200** in the **Response** tab, with the body `pong`, means
+the address, the TLS, the path and the secret are all correct. The server logs
+it as:
+
+```
+Ping received for hook 512345678.
+```
+
+Anything else is covered by
+[the webhook section of the troubleshooting guide](./troubleshooting.md#the-star-webhook-is-not-working);
+the status code in the delivery log tells you which entry to read. You can
+resend the ping from the **Redeliver** button on that page after each change,
+rather than un-starring and starring the repository again to test.
+
+Then test the real thing: un-star and re-star the repository with an account
+that has already verified with the bot, and watch the role come back within
+`ROLE_SYNC_INTERVAL` seconds.
+
+### 5. Only now, raise `AUTOMATIC_CHECK_DELAY`
+
+Once you have seen real `star` deliveries come back green for a day or so,
+move the sweep from hourly to daily:
+
+```ini
+AUTOMATIC_CHECK_DELAY=86400
+```
+
+```sh
+docker compose up -d discord-bot
+```
+
+**Do not set `AUTOMATIC_CHECK=false`.** The sweep is not made redundant by the
+webhook, and this is the part that is easy to get wrong.
+
+[GitHub does not automatically retry a failed
+delivery](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries).
+Redelivery is a manual action, from the **Redeliver** button in the repository's
+delivery log. So a delivery that arrived while your server was restarting, or
+while the database was away, is simply lost, and nothing will ever bring it
+back on its own. The member keeps a role they un-starred for, or never gets
+the one they starred for, until something else notices.
+
+The sweep is that something else. It is the only thing that repairs a missed
+delivery on its own, which is why it stays on even when the webhook is
+healthy. What the webhook buys you is the freedom to run it daily instead of
+hourly: 450 API requests a day rather than 450 an hour, with role changes
+still landing in seconds.
+
+If you do turn the sweep off anyway, know which direction you are exposed in.
+The sweep only ever **takes** the role away; it never grants one. So with it
+off, a lost delivery for somebody who starred is repaired by that member
+pressing **Claim your role** again, but a lost delivery for somebody who
+un-starred is repaired by nothing at all until a moderator runs
+`/checkstars`.
 
 ## Running without Docker
 
@@ -444,16 +598,24 @@ you operate. It defaults to `1`.
   If you set `BOT_HEALTH_ENABLED=false`, nothing answers the probe and the
   container is reported `unhealthy` forever; disable the `healthcheck` block
   too if you turn the endpoint off.
-- **Seven variables are new**: `SERVER_BIND_PORT`, `TRUSTED_PROXY_COUNT`,
+- **Eleven variables are new**: `SERVER_BIND_PORT`, `TRUSTED_PROXY_COUNT`,
   `LOGIN_RATE_LIMIT`, `LOGIN_RATE_LIMIT_WINDOW`, `BOT_HEALTH_ENABLED`,
-  `BOT_HEALTH_HOST`, `BOT_HEALTH_PORT` and `LOG_FORMAT`. All of them have
-  working defaults, so an existing `.env` keeps working once the three changes
-  above are handled.
+  `BOT_HEALTH_HOST`, `BOT_HEALTH_PORT`, `LOG_FORMAT`, `GITHUB_WEBHOOK_SECRET`,
+  `ROLE_SYNC_ENABLED` and `ROLE_SYNC_INTERVAL`. All of them have working
+  defaults, so an existing `.env` keeps working once the three changes above
+  are handled. `GITHUB_WEBHOOK_SECRET` defaults to unset, which means no
+  webhook receiver and the behaviour you already had; see
+  [Step 12](#step-12-set-up-the-star-webhook-optional) when you want it.
 - **Existing verified members do not need to do anything.** Their rows are
   kept and brought forward to the current schema at startup, which is logged
-  as `Upgraded N user record(s) to schema version 2`. Members are now keyed by
+  as `Upgraded N user record(s) to schema version 3`. Members are now keyed by
   Discord ID rather than by email address, and a GitHub account can only be
   linked to one Discord user at a time.
+- **The un-star check now matches on the numeric GitHub account id** rather
+  than the login. Anybody who renamed their GitHub account used to lose the
+  role at the next check even though their star was still there. Rows written
+  by much older versions have no id stored and still fall back to the login,
+  so they keep that behaviour until the member verifies once more.
 
 ## Development and tests
 
