@@ -8,10 +8,19 @@ disable =
     too-few-public-methods,
     too-many-arguments,
     too-many-positional-arguments,
-    too-many-return-statements
-
-[FORMAT]
-max-line-length = 100
+    too-many-return-statements,
+# Everything below this line is checked by ruff instead, one rule for one
+# rule, so leaving it on here only means reading the same finding twice.
+# Nothing is disabled that ruff does not already report; see [tool.ruff.lint]
+# in pyproject.toml for the selected rule families.
+    line-too-long,          # ruff E501, and the formatter keeps lines short
+    missing-final-newline,  # ruff W292
+    trailing-whitespace,    # ruff W291
+    unused-import,          # ruff F401
+    unused-variable,        # ruff F841
+    ungrouped-imports,      # ruff I001
+    wrong-import-order,     # ruff I001
+    wrong-import-position   # ruff E402
 
 [BASIC]
 good-names = i, j, k, db, ex, _, id, log, app

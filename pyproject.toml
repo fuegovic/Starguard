@@ -1,0 +1,122 @@
+# Tool configuration for Starguard.
+#
+# This file deliberately declares no [project] table: Starguard is deployed as
+# two containers that pip install from requirements.txt, not as a distributable
+# package, so adding packaging metadata would create a second, drifting source
+# of truth for the dependency pins.
+#
+# pylint keeps its own .pylintrc because that file predates this one and the
+# init-hook it carries has no pyproject spelling.
+
+# --- mypy -----------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+# What a bare `mypy` checks. CI runs `mypy .`, and an explicit path on the
+# command line overrides this list, which is why the test suite also has to be
+# named in `exclude` below rather than simply left out here.
+files = ["bot", "common", "server"]
+
+# The suite is written in the usual untyped pytest style, so strict mode would
+# report every fixture and every helper. Excluding it keeps the three source
+# packages honestly strict instead of loosening the flags for everyone.
+exclude = "(^|/)tests($|/)"
+
+# An ignore with no error code silences whatever the next mypy release decides
+# to report on that line, so require the code.
+enable_error_code = ["ignore-without-code", "redundant-self", "truthy-bool"]
+
+warn_unreachable = true
+pretty = true
+
+# Authlib ships no type information and has no stub package on PyPI. Every
+# other third-party import here is typed: pymongo, flask, werkzeug,
+# itsdangerous, interactions.py and python-dotenv ship py.typed, and requests
+# and waitress are covered by the stub packages in requirements-dev.txt.
+[[tool.mypy.overrides]]
+module = ["authlib.*"]
+ignore_missing_imports = true
+
+# --- ruff -----------------------------------------------------------------
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "N",    # pep8-naming
+    "ANN",  # flake8-annotations
+    "DTZ",  # flake8-datetimez
+    "RUF",  # ruff's own rules
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The suite is written in the usual untyped pytest style on purpose, so the
+# annotation rules do not apply to it. This is the only rule family the tests
+# are excused from: everything else ruff reports there is a real finding and
+# is meant to be fixed rather than configured away.
+"tests/**" = ["ANN"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bot", "common", "server"]
+
+# --- bandit ---------------------------------------------------------------
+#
+# CI runs `bandit -r bot common server`, which already scans exactly the three
+# source packages and needs nothing from this section. Bandit only reads a
+# pyproject.toml when it is pointed at one, so `bandit -c pyproject.toml -r .`
+# is the invocation that picks these up; both spellings report the same thing.
+#
+# Every finding in the source is either fixed or carries an inline `# nosec`
+# naming the specific test and saying why it is safe here. There are no
+# blanket skips: a rule turned off in this file would be turned off for code
+# nobody has looked at yet.
+
+[tool.bandit]
+exclude_dirs = ["tests", ".git"]
+
+# --- coverage -------------------------------------------------------------
+#
+# The gate is fail_under = 100 in [tool.coverage.report]. No --cov in pytest's
+# addopts, because a default --cov would slow every local run; CI passes it.
+
+[tool.coverage.run]
+branch = true
+source = ["bot", "common", "server"]
+
+[tool.coverage.report]
+show_missing = true
+precision = 1
+# The suite covers every line and every branch, so the gate is set where the
+# project actually stands. A lower number would just license silent erosion.
+# If a future change genuinely cannot be covered, add it to exclude_also with
+# a reason: that is a deliberate decision someone reviews, unlike drift.
+fail_under = 100
+exclude_also = [
+    # Entry points that only run under `python -m`.
+    "if __name__ == .__main__.:",
+    # Bodies that exist for the type checker and never execute.
+    "if TYPE_CHECKING:",
+    "\\.\\.\\.$",
+    "raise NotImplementedError",
+]
+
+# --- pytest ---------------------------------------------------------------
+#
+# Folded in from pytest.ini so there is one place to look. `pytest` with no
+# arguments from the repository root behaves exactly as it did before.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
