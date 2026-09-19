@@ -4,6 +4,8 @@
 # deliberately mirror signatures they do not use.
 # pylint: disable=missing-function-docstring,unused-argument
 
+from contextlib import closing
+
 import pytest
 from flask import abort
 
@@ -129,11 +131,16 @@ def test_a_forwarded_header_cannot_choose_the_bucket():
 def test_static_files_keep_the_caching_flask_chose_for_them(client):
     # Everything else is per-user and one page carries a token in its URL,
     # but the stylesheet is the same for everybody.
-    response = client.get("/static/css/style.css")
-    assert response.status_code == 200
-    assert response.headers.get("Cache-Control") != "no-store"
-    # It is still hardened.
-    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    # close() matters here and nowhere else in this suite: a static file is
+    # served as a wrapped file object, and the test client hands it over
+    # without consuming it, so the handle stays open and warnings-as-errors
+    # turns that into a failure. A real serve iterates the response and
+    # closes it for you.
+    with closing(client.get("/static/css/style.css")) as response:
+        assert response.status_code == 200
+        assert response.headers.get("Cache-Control") != "no-store"
+        # It is still hardened.
+        assert response.headers["X-Content-Type-Options"] == "nosniff"
 
 
 def test_a_request_that_never_began_is_still_torn_down_cleanly():
