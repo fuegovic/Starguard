@@ -1,137 +1,232 @@
-# pylint: disable=missing-module-docstring
-# pylint: disable=missing-class-docstring
-# pylint: disable=missing-function-docstring
-# pylint: disable=line-too-long
+"""GitHub OAuth callback server for Starguard.
 
+Handles two routes: ``/login`` starts the OAuth flow for a Discord user who
+presented a signed link token from the bot, and ``/authorize`` records whether
+that user has starred the configured repository.
+
+The GitHub access token is used for the duration of the request and then
+discarded. It is never written to the database or to the logs.
+"""
+
+import logging
 import os
-from datetime import datetime, timezone
-from flask import Flask, request, render_template, url_for, session
+import sys
+
+from authlib.integrations.flask_client import OAuth, OAuthError
 from dotenv import load_dotenv
-from authlib.integrations.flask_client import OAuth
-from authlib.integrations.flask_client import OAuthError
+from flask import Flask, render_template, request, session, url_for
 from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+from waitress import serve
 from werkzeug.middleware.proxy_fix import ProxyFix
-import pymongo
+
+from common.config import ConfigError, env_int, require_env, require_secret_key
+from common.linktoken import LinkTokenError, read_link_token
+from common.storage import AccountAlreadyLinkedError, connect, link_account
 
 load_dotenv()
 
-owner = os.getenv('REPO_OWNER')
-repo = os.getenv('GITHUB_REPO')
-url = f"https://github.com/{owner}/{repo}/"
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("starguard.server")
 
-app = Flask(__name__, template_folder='./html')
-app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
-app.template_folder = './html'
-app.secret_key = os.getenv('SECRET_KEY')
-oauth = OAuth(app)
+# The scope needed to read a public profile and check whether the authenticated
+# user starred a public repository. This used to request `repo`, which grants
+# read and write access to every private repository the user owns: far beyond
+# what a Discord role bot needs, and a serious thing to ask of a visitor.
+GITHUB_OAUTH_SCOPE = "read:user"
 
-CLIENT = None
-DB = None
+# GitHub answers "is this repo starred by me" with 204 (yes) or 404 (no).
+STARRED_STATUS = 204
 
-# Connect to the MongoDB server
+
+def load_config():
+    """Read and validate every setting the server needs."""
+    return {
+        "owner": require_env("REPO_OWNER"),
+        "repo": require_env("GITHUB_REPO"),
+        "secret_key": require_secret_key(),
+        "client_id": require_env("GITHUB_CLIENT_ID"),
+        "client_secret": require_env("GITHUB_CLIENT_SECRET"),
+        "mongo_host": require_env("MONGO_HOST"),
+        "mongo_database": require_env("MONGO_DATABASE"),
+        # The port inside the container. docker-compose publishes it on the
+        # host as ${SERVER_PORT}; the two are deliberately separate, because
+        # binding to SERVER_PORT while the compose file mapped it to 5000 made
+        # every value other than 5000 unreachable.
+        "port": env_int("SERVER_BIND_PORT", 5000, minimum=1),
+        "link_token_max_age": env_int("LINK_TOKEN_MAX_AGE", 900, minimum=60),
+    }
+
+
 try:
-    CLIENT = MongoClient(host=os.getenv('MONGO_HOST'))
-    DB = CLIENT.get_database(os.getenv('MONGO_DATABASE'))
-except pymongo.errors.ConfigurationError as configuration_error:
-    print(f"Error connecting to MongoDB: {configuration_error}")
-except pymongo.errors.OperationFailure as operation_error:
-    print(f"Error connecting to MongoDB: {operation_error}")
-except pymongo.errors.ServerSelectionTimeoutError as timeout_error:
-    print(f"Server selection timeout error: {timeout_error}")
+    CONFIG = load_config()
+except ConfigError as config_error:
+    log.error("Configuration error: %s", config_error)
+    sys.exit(1)
 
-github = oauth.register(
-    name='github',
-    client_id=os.getenv('GITHUB_CLIENT_ID'),
-    client_secret=os.getenv('GITHUB_CLIENT_SECRET'),
-    authorize_url='https://github.com/login/oauth/authorize',
-    access_token_url='https://github.com/login/oauth/access_token',
-    api_base_url='https://api.github.com/',
-    client_kwargs={'scope': 'user:email repo'}
+REPO_URL = f"https://github.com/{CONFIG['owner']}/{CONFIG['repo']}/"
+
+app = Flask(__name__, template_folder="./html")
+# The server sits behind a reverse proxy, which terminates TLS. Without this
+# the OAuth redirect_uri would be built as http:// and GitHub would reject it.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.secret_key = CONFIG["secret_key"]
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=True,
 )
 
-@app.route('/login')
+oauth = OAuth(app)
+github = oauth.register(
+    name="github",
+    client_id=CONFIG["client_id"],
+    client_secret=CONFIG["client_secret"],
+    authorize_url="https://github.com/login/oauth/authorize",
+    access_token_url="https://github.com/login/oauth/access_token",
+    api_base_url="https://api.github.com/",
+    client_kwargs={"scope": GITHUB_OAUTH_SCOPE},
+)
+
+MONGO_CLIENT = None
+USERS = None
+try:
+    MONGO_CLIENT, USERS = connect(
+        CONFIG["mongo_host"], CONFIG["mongo_database"], MongoClient
+    )
+except PyMongoError as mongo_error:
+    log.error("Error connecting to MongoDB: %s", mongo_error)
+
+
+def render_result(message):
+    """Render the result page with a single user-facing message."""
+    return render_template("result.html", message=message)
+
+
+@app.route("/login")
 def login():
-    discord_username = request.args.get('name')
-    discord_id = request.args.get('id')
-    session['name'] = discord_username
-    session['id'] = discord_id
-    redirect_uri = url_for('authorize', _external=True)
+    """Begin the OAuth flow for the Discord user named in the link token."""
+    try:
+        discord_id, discord_username = read_link_token(
+            app.secret_key,
+            request.args.get("token"),
+            max_age=CONFIG["link_token_max_age"],
+        )
+    except LinkTokenError as exc:
+        log.info("Rejected verification link: %s", exc)
+        return render_result(str(exc)), 400
+
+    session["discord_id"] = discord_id
+    session["discord_username"] = discord_username
+
+    redirect_uri = url_for("authorize", _external=True)
     return github.authorize_redirect(redirect_uri)
 
-@app.route('/authorize')
+
+@app.route("/authorize")
 def authorize():
-    discord_username = session.get('name')
-    discord_id = session.get('id')
-    message = ""
-    user_data = {}
+    """Complete the OAuth flow and record the user's star status."""
+    discord_id = session.pop("discord_id", None)
+    discord_username = session.pop("discord_username", None)
+
+    if not discord_id:
+        return render_result(
+            "Your verification session has expired. Run /verify in Discord again."
+        ), 400
+
+    if USERS is None:
+        log.error("Cannot record a link: no database connection.")
+        return render_result(
+            "The database is unavailable right now. Please try again later."
+        ), 503
 
     try:
         token = github.authorize_access_token()
-        if token:
-            # Auth successful
-            message = "Authentication successful!"
-            print(f"Auth Status: {message}")
+    except OAuthError as exc:
+        log.info("OAuth error for Discord ID %s: %s", discord_id, exc.description)
+        return render_result(f"GitHub sign-in failed: {exc.description}"), 400
 
-            user_resp = github.get('user', token=token)
-            username = user_resp.json()['login']
-            print(f"User's username: {username}")
+    if not token:
+        return render_result("GitHub sign-in failed. Please try again."), 400
 
-            resp = github.get('user/emails', token=token)
-            email = resp.json()[0]['email']
-            print(f"User's email: {email}")
-            print(f"Token: {token}")
+    try:
+        profile = github.get("user", token=token).json()
+        github_username = profile["login"]
+        github_id = profile["id"]
 
-            # Make a GET request to the "Check if a repository is starred" endpoint
-            starred_resp = github.get(f'user/starred/{owner}/{repo}', token=token)
-            print(f"starred response = {starred_resp}")
+        # 204 means the authenticated user has starred the repository.
+        starred_response = github.get(
+            f"user/starred/{CONFIG['owner']}/{CONFIG['repo']}", token=token
+        )
+        starred = starred_response.status_code == STARRED_STATUS
+    except (OAuthError, KeyError, ValueError) as exc:
+        log.warning("Could not read the GitHub profile: %s", exc)
+        return render_result(
+            "Could not read your GitHub profile. Please try again."
+        ), 502
 
-            # If the response status code is 204, the repository is starred
-            starred_repo = starred_resp.status_code == 204
+    log.info(
+        "Linking Discord ID %s to GitHub user %s (starred=%s)",
+        discord_id,
+        github_username,
+        starred,
+    )
 
-            # Get the current timestamp in UTC
-            current_time = datetime.now(timezone.utc).isoformat()
+    try:
+        link_account(
+            USERS,
+            discord_id=discord_id,
+            discord_username=discord_username,
+            github_id=github_id,
+            github_username=github_username,
+            linked_repo=REPO_URL,
+            starred_repo=starred,
+        )
+    except AccountAlreadyLinkedError:
+        log.info(
+            "Refused to link GitHub user %s to Discord ID %s: already linked.",
+            github_username,
+            discord_id,
+        )
+        return render_result(
+            f"The GitHub account {github_username} is already linked to another "
+            "Discord user. Each GitHub account can only be used once."
+        ), 409
+    except PyMongoError as exc:
+        log.error("Could not save the link: %s", exc)
+        return render_result(
+            "Could not save your verification right now. Please try again later."
+        ), 503
 
-            user_data = {
-                'discord_username': discord_username,
-                'discord_id': discord_id,
-                'github_username': username,
-                'github_email': email,
-                'linked_repo': url,
-                'starred_repo': starred_repo,
-                'github_token': token,
-                'updated_at': current_time,
-            }
+    if starred:
+        return render_result(
+            "Authentication successful! Head back to Discord and claim your role."
+        )
+    return render_result(
+        f"Authentication successful, but you have not starred {CONFIG['owner']}/"
+        f"{CONFIG['repo']} yet. Star it, then claim your role in Discord."
+    )
 
-            save_user_data_to_db(user_data)
 
-        else:
-            # Auth failed
-            message = "Invalid link!"
-            print(f"Auth Status: {message}")
+@app.route("/healthz")
+def healthz():
+    """Liveness probe that also reports database reachability."""
+    if USERS is None:
+        return {"status": "degraded", "database": "unavailable"}, 503
+    return {"status": "ok"}, 200
 
-    except OAuthError as e:
-        message = f"OAuth error: {e.description}"
-        print(f"Auth Status: {message}")
 
-    return render_template('result.html', message=message, user_data=user_data)
-
-def save_user_data_to_db(user_data):
-    # Save user information to MongoDB
-    user_collection = DB['users']
-
-    # Check if a document with the same email exists
-    existing_user = user_collection.find_one({'github_email': user_data['github_email']})
-
-    if existing_user:
-        # Update the existing document
-        user_collection.update_one({'github_email': user_data['github_email']}, {'$set': user_data})
-    else:
-        # Insert a new document
-        user_collection.insert_one(user_data)
-
-@app.route('/')
+@app.route("/")
 def home():
-    return render_template('home.html')
+    """Deliberately uninformative landing page."""
+    return render_template("home.html")
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=os.getenv('SERVER_PORT'), debug=False)
+
+if __name__ == "__main__":
+    # waitress is a production WSGI server. Flask's built-in app.run() is a
+    # development server and explicitly not meant to face the internet.
+    log.info("Starguard OAuth server listening on port %s", CONFIG["port"])
+    serve(app, host="0.0.0.0", port=CONFIG["port"], ident="Starguard")

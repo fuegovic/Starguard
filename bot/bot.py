@@ -1,96 +1,197 @@
-# pylint: disable=missing-module-docstring
-# pylint: disable=missing-class-docstring
-# pylint: disable=missing-function-docstring
-# pylint: disable=line-too-long
+"""Starguard Discord bot.
 
-import os
+Grants a role to members who have starred the configured GitHub repository and
+takes it back when they un-star it.
+
+Blocking work (HTTP calls to GitHub, the synchronous pymongo driver) runs in a
+worker thread via ``asyncio.to_thread`` so it never stalls the gateway
+heartbeat.
+"""
+
 import asyncio
 import logging
+import os
 import random
-import requests
+import sys
+from urllib.parse import urlencode
+
 from dotenv import load_dotenv
-from pymongo import MongoClient
-import pymongo
-from messages import THANKS, SORRY
 from interactions import (
-    Client,
-    Intents,
-    listen,
-    slash_command,
-    SlashContext,
     ActionRow,
     Button,
     ButtonStyle,
+    Client,
     ComponentContext,
+    Embed,
+    Intents,
+    SlashContext,
     component_callback,
-    Embed
+    listen,
+    slash_command,
 )
+from interactions.client.errors import Forbidden, HTTPException, NotFound
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+
+from bot.messages import SORRY, THANKS
+from common.config import (
+    ConfigError,
+    env_bool,
+    env_int,
+    optional_env,
+    require_env,
+    require_secret_key,
+    require_snowflake,
+)
+from common.github_api import GitHubError, fetch_stargazer_logins
+from common.linktoken import issue_link_token
+from common.storage import all_links, connect, find_link, set_starred
 
 load_dotenv()
 
-token = os.getenv('TOKEN')
-repo = os.getenv('GITHUB_REPO')
-owner = os.getenv('REPO_OWNER')
-role = os.getenv('ROLE_ID')
-client_id = os.getenv('CLIENT_ID')
-domain = os.getenv('DOMAIN')
-CLIENT = None
-DB = None
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("starguard.bot")
 
-logging.basicConfig()
-cls_log = logging.getLogger('MyLogger')
-cls_log.setLevel(logging.INFO)
+# The automatic check hits the GitHub API once per page of stargazers, so a
+# short interval on a popular repository would burn through the rate limit.
+MIN_CHECK_DELAY_SECONDS = 300
+DEFAULT_CHECK_DELAY_SECONDS = 3600
 
-# Connect to the MongoDB server
+# How long to wait before retrying after the check loop raises.
+LOOP_ERROR_BACKOFF_SECONDS = 60
+
+# Discord rejects slash command names that are not lowercase.
+MAX_LINK_BUTTONS = 4
+
+
+def load_config():
+    """Read and validate every setting the bot needs.
+
+    Called before the command decorators run, so a missing value produces a
+    named error instead of a bot that registers a command called "None".
+    """
+    config = {
+        "token": require_env("TOKEN"),
+        "client_id": optional_env("CLIENT_ID", ""),
+        "owner": require_env("REPO_OWNER"),
+        "repo": require_env("GITHUB_REPO"),
+        "github_token": optional_env("GITHUB_TOKEN"),
+        "role_id": require_snowflake("ROLE_ID"),
+        "guild_id": require_snowflake("GUILD_ID"),
+        "channel_id": require_snowflake("CHANNEL_ID"),
+        "domain": require_env("DOMAIN").rstrip("/"),
+        "secret_key": require_secret_key(),
+        "mongo_host": require_env("MONGO_HOST"),
+        "mongo_database": require_env("MONGO_DATABASE"),
+        "automatic_check": env_bool("AUTOMATIC_CHECK", True),
+        "check_delay": env_int(
+            "AUTOMATIC_CHECK_DELAY",
+            DEFAULT_CHECK_DELAY_SECONDS,
+            minimum=MIN_CHECK_DELAY_SECONDS,
+        ),
+    }
+
+    # The custom links command is optional. Older versions crashed at startup
+    # when it was unconfigured; now it is simply not registered.
+    command_name = (optional_env("COMMAND_NAME") or "").lower()
+    config["command_name"] = command_name
+    config["command_description"] = optional_env(
+        "COMMAND_DESCRIPTION", "Useful links"
+    )
+    config["command_extended_description"] = optional_env(
+        "COMMAND_EXTENDED_DESCRIPTION", ""
+    )
+    config["link_buttons"] = [
+        (label, url)
+        for label, url in (
+            (optional_env(f"BTN{i}"), optional_env(f"URL{i}"))
+            for i in range(1, MAX_LINK_BUTTONS + 1)
+        )
+        if label and url
+    ]
+    return config
+
+
 try:
-    CLIENT = MongoClient(host=os.getenv('MONGO_HOST'))
-    DB = CLIENT.get_database(os.getenv('MONGO_DATABASE'))
-except pymongo.errors.ConfigurationError as configuration_error:
-    print(f"Error connecting to MongoDB: {configuration_error}")
-except pymongo.errors.OperationFailure as operation_error:
-    print(f"Error connecting to MongoDB: {operation_error}")
-except pymongo.errors.ServerSelectionTimeoutError as timeout_error:
-    print(f"Server selection timeout error: {timeout_error}")
+    CONFIG = load_config()
+except ConfigError as config_error:
+    log.error("Configuration error: %s", config_error)
+    sys.exit(1)
+
+REPO_URL = f"https://github.com/{CONFIG['owner']}/{CONFIG['repo']}/"
+
+MONGO_CLIENT = None
+USERS = None
+try:
+    MONGO_CLIENT, USERS = connect(
+        CONFIG["mongo_host"], CONFIG["mongo_database"], MongoClient
+    )
+except PyMongoError as mongo_error:
+    log.error("Error connecting to MongoDB: %s", mongo_error)
 
 client = Client(
-    intents=Intents.ALL,
-    token=token,
+    intents=Intents.DEFAULT | Intents.GUILD_MEMBERS,
+    token=CONFIG["token"],
     sync_interactions=True,
     asyncio_debug=False,
-    logger=cls_log,
-    send_command_tracebacks=False
+    logger=log,
+    send_command_tracebacks=False,
 )
+
+# Holding a reference keeps the loop task from being garbage collected mid-run,
+# which asyncio is free to do when nothing refers to the task.
+_CHECK_TASK = None
 
 
 @listen()
 async def on_startup():
-    print(f'{client.user} connected to discord')
-    print('----------------------------------------------------------------------------------------------------------------')
-    print(f'Bot invite link: https://discord.com/api/oauth2/authorize?client_id={client_id}&permissions=268453888&scope=bot')
-    print('----------------------------------------------------------------------------------------------------------------')
-    # Start the task
-    asyncio.create_task(check_star_status_loop())
+    """Announce the bot and start the periodic star check."""
+    global _CHECK_TASK  # pylint: disable=global-statement
+
+    log.info("%s connected to Discord", client.user)
+    if CONFIG["client_id"]:
+        log.info(
+            "Bot invite link: https://discord.com/api/oauth2/authorize"
+            "?client_id=%s&permissions=268453888&scope=bot",
+            CONFIG["client_id"],
+        )
+
+    if CONFIG["automatic_check"]:
+        log.info(
+            "Automatic star checks every %s seconds", CONFIG["check_delay"]
+        )
+        _CHECK_TASK = asyncio.create_task(check_star_status_loop())
+    else:
+        log.info("Automatic star checks are disabled (AUTOMATIC_CHECK=false)")
 
 
 # 👁️ AUTOMATIC CHECK OF THE STAR STATUS
 async def check_star_status_loop():
-    disable_loop = os.getenv('AUTOMATIC_CHECK', 'True')  # Default to 'True' if not set
-    if disable_loop.lower() == 'false':
-        return
+    """Re-check every linked user on an interval, forever.
+
+    Errors are caught and logged rather than allowed to escape: an unhandled
+    exception here used to kill the task silently, and automatic checks would
+    never run again until the bot was restarted.
+    """
     while True:
-        channel_id = os.getenv('CHANNEL_ID')
-        channel = client.get_channel(channel_id)
-        await check_star_status(channel, manual=False)
-        loop_delay = os.getenv('AUTOMATIC_CHECK_DELAY', '3600')  # Default to 3600 seconds (1 hour) if not set
-        loop_delay = int(loop_delay)  # Convert string to int
-        min_delay = 300  # Set minimum delay to 300 seconds (5 minutes)
-        loop_delay = max(loop_delay, min_delay)  # Choose maximum of loop_delay and min_delay
-        await asyncio.sleep(loop_delay)
+        try:
+            await check_star_status()
+            delay = CONFIG["check_delay"]
+        # CancelledError derives from BaseException, so cancellation still
+        # propagates out of this handler and stops the loop.
+        except Exception:  # pylint: disable=broad-except
+            log.exception("Automatic star check failed; retrying shortly")
+            delay = LOOP_ERROR_BACKOFF_SECONDS
+        await asyncio.sleep(delay)
 
 
 # ☎️ PING
 @slash_command(name="ping", description="☎️ Ping")
 async def ping(ctx: SlashContext):
+    """Report the gateway latency."""
     latency_ms = round(client.latency * 1000, 2)
     await ctx.send(f"Ping: {latency_ms}ms", ephemeral=True)
 
@@ -98,102 +199,97 @@ async def ping(ctx: SlashContext):
 # 🙋 HELP
 @slash_command(name="help", description="Show a list of available commands")
 async def help_command(ctx: SlashContext):
+    """List the commands this bot provides."""
     embed = Embed(
         title="GitHub 🌟 Verification Bot",
         description="Here is a list of available commands:",
-        color=0xffac33,
-        url="https://github.com/fuegovic/Starguard"
+        color=0xFFAC33,
+        url="https://github.com/fuegovic/Starguard",
     )
-
     embed.add_field(
         name="> /ping",
-        value="**Ping the bot**\n"
-        "- ☎️ Ping the bot, returns the latency in milliseconds"
+        value="**Ping the bot**\n- ☎️ Ping the bot, returns the latency in milliseconds",
     )
     embed.add_field(
         name="> /verify",
         value="**GitHub verification**\n"
-        f"- ✨ Star **{repo}**\n"
+        f"- ✨ Star **{CONFIG['repo']}**\n"
         "- 🔑 Link your GitHub account\n"
-        "- 🎁 Get a role"
+        "- 🎁 Get a role",
     )
     embed.add_field(
         name="> /starcount",
-        value=f"**💫 Displays the number of stargazers for:\nhttps://github.com/{owner}/{repo}/**"
+        value=f"**💫 Displays the number of stargazers for:\n{REPO_URL}**",
     )
+    if CONFIG["command_name"]:
+        embed.add_field(
+            name=f"> /{CONFIG['command_name']}",
+            value=f"**{CONFIG['command_description']}**\n"
+            f"- {CONFIG['command_extended_description']}",
+        )
+    embed.add_field(name="---", value=" \n")
     embed.add_field(
-        name=f"> /{os.getenv('COMMAND_NAME')}",
-        value=f"**{os.getenv('COMMAND_DESCRIPTION')}**\n"
-        f"- {os.getenv('COMMAND_EXTENDED_DESCRIPTION')}"
+        name="Visit our GitHub page for the latest updates, additional "
+        "information, or to report any problems",
+        value="**[GitHub](https://github.com/fuegovic/Starguard)**",
     )
-    embed.add_field(
-        name="---",
-        value=" \n"
-    )
-    embed.add_field(
-        name="Visit our GitHub page for the latest updates, additional information, or to report any problems",
-        value="**[GitHub](https://github.com/fuegovic/Starguard)**"
-    )
-
     await ctx.send(embed=embed, ephemeral=True)
 
 
 # 🛠️ CUSTOM COMMAND - See .env.example
-@slash_command(
-        name=f"{os.getenv('COMMAND_NAME')}",
-        description=f"{os.getenv('COMMAND_DESCRIPTION')}")
-async def hyperlinks(ctx: SlashContext):
-    hyperlinks_btns = [
-        ActionRow(
-            Button(
-                style=ButtonStyle.URL,
-                label=f"{os.getenv('BTN1')}",
-                url=f"{os.getenv('URL1')}"
-            ),
-            Button(
-                style=ButtonStyle.URL,
-                label=f"{os.getenv('BTN2')}",
-                url=f"{os.getenv('URL2')}"
-            ),
-            Button(
-                style=ButtonStyle.URL,
-                label=f"{os.getenv('BTN3')}",
-                url=f"{os.getenv('URL3')}"
-            ),
-            Button(
-                style=ButtonStyle.URL,
-                label=f"{os.getenv('BTN4')}",
-                url=f"{os.getenv('URL4')}"
-            )
+def register_links_command():
+    """Register the optional custom links command, if it is configured."""
+    if not CONFIG["command_name"] or not CONFIG["link_buttons"]:
+        return
+
+    @slash_command(
+        name=CONFIG["command_name"], description=CONFIG["command_description"]
+    )
+    async def hyperlinks(ctx: SlashContext):
+        buttons = [
+            Button(style=ButtonStyle.URL, label=label, url=url)
+            for label, url in CONFIG["link_buttons"]
+        ]
+        await ctx.send(
+            "Useful links:", components=[ActionRow(*buttons)], ephemeral=True
         )
-    ]
-    await ctx.send("Useful links:", components=hyperlinks_btns, ephemeral=True)
+
+    client.add_command(hyperlinks)
 
 
-# ✨ OUTPUT THE NUMBER OF STAR A REPO HAS
+# ✨ OUTPUT THE NUMBER OF STARS A REPO HAS
 @slash_command(name="starcount", description="Get the total number of stargazers")
 async def starcount(ctx: SlashContext):
-    await ctx.send("Counting stars...", ephemeral=True)
-    stargazers = await get_stargazers()
+    """Report how many accounts have starred the repository."""
+    await ctx.defer(ephemeral=True)
+    try:
+        stargazers = await get_stargazers()
+    except GitHubError as exc:
+        # This used to call len() on None and raise a TypeError on every
+        # rate-limited request.
+        log.warning("starcount failed: %s", exc)
+        await ctx.send(f"Could not reach GitHub right now: {exc}", ephemeral=True)
+        return
     await ctx.send(f"There are {len(stargazers)} stargazers! ✨", ephemeral=True)
 
 
 # 🔍 VERIFY USER AND GIVE A ROLE BUTTONS
-@slash_command(
-        name='verify',
-        description='💫 Self Verification')
-
+@slash_command(name="verify", description="💫 Self Verification")
 async def verify(ctx: SlashContext):
-    user = ctx.author
-    userid = ctx.author_id
+    """Send the three-step verification prompt."""
+    # The Discord ID travels inside a signed, expiring token rather than as a
+    # plain query parameter, so it cannot be swapped for someone else's.
+    link_token = issue_link_token(
+        CONFIG["secret_key"], ctx.author_id, str(ctx.author)
+    )
+    oauth_url = f"{CONFIG['domain']}/login?{urlencode({'token': link_token})}"
 
-    oauth_url = f"{domain}/login?id={userid}&name={user}"
     ver_btns = [
         ActionRow(
             Button(
                 style=ButtonStyle.URL,
                 label="1: Star this repo 🌟",
-                url=f"https://github.com/{owner}/{repo}/",
+                url=REPO_URL,
             ),
             Button(
                 style=ButtonStyle.URL,
@@ -204,106 +300,217 @@ async def verify(ctx: SlashContext):
                 style=ButtonStyle.BLUE,
                 label="3: Claim your role ❤️‍🔥",
                 custom_id="claim",
-            )
+            ),
         )
     ]
-    await ctx.send("💫 Self Verification:\n- 1: Make sure you've starred this repo\n- 2: Authenticate with GitHub\n- 3: Claim your role", components=ver_btns, ephemeral=True)
+    await ctx.send(
+        "💫 Self Verification:\n"
+        "- 1: Make sure you've starred this repo\n"
+        "- 2: Authenticate with GitHub\n"
+        "- 3: Claim your role\n"
+        "_The GitHub link is personal to you and expires in 15 minutes._",
+        components=ver_btns,
+        ephemeral=True,
+    )
 
 
 # 🎁 CLAIM THE ROLE
 @component_callback("claim")
 async def claim_callback(ctx: ComponentContext):
-    userid = ctx.author_id
-    user = ctx.author
-    # Get user data from MongoDB
-    user_collection = DB['users']
-    user_entry = user_collection.find_one({'discord_id': f'{userid}', 'linked_repo': f"https://github.com/{owner}/{repo}/"})
-
-    if user_entry:
-        # Check if user has starred the repo
-        if user_entry.get('starred_repo', False):
-            # Check if user already has the role
-            if user.has_role(role):
-                # User already has the role, do nothing
-                await ctx.send(content="You already claimed your role 😁\n💫Thanks!", ephemeral=True)
-            else:
-                # User doesn't have the role, assign it and send the message
-                await user.add_role(role, reason='star')
-                thank_you_message = random.choice(THANKS).format(userid)
-                await ctx.send(content=thank_you_message)
-        else:
-            await user.remove_role(role, reason='no_star')
-            await ctx.send(content="Please star the repo to get the role 🌟", ephemeral=True)
-    else:
-        await ctx.send(content="Please make sure to link your GitHub account by using the **Log in with GitHub** button.", ephemeral=True)
-
-
-#⭐ Check who has un-starred the repo and remove their role
-@slash_command(name="checkstars", description="⭐ Check who has un-starred the repo and remove their role")
-async def check_stars_command(ctx: SlashContext):
-    await ctx.send("Checking star status...", ephemeral=True)
-    await check_star_status(ctx, manual=True)
-    await ctx.send("Star status checked", ephemeral=True)
-
-async def check_star_status(ctx: SlashContext, manual):
-    channel_id = os.getenv('CHANNEL_ID')
-    channel = client.get_channel(channel_id)
-    stargazers = await get_stargazers()
-    if stargazers is None:
+    """Grant the role if the clicking user has a recorded star."""
+    if USERS is None:
+        await ctx.send(
+            content="The database is unavailable right now, please try again later.",
+            ephemeral=True,
+        )
         return
 
-    user_collection = DB['users']
-    users = user_collection.find()
+    member = ctx.author
+    try:
+        user_entry = await asyncio.to_thread(find_link, USERS, ctx.author_id)
+    except PyMongoError as exc:
+        log.error("Could not read the link for %s: %s", ctx.author_id, exc)
+        await ctx.send(
+            content="Could not check your verification, please try again later.",
+            ephemeral=True,
+        )
+        return
 
-    for user in users:
-        if user['github_username'] not in stargazers:
-            # Get the Discord member object
-            guild_id = os.getenv('GUILD_ID')
-            guild = client.get_guild(guild_id)
-            discord_member = guild.get_member(user['discord_id'])
+    if not user_entry:
+        await ctx.send(
+            content="Please make sure to link your GitHub account by using the "
+            "**Log in with GitHub** button.",
+            ephemeral=True,
+        )
+        return
 
-            if not discord_member.has_role(role):
-                continue
+    if not user_entry.get("starred_repo", False):
+        # Only touch the role if they actually hold it.
+        if member.has_role(CONFIG["role_id"]):
+            await safe_remove_role(member, "no_star")
+        await ctx.send(
+            content="Please star the repo to get the role 🌟", ephemeral=True
+        )
+        return
 
-            await discord_member.remove_role(role, reason='no_star')
-            username = user['discord_username'].replace('@', '')
-            sorry_message = random.choice(SORRY).format(user['discord_id'])
-            await channel.send(content=sorry_message)
+    if member.has_role(CONFIG["role_id"]):
+        await ctx.send(
+            content="You already claimed your role 😁\n💫Thanks!", ephemeral=True
+        )
+        return
 
-            if manual:
-                await ctx.send(content=f"Removed role from **{username}** for un-starring the repo.", ephemeral=True)
+    if not await safe_add_role(member, "star"):
+        await ctx.send(
+            content="I could not assign the role. Please ask a moderator to "
+            "check my permissions and role position.",
+            ephemeral=True,
+        )
+        return
 
-            user_collection.update_one({'github_username': user['github_username']}, {'$set': {'starred_repo': False}})
+    await ctx.send(content=random.choice(THANKS).format(ctx.author_id))
+
+
+# ⭐ Check who has un-starred the repo and remove their role
+@slash_command(
+    name="checkstars",
+    description="⭐ Check who has un-starred the repo and remove their role",
+)
+async def check_stars_command(ctx: SlashContext):
+    """Run the star check now and report what changed."""
+    await ctx.defer(ephemeral=True)
+    try:
+        removed = await check_star_status()
+    except GitHubError as exc:
+        await ctx.send(f"Could not reach GitHub right now: {exc}", ephemeral=True)
+        return
+    except PyMongoError as exc:
+        log.error("checkstars failed: %s", exc)
+        await ctx.send("Could not reach the database right now.", ephemeral=True)
+        return
+
+    if not removed:
+        await ctx.send("Star status checked, no changes.", ephemeral=True)
+        return
+
+    names = ", ".join(f"**{name}**" for name in removed)
+    await ctx.send(
+        f"Removed the role from {len(removed)} member(s) for un-starring the "
+        f"repo: {names}",
+        ephemeral=True,
+    )
+
+
+async def check_star_status():
+    """Strip the role from linked users who no longer star the repository.
+
+    Returns the list of display names that lost the role.
+    """
+    if USERS is None:
+        log.warning("Skipping star check: no database connection.")
+        return []
+
+    stargazers = await get_stargazers()
+    links = await asyncio.to_thread(all_links, USERS)
+
+    guild = client.get_guild(CONFIG["guild_id"])
+    if guild is None:
+        log.warning("Guild %s is not in the cache; skipping.", CONFIG["guild_id"])
+        return []
+
+    channel = client.get_channel(CONFIG["channel_id"])
+    removed = []
+
+    for entry in links:
+        username = entry.get("github_username_lower") or (
+            entry.get("github_username") or ""
+        ).lower()
+        if not username or username in stargazers:
+            continue
+
+        discord_id = entry.get("discord_id")
+        if not discord_id:
+            continue
+
+        # A member who left the guild returns None here. Calling has_role on
+        # that used to raise and take the whole loop down with it.
+        member = guild.get_member(discord_id)
+        if member is None:
+            log.info(
+                "Discord ID %s is no longer in the guild; marking un-starred.",
+                discord_id,
+            )
+            await record_unstarred(discord_id)
+            continue
+
+        if not member.has_role(CONFIG["role_id"]):
+            await record_unstarred(discord_id)
+            continue
+
+        if not await safe_remove_role(member, "no_star"):
+            continue
+
+        await record_unstarred(discord_id)
+        removed.append(str(entry.get("discord_username") or member.display_name).lstrip("@"))
+
+        if channel is not None:
+            try:
+                await channel.send(content=random.choice(SORRY).format(discord_id))
+            except (Forbidden, HTTPException) as exc:
+                log.warning("Could not post to the announcement channel: %s", exc)
+
+    return removed
+
+
+async def record_unstarred(discord_id):
+    """Persist that ``discord_id`` no longer stars the repository."""
+    try:
+        await asyncio.to_thread(set_starred, USERS, discord_id, False)
+    except PyMongoError as exc:
+        log.error("Could not update star state for %s: %s", discord_id, exc)
+
+
+async def safe_add_role(member, reason):
+    """Add the configured role, returning True on success."""
+    try:
+        await member.add_role(CONFIG["role_id"], reason=reason)
+        return True
+    except (Forbidden, NotFound, HTTPException) as exc:
+        log.warning("Could not add the role to %s: %s", member.id, exc)
+        return False
+
+
+async def safe_remove_role(member, reason):
+    """Remove the configured role, returning True on success."""
+    try:
+        await member.remove_role(CONFIG["role_id"], reason=reason)
+        return True
+    except (Forbidden, NotFound, HTTPException) as exc:
+        log.warning("Could not remove the role from %s: %s", member.id, exc)
+        return False
 
 
 # 🤩 GET THE LIST OF STARGAZERS FOR THE SPECIFIED REPO
 async def get_stargazers():
-    headers = {
-        "Accept": "application/vnd.github.v3.star+json",
-        "Authorization": f"token {os.getenv('GITHUB_TOKEN')}"
-    }
-    url = f"https://api.github.com/repos/{os.getenv('REPO_OWNER')}/{os.getenv('GITHUB_REPO')}/stargazers"
-    stargazers = []
-    while True:
-        response = requests.get(url, headers=headers, timeout=60)
-        if response.status_code == 200:
-            data = response.json()
-            for user in data:
-                stargazers.append(user['user']['login'])  # Add the username to the list
-            link = response.headers.get("Link")
-            if not link or "rel=\"next\"" not in link:
-                break
-            links = link.split(", ")
-            for link in links:
-                url, rel = link.split("; ")
-                if "next" in rel:
-                    url = url.strip("<>")
-                    break
-            else:
-                break
-        else:
-            print(f"Error: {response.status_code}")
-            return None
-    return stargazers
+    """Return the lower-cased logins that star the repository."""
+    return await asyncio.to_thread(
+        fetch_stargazer_logins,
+        CONFIG["owner"],
+        CONFIG["repo"],
+        CONFIG["github_token"],
+    )
 
-client.start()
+
+def main():
+    """Register optional commands and connect to Discord."""
+    if not CONFIG["github_token"]:
+        log.warning(
+            "GITHUB_TOKEN is not set. Unauthenticated GitHub requests are "
+            "limited to 60 per hour, which is not enough for a repository "
+            "with more than a few thousand stargazers."
+        )
+    register_links_command()
+    client.start()
+
+
+if __name__ == "__main__":
+    main()

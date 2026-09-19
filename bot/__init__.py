@@ -1,0 +1,1 @@
+"""Starguard Discord bot package."""
