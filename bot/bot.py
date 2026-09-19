@@ -26,6 +26,7 @@ from pymongo.errors import PyMongoError
 from bot.commands import register_commands
 from bot.config import BotConfig, load_bot_config
 from bot.health import HealthState, serve_health, stale_after_seconds
+from bot.rolesync import RoleSyncDrainer
 from bot.starcheck import StarChecker
 from common.config import ConfigError
 from common.logging_setup import configure_logging
@@ -55,8 +56,14 @@ def create_client(
     )
 
     checker = StarChecker(client, config, users)
+    # The drain is handed the checker's own lock rather than taking one of
+    # its own, so a sweep and a drain can never act on the same member at
+    # the same time. See StarChecker.lock.
+    drainer = RoleSyncDrainer(client, config, users, checker.lock)
     register_commands(client, config, checker, users)
-    client.add_listener(listen("startup")(_startup_listener(client, config, checker, health)))
+    client.add_listener(
+        listen("startup")(_startup_listener(client, config, checker, drainer, health))
+    )
 
     return client, checker
 
@@ -67,6 +74,7 @@ def _startup_listener(
     client: Client,
     config: BotConfig,
     checker: StarChecker,
+    drainer: RoleSyncDrainer,
     health: HealthState | None,
 ) -> Callable[[], Coroutine[Any, Any, None]]:
     """Build the Startup handler for this client."""
@@ -95,6 +103,17 @@ def _startup_listener(
             )
         else:
             log.info("Automatic star checks are disabled (AUTOMATIC_CHECK=false)")
+
+        if config.role_sync_enabled:
+            log.info("Draining queued role changes every %s seconds", config.role_sync_interval)
+            # Held for the same reason as the check task above, and in its
+            # own attribute so that turning one loop off does not disturb
+            # the other's handle.
+            client.starguard_rolesync_task = asyncio.create_task(  # type: ignore[attr-defined]
+                drainer.run_forever()
+            )
+        else:
+            log.info("The role sync drain is disabled (ROLE_SYNC_ENABLED=false)")
 
         if health is not None:
             health.mark_ready(
