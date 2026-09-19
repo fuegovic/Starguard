@@ -10,6 +10,30 @@ services:
     restart: always
     env_file:
       - .env
+    healthcheck:
+      # python:3.12-slim has neither curl nor wget, so this uses the stdlib.
+      # BOT_HEALTH_HOST/PORT default to 127.0.0.1:8080, reachable from inside
+      # the container without publishing anything on the host. A generous
+      # start_period because the bot has to connect to the Discord gateway
+      # before /healthz reports ready.
+      test: ["CMD", "python", "-c",
+             "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${BOT_HEALTH_PORT:-8080}/healthz', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - Starguard
 
@@ -17,10 +41,13 @@ services:
     container_name: StarGuardServer
     image: starguard-server
     ports:
-      # SERVER_PORT is the port published on the host. The application always
-      # listens on 5000 inside the container; it used to bind SERVER_PORT while
-      # this mapping assumed 5000, so any value other than 5000 was unreachable.
-      - ${SERVER_PORT:-5000}:5000
+      # SERVER_PORT is the port published on the host. SERVER_BIND_PORT is the
+      # port the application listens on inside the container (default 5000,
+      # matching the target side of this mapping); it used to be hardcoded
+      # while a different mapping assumed 5000, so any host port other than
+      # 5000 was unreachable. If you change SERVER_BIND_PORT, this mapping
+      # tracks it automatically.
+      - ${SERVER_PORT:-5000}:${SERVER_BIND_PORT:-5000}
     build:
       context: .
       dockerfile: Dockerfile.server
@@ -29,11 +56,23 @@ services:
       - .env
     healthcheck:
       test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/healthz')"]
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${SERVER_BIND_PORT:-5000}/healthz')"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - Starguard
 

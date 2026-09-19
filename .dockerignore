@@ -1,0 +1,51 @@
+# Neither Dockerfile COPYs anything outside requirements.lock, common/, bot/
+# and server/ (requirements.txt is the human-edited source but the images
+# install from the hash-pinned requirements.lock instead), but everything
+# else still rides along in the build context sent to the daemon unless it
+# is excluded here.
+
+# Version control and CI
+.git
+.github
+
+# Environment and secrets - never send these to the build context
+.env
+.env.*
+!.env.example
+
+# Documentation and non-runtime assets
+docs/
+*.md
+starguard_logo.png
+LICENSE
+
+# Tests and dev tooling, not needed inside the images
+tests/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+pytest.ini
+.pylintrc
+pyproject.toml
+requirements-dev.txt
+
+# Compose and Docker files themselves
+docker-compose*.yml
+override.example.yml
+Dockerfile.bot
+Dockerfile.server
+.dockerignore
+
+# Local Mongo data volume when running the bundled database
+server/mongo-data/
+
+# Python artifacts and editor/OS cruft
+__pycache__/
+*.py[cod]
+*.egg-info/
+.vscode/
+.idea/
+.DS_Store
