@@ -10,6 +10,7 @@ import logging
 import random
 import time
 from collections.abc import Iterator, Mapping
+from datetime import UTC, datetime
 from itertools import islice
 from typing import Final, cast
 
@@ -26,7 +27,14 @@ from bot.config import BotConfig
 from bot.messages import SORRY
 from bot.roles import safe_remove_role
 from common.github_api import StargazerCache, StargazerListing, fetch_stargazer_listing
-from common.storage import MongoDocument, UserCollection, iter_links, set_starred
+from common.storage import (
+    MongoDocument,
+    UserCollection,
+    iter_links,
+    queue_role_sync,
+    set_starred,
+    star_event_is_newer,
+)
 
 log = logging.getLogger("starguard.bot")
 
@@ -53,14 +61,92 @@ class CheckAlreadyRunningError(RuntimeError):
     """Raised when a check is requested while one is already in progress."""
 
 
-def _next_batch(links: Iterator[MongoDocument], size: int) -> list[MongoDocument]:
-    """Pull up to ``size`` documents off ``links``. Runs in a worker thread."""
-    return list(islice(links, size))
+def next_batch(documents: Iterator[MongoDocument], size: int) -> list[MongoDocument]:
+    """Pull up to ``size`` documents off ``documents``. Runs in a worker thread.
+
+    Public because the role-sync drain walks its own cursor the same way and
+    for the same reason: pymongo is synchronous, so every getMore has to
+    happen off the event loop or the gateway heartbeat stalls behind it.
+    """
+    return list(islice(documents, size))
+
+
+def announcement_channel(client: Client, config: BotConfig) -> TYPE_MESSAGEABLE_CHANNEL | None:
+    """Return the channel star changes are announced in, if it is cached.
+
+    CHANNEL_ID names the announcement channel, so what comes back is
+    something that can be posted to. get_channel is typed as any channel at
+    all, including the kinds that have no send(), hence the cast rather than
+    an isinstance check that would quietly change what a misconfigured
+    CHANNEL_ID does.
+    """
+    return cast("TYPE_MESSAGEABLE_CHANNEL | None", client.get_channel(config.channel_id))
+
+
+async def announce_unstarred(channel: TYPE_MESSAGEABLE_CHANNEL | None, discord_id: object) -> None:
+    """Post the farewell for ``discord_id``, where there is anywhere to post.
+
+    Shared with the role-sync drain so a role taken back by a webhook reads
+    exactly like one taken back by the sweep. A channel the bot may not post
+    in is logged and shrugged off: the role change has already happened and
+    must not be undone by the announcement failing.
+    """
+    if channel is None:
+        return
+    try:
+        # B311: picks a farewell message, not a secret.
+        await channel.send(content=random.choice(SORRY).format(discord_id))  # nosec B311
+    except (Forbidden, HTTPException) as exc:
+        log.warning("Could not post to the announcement channel: %s", exc)
+
+
+def error_backoff(consecutive_failures: int, base_seconds: float, max_seconds: float) -> float:
+    """Return the jittered, capped wait after ``consecutive_failures`` failures.
+
+    Shared by both background loops, which want the same shape of retry with
+    different ceilings: an hourly sweep can afford to wait half an hour out,
+    a queue of role changes cannot.
+    """
+    # The exponent is capped before the shift so a long outage cannot build
+    # an enormous integer on the way to min().
+    ceiling: float = base_seconds * 2 ** min(consecutive_failures - 1, 10)
+    base = min(ceiling, max_seconds)
+    # B311: jitter that spreads deployments out, not a secret.
+    return base * random.uniform(  # nosec B311
+        1 - LOOP_ERROR_BACKOFF_JITTER, 1 + LOOP_ERROR_BACKOFF_JITTER
+    )
 
 
 def _display_name(entry: Mapping[str, object], member: Member) -> str:
     """Return the name to report for a member who lost the role."""
     return str(entry.get("discord_username") or member.display_name).lstrip("@")
+
+
+def _still_stars(entry: MongoDocument, listing: StargazerListing) -> bool:
+    """Whether ``entry`` still matches somebody in the stargazer listing.
+
+    The match is on ``github_id``, GitHub's immutable account number. This
+    used to compare the stored login against the listing's logins, and a
+    login is not immutable: anybody who renamed their GitHub account matched
+    nothing in the next listing, so the check concluded they had un-starred
+    and took the role from them.
+
+    Documents written by much older versions have no ``github_id``, and one
+    cannot be derived from a login without another API call, so those fall
+    back to the login comparison. A missing id is deliberately not read as
+    "not starred", which would strip the role from every one of those rows
+    at once.
+    """
+    github_id = entry.get("github_id")
+    if github_id is not None:
+        # The id is load-bearing on its own; the stored login is whatever
+        # spelling was current when the link was made and is ignored here.
+        return github_id in listing.ids
+
+    username = entry.get("github_username_lower") or (entry.get("github_username") or "").lower()
+    # A row with neither an id nor a login gives no evidence either way, and
+    # taking a role on no evidence is the failure mode worth avoiding.
+    return not username or username in listing.logins
 
 
 class StarChecker:
@@ -136,13 +222,10 @@ class StarChecker:
 
     def _error_delay(self) -> float:
         """Return the jittered, capped backoff for the current failure run."""
-        # The exponent is capped before the shift so a long outage cannot
-        # build an enormous integer on the way to min().
-        ceiling: float = LOOP_ERROR_BACKOFF_SECONDS * 2 ** min(self._consecutive_failures - 1, 10)
-        base = min(ceiling, LOOP_ERROR_BACKOFF_MAX_SECONDS)
-        # B311: jitter that spreads deployments out, not a secret.
-        return base * random.uniform(  # nosec B311
-            1 - LOOP_ERROR_BACKOFF_JITTER, 1 + LOOP_ERROR_BACKOFF_JITTER
+        return error_backoff(
+            self._consecutive_failures,
+            LOOP_ERROR_BACKOFF_SECONDS,
+            LOOP_ERROR_BACKOFF_MAX_SECONDS,
         )
 
     async def _run_cycle(self) -> list[str]:
@@ -152,6 +235,14 @@ class StarChecker:
         if self._users is None:
             log.warning("Skipping star check: no database connection.")
             return []
+
+        # Taken before the first page is requested, not after the last one.
+        # The listing is assembled over minutes on a popular repository, so
+        # a star event during the crawl may or may not be in it; the earlier
+        # instant makes that whole ambiguous window count as newer than the
+        # listing, which is the side to be wrong on. Everything this cycle
+        # writes is conditional on it. See common.storage.set_starred.
+        observed_at = datetime.now(UTC)
 
         listing = await asyncio.to_thread(
             fetch_stargazer_listing,
@@ -166,22 +257,16 @@ class StarChecker:
             log.warning("Guild %s is not in the cache; skipping.", self._config.guild_id)
             return []
 
-        examined, removed = await self._sweep(guild, listing.logins)
+        examined, removed = await self._sweep(guild, listing, observed_at)
         self._last_completed = time.monotonic()
         self._log_summary(listing, examined, removed, time.monotonic() - started)
         return removed
 
-    async def _sweep(self, guild: Guild, stargazers: frozenset[str]) -> tuple[int, list[str]]:
+    async def _sweep(
+        self, guild: Guild, listing: StargazerListing, observed_at: datetime
+    ) -> tuple[int, list[str]]:
         """Walk the links, removing the role where the star is gone."""
-        # CHANNEL_ID names the announcement channel, so what comes back is
-        # something that can be posted to. get_channel is typed as any
-        # channel at all, including the kinds that have no send(), hence the
-        # cast rather than an isinstance check that would quietly change
-        # what a misconfigured CHANNEL_ID does.
-        channel = cast(
-            "TYPE_MESSAGEABLE_CHANNEL | None",
-            self._client.get_channel(self._config.channel_id),
-        )
+        channel = announcement_channel(self._client, self._config)
         # _run_cycle returns before it gets here when there is no collection,
         # so self._users is never None on this path. The ignore states that
         # invariant rather than adding a runtime assert for it.
@@ -190,13 +275,13 @@ class StarChecker:
         removed: list[str] = []
 
         while True:
-            batch = await asyncio.to_thread(_next_batch, links, LINK_BATCH_SIZE)
+            batch = await asyncio.to_thread(next_batch, links, LINK_BATCH_SIZE)
             if not batch:
                 return examined, removed
 
             for entry in batch:
                 examined += 1
-                name = await self._check_one(guild, channel, entry, stargazers)
+                name = await self._check_one(guild, channel, entry, listing, observed_at)
                 if name is not None:
                     removed.append(name)
 
@@ -205,13 +290,23 @@ class StarChecker:
         guild: Guild,
         channel: TYPE_MESSAGEABLE_CHANNEL | None,
         entry: MongoDocument,
-        stargazers: frozenset[str],
+        listing: StargazerListing,
+        observed_at: datetime,
     ) -> str | None:
         """Handle one link. Returns a display name when the role was taken."""
-        username = (
-            entry.get("github_username_lower") or (entry.get("github_username") or "").lower()
-        )
-        if not username or username in stargazers:
+        # Checked before anything else, including the listing comparison: a
+        # star event recorded after this cycle's listing was taken is newer
+        # than the listing by construction, so this cycle has nothing to say
+        # about the member. Acting anyway would take a role the webhook had
+        # just earned them and then write over the record of it.
+        if star_event_is_newer(entry, observed_at):
+            log.debug(
+                "Discord ID %s changed after the listing was taken; leaving them to the drain.",
+                entry.get("discord_id"),
+            )
+            return None
+
+        if _still_stars(entry, listing):
             return None
 
         discord_id = entry.get("discord_id")
@@ -226,40 +321,73 @@ class StarChecker:
                 "Discord ID %s is no longer in the guild; marking un-starred.",
                 discord_id,
             )
-            await self._record_unstarred(discord_id)
+            await self._record_unstarred(discord_id, observed_at)
             return None
 
         if not member.has_role(self._config.role_id):
-            await self._record_unstarred(discord_id)
+            await self._record_unstarred(discord_id, observed_at)
             return None
 
         if not await safe_remove_role(member, self._config.role_id, "no_star"):
             return None
 
-        await self._record_unstarred(discord_id)
+        if not await self._record_unstarred(discord_id, observed_at):
+            # A newer star event overtook this cycle, so the row has been
+            # queued and the drain hands the role back within the poll
+            # interval. This cycle therefore has nothing true to say about
+            # this member: a farewell to somebody who stars the repository
+            # would stay in the channel long after the role came back, and
+            # counting them as removed would have /checkstars report a loss
+            # to an admin about a member who holds the role.
+            return None
 
-        if channel is not None:
-            try:
-                # B311: picks a farewell message, not a secret.
-                await channel.send(content=random.choice(SORRY).format(discord_id))  # nosec B311
-            except (Forbidden, HTTPException) as exc:
-                log.warning("Could not post to the announcement channel: %s", exc)
+        await announce_unstarred(channel, discord_id)
 
         return _display_name(entry, member)
 
-    async def _record_unstarred(self, discord_id: object) -> None:
-        """Persist that ``discord_id`` no longer stars the repository."""
+    async def _record_unstarred(self, discord_id: object, observed_at: datetime) -> bool:
+        """Persist that ``discord_id`` no longer stars the repository.
+
+        Returns False when a star event overtook this cycle, which is the
+        caller's signal that the un-star is not this cycle's to report.
+        """
         try:
             # Reached only from _sweep, so self._users is not None here; see
             # the note on the iter_links call there.
-            await asyncio.to_thread(
+            landed = await asyncio.to_thread(
                 set_starred,
                 self._users,  # type: ignore[arg-type]
                 discord_id,
                 False,
+                observed_at,
             )
+            if landed:
+                return True
+
+            # A webhook wrote a newer observation in the window between the
+            # freshness check above and this write, so the write matched
+            # nothing and the row keeps the newer fact. Saying so makes a
+            # race that is otherwise invisible show up in the log.
+            log.info(
+                "A star event overtook the check for %s; leaving the newer state alone.",
+                discord_id,
+            )
+            # The role change has already committed to Discord, on
+            # information this refusal proves was stale, so this cycle owes
+            # the row a reconciliation. See queue_role_sync for why the
+            # same event does not queue anything on its way in.
+            await asyncio.to_thread(
+                queue_role_sync,
+                self._users,  # type: ignore[arg-type]
+                discord_id,
+            )
+            return False
         except PyMongoError as exc:
             log.error("Could not update star state for %s: %s", discord_id, exc)
+            # Only the bookkeeping failed. The role really is gone and
+            # nothing newer is known about this member, so the cycle still
+            # reports the removal it actually made.
+            return True
 
     def _log_summary(
         self,

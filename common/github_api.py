@@ -65,18 +65,31 @@ class GitHubError(RuntimeError):
 
 @dataclass(frozen=True)
 class CachedPage:
-    """One page of the listing as it was last seen."""
+    """One page of the listing as it was last seen.
+
+    Both halves of the identity are memoised, not just the logins. A page
+    that replayed only its logins would contribute nothing to the id set on
+    a 304, and the un-star check matches on ids, so every member behind a
+    cached page would look as though they had un-starred.
+    """
 
     etag: str
     logins: frozenset[str]
+    ids: frozenset[int]
     next_url: str | None
 
 
 @dataclass(frozen=True)
 class StargazerListing:
-    """The complete listing plus what it cost to obtain."""
+    """The complete listing plus what it cost to obtain.
+
+    ``ids`` and ``logins`` describe the same set of accounts: the id is what
+    the un-star check matches on, because it cannot be renamed, and the login
+    is what /starcount counts and what the logs are readable by.
+    """
 
     logins: frozenset[str]
+    ids: frozenset[int]
     api_calls: int = 0
     pages_fetched: int = 0
     pages_unchanged: int = 0
@@ -97,7 +110,7 @@ class StargazerCache:
     earlier page untouched, while an un-star shifts every later entry up a
     slot and changes all the pages after it. Either way the result is the
     union of the pages actually walked this cycle, so a reused page can only
-    contribute logins that really are still in that page's body.
+    contribute accounts that really are still in that page's body.
 
     The point of all this is that a 304 does not count against the REST rate
     limit, so a repository whose early pages rarely change costs a fraction of
@@ -153,25 +166,27 @@ def _describe_failure(response: requests.Response) -> str:
     return f"GitHub API returned HTTP {status}."
 
 
-def _extract_login(entry: object) -> str | None:
-    """Return the login from a stargazer entry.
+def _extract_identity(entry: object) -> tuple[str | None, int | None]:
+    """Return the ``(login, account id)`` pair from a stargazer entry.
 
     The plain listing returns user objects; the ``star+json`` media type wraps
     them in ``{"starred_at": ..., "user": {...}}``. Both are accepted so the
     helper keeps working if the Accept header is ever changed back.
+
+    The id was already in every response body and used to be thrown away.
+    Collecting it is what lets the un-star check match on something GitHub
+    does not let people change.
     """
     if not isinstance(entry, dict):
-        return None
+        return None, None
     user: object = entry.get("user")
-    if isinstance(user, dict):
-        login: object = user.get("login")
-    else:
-        login = entry.get("login")
-    # GitHub always sends a string here. The value is not re-validated,
-    # because narrowing it would quietly turn a malformed response into a
-    # silently shorter listing, and a short listing strips roles from people
-    # who never un-starred.
-    return cast("str | None", login)
+    if not isinstance(user, dict):
+        user = entry
+    # GitHub always sends a string login and an integer id. Neither value is
+    # re-validated, because narrowing it would quietly turn a malformed
+    # response into a silently shorter listing, and a short listing strips
+    # roles from people who never un-starred.
+    return cast("str | None", user.get("login")), cast("int | None", user.get("id"))
 
 
 def _rate_limit_remaining(response: requests.Response) -> int | None:
@@ -275,6 +290,7 @@ class _Walk:
     """What one pass over the paginated listing has accumulated so far."""
 
     logins: set[str]
+    ids: set[int]
     pages: dict[str, CachedPage]
     api_calls: int = 0
     pages_fetched: int = 0
@@ -285,6 +301,7 @@ class _Walk:
         """Freeze the walk into the listing the caller gets."""
         return StargazerListing(
             logins=frozenset(self.logins),
+            ids=frozenset(self.ids),
             api_calls=self.api_calls,
             pages_fetched=self.pages_fetched,
             pages_unchanged=self.pages_unchanged,
@@ -302,10 +319,11 @@ def _absorb_page(walk: _Walk, url: str, response: requests.Response, caching: bo
         raise GitHubError("Unexpected response shape from the GitHub API.")
 
     walk.pages_fetched += 1
-    logins = frozenset(
-        login.lower() for login in (_extract_login(entry) for entry in page) if login
-    )
+    identities = [_extract_identity(entry) for entry in page]
+    logins = frozenset(login.lower() for login, _ in identities if login)
+    ids = frozenset(account_id for _, account_id in identities if account_id is not None)
     walk.logins |= logins
+    walk.ids |= ids
 
     # requests parses the RFC 5988 Link header for us, which avoids the
     # hand-rolled string splitting this used to do.
@@ -313,7 +331,7 @@ def _absorb_page(walk: _Walk, url: str, response: requests.Response, caching: bo
 
     etag = response.headers.get("ETag")
     if caching and etag:
-        walk.pages[url] = CachedPage(etag, logins, next_url)
+        walk.pages[url] = CachedPage(etag, logins, ids, next_url)
 
     return next_url
 
@@ -328,8 +346,9 @@ def fetch_stargazer_listing(
 ) -> StargazerListing:
     """Return a :class:`StargazerListing` for ``owner/repo``.
 
-    Logins are lower-cased because GitHub treats usernames case-insensitively,
-    and a set is returned so membership tests stay constant time no matter how
+    Both the immutable numeric account ids and the logins come back. Logins
+    are lower-cased because GitHub treats usernames case-insensitively, and
+    sets are returned so membership tests stay constant time no matter how
     many stargazers the repository has.
 
     Raises :class:`GitHubError` rather than returning a partial set: acting on
@@ -342,7 +361,7 @@ def fetch_stargazer_listing(
     url = f"{API_ROOT}/repos/{owner}/{repo}/stargazers"
     params: Mapping[str, int] | None = {"per_page": PER_PAGE}
     base_headers = _headers(token)
-    walk = _Walk(logins=set(), pages={})
+    walk = _Walk(logins=set(), ids=set(), pages={})
 
     for _ in range(MAX_PAGES):
         cached = cache.get(url) if cache is not None else None
@@ -360,6 +379,7 @@ def fetch_stargazer_listing(
         if response.status_code == NOT_MODIFIED and cached is not None:
             walk.pages_unchanged += 1
             walk.logins |= cached.logins
+            walk.ids |= cached.ids
             walk.pages[url] = cached
             next_url = cached.next_url
         else:

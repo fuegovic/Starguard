@@ -51,14 +51,16 @@ from tests.test_starcheck import make_config as make_bot_config
 mongomock = pytest.importorskip("mongomock")
 
 # The lower-cased login GitHub reports for the account the OAuth flow
-# returns. The star check compares against this, never against the spelling
-# stored in the document.
+# returns, and the immutable account id that goes with it. The star check
+# matches on the id; the login is only the fallback for rows written before
+# the id was recorded.
 GITHUB_LOGIN = PROFILE["login"].lower()
+GITHUB_ID = PROFILE["id"]
 
-# Every field bot/starcheck.py reads off a link document, from _check_one
-# and _display_name. The server has to write all of them.
+# Every field bot/starcheck.py reads off a link document, from _still_stars,
+# _check_one and _display_name. The server has to write all of them.
 FIELDS_THE_STAR_CHECK_READS = frozenset(
-    {"discord_id", "discord_username", "github_username", "github_username_lower"}
+    {"discord_id", "discord_username", "github_id", "github_username", "github_username_lower"}
 )
 
 
@@ -92,11 +94,17 @@ def verify_through_the_server(users, discord_id, username, starred=True):
     return client.get("/authorize?code=abc&state=xyz")
 
 
-def run_the_star_check(monkeypatch, users, stargazers, member):
-    """Run the real check over ``users``. Returns (removed, channel)."""
+def run_the_star_check(monkeypatch, users, stargazers, member, stargazer_ids=()):
+    """Run the real check over ``users``. Returns (removed, channel).
+
+    The ids are named separately from the logins because that is the seam:
+    the server writes GitHub's own account id and the check looks for that
+    id, so a test that only lined up the logins would pass while the two
+    halves disagreed about which field identifies a person.
+    """
 
     def fetch(owner, repo, token=None, cache=None):
-        return listing(*stargazers)
+        return listing(*stargazers, ids=stargazer_ids)
 
     monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", fetch)
     channel = FakeChannel()
@@ -140,6 +148,10 @@ def test_the_server_writes_the_document_the_bot_expects_to_read(users):
     # lookup misses silently if either one changes its mind.
     assert document["discord_id"] == "123456789"
     assert isinstance(document["github_id"], int)
+    # The id the check matches on, spelled the way GitHub spelled it. This
+    # is the load-bearing one now, and an int on one side against a string
+    # on the other would silently look like everybody had un-starred.
+    assert document["github_id"] == GITHUB_ID
     assert document["github_username_lower"] == document["github_username"].lower()
     assert document["github_username_lower"] == GITHUB_LOGIN
     assert document["starred_repo"] is True
@@ -171,7 +183,34 @@ def test_a_member_who_is_still_starring_keeps_the_role(users, monkeypatch):
 
     member = member_for(document)
     removed, channel = run_the_star_check(
-        monkeypatch, users, stargazers={GITHUB_LOGIN}, member=member
+        monkeypatch,
+        users,
+        stargazers={GITHUB_LOGIN},
+        member=member,
+        stargazer_ids={document["github_id"]},
+    )
+
+    assert removed == []
+    assert member.roles == {ROLE_ID}
+    assert member.removals == 0
+    assert not channel.sent
+    assert find_link(users, "123456789")["starred_repo"] is True
+
+
+def test_a_member_who_renames_on_github_keeps_the_role_the_server_recorded(users, monkeypatch):
+    # GitHub lets people rename, and the listing then reports a login the
+    # stored document has never seen. The row is still the same account, so
+    # the two halves have to agree on matching by id rather than by name.
+    verify_through_the_server(users, "123456789", "someone")
+    document = find_link(users, "123456789")
+
+    member = member_for(document)
+    removed, channel = run_the_star_check(
+        monkeypatch,
+        users,
+        stargazers={"renamed-since-linking"},
+        member=member,
+        stargazer_ids={document["github_id"]},
     )
 
     assert removed == []
@@ -228,5 +267,11 @@ def test_re_verifying_updates_the_row_the_check_already_knows_about(users, monke
     assert document["updated_at"] >= first_seen
 
     member = member_for(document)
-    removed, _ = run_the_star_check(monkeypatch, users, stargazers={GITHUB_LOGIN}, member=member)
+    removed, _ = run_the_star_check(
+        monkeypatch,
+        users,
+        stargazers={GITHUB_LOGIN},
+        member=member,
+        stargazer_ids={document["github_id"]},
+    )
     assert removed == []

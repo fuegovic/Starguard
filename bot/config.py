@@ -24,6 +24,16 @@ from common.config import (
 MIN_CHECK_DELAY_SECONDS: Final = 300
 DEFAULT_CHECK_DELAY_SECONDS: Final = 3600
 
+# How often the bot drains the role changes the star webhook queued in the
+# database. This is not a GitHub call and not a scan: the queue is a partial
+# index holding only the rows that are actually waiting, so a poll that finds
+# nothing reads an empty index and writes nothing. That is what makes a short
+# interval affordable here where it would not be for the sweep above. The
+# minimum keeps a typo such as ROLE_SYNC_INTERVAL=0 from becoming a busy loop
+# against MongoDB.
+MIN_ROLE_SYNC_INTERVAL_SECONDS: Final = 5
+DEFAULT_ROLE_SYNC_INTERVAL_SECONDS: Final = 30
+
 MAX_LINK_BUTTONS: Final = 4
 
 # The bot's health endpoint. Bound to loopback by default because its only
@@ -55,6 +65,8 @@ class BotConfig:
     mongo_database: str
     automatic_check: bool
     check_delay: int
+    role_sync_enabled: bool
+    role_sync_interval: int
     command_name: str
     command_description: str
     command_extended_description: str
@@ -115,6 +127,17 @@ def load_bot_config() -> BotConfig:
             "AUTOMATIC_CHECK_DELAY",
             DEFAULT_CHECK_DELAY_SECONDS,
             minimum=MIN_CHECK_DELAY_SECONDS,
+        ),
+        # Turned on and off separately from the sweep, because the two
+        # answer different needs. An operator who has not configured the
+        # GitHub webhook can switch the drain off and pay nothing for a
+        # queue that will never have anything in it, and a deployment that
+        # trusts the webhook can run the drain with AUTOMATIC_CHECK=false.
+        role_sync_enabled=env_bool("ROLE_SYNC_ENABLED", True),
+        role_sync_interval=env_int(
+            "ROLE_SYNC_INTERVAL",
+            DEFAULT_ROLE_SYNC_INTERVAL_SECONDS,
+            minimum=MIN_ROLE_SYNC_INTERVAL_SECONDS,
         ),
         # The custom links command is optional. Older versions crashed at
         # startup when it was unconfigured; now it is simply not registered.
