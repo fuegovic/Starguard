@@ -120,3 +120,15 @@ exclude_also = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+# Warnings are errors, so a deprecation in code this project owns fails the
+# build rather than scrolling past. The two ignores below are third-party
+# calls this project cannot reach, each pinned to the module that makes them
+# so a deprecation anywhere else still fails. Drop each one when its upstream
+# releases a fix.
+filterwarnings = [
+    "error",
+    # interactions.py imports the stdlib audioop, removed in 3.13.
+    "ignore:'audioop' is deprecated:DeprecationWarning",
+    # mongomock calls datetime.utcnow() internally, including on the TTL path.
+    "ignore:datetime.datetime.utcnow\\(\\) is deprecated:DeprecationWarning:mongomock.helpers",
+]
