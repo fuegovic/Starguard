@@ -1,29 +1,18 @@
-<!DOCTYPE html>
-<html>
-  <head>
-    <title>Github authentication</title>
-    <link
-      type="text/css"
-      rel="stylesheet"
-      href="{{ url_for('static', filename='css/style.css') }}"
-    />
-    <script
-      type="text/javascript"
-      src="{{ url_for('static', filename='js/jquery.min.js') }}"
-    ></script>
-    <script
-      type="text/javascript"
-      src="{{ url_for('static', filename='js/particleground.min.js') }}"
-    ></script>
-    <script
-      type="text/javascript"
-      src="{{ url_for('static', filename='js/particles.js') }}"
-    ></script>
-  </head>
-  <body>
-    <div id="particles"></div>
-    <div id="app">
-      <span>{{ message }}</span>
-    </div>
-  </body>
-</html>
+{% extends "base.html" %}
+{% block title %}StarGuard - Verification Result{% endblock %}
+{% block content %}
+<h1>GitHub Verification</h1>
+{# Tone comes from the HTTP status. A failure interrupts the screen reader,
+   a success waits its turn. The visible label carries the same distinction in
+   text, so it does not depend on the colour of the border alone. #}
+<p
+  class="message {{ 'message-error' if is_error else 'message-success' }}"
+  role="{{ 'alert' if is_error else 'status' }}"
+  aria-live="{{ 'assertive' if is_error else 'polite' }}"
+  tabindex="-1"
+  autofocus
+>
+  <strong class="message-label">{{ "Problem" if is_error else "Success" }}:</strong>
+  {{ message }}
+</p>
+{% endblock %}

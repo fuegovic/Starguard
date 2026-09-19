@@ -23,15 +23,7 @@ from typing import Any, Final, Literal, Protocol, TypedDict
 
 from authlib.integrations.flask_client import OAuth, OAuthError
 from dotenv import load_dotenv
-from flask import (
-    Flask,
-    Response,
-    current_app,
-    render_template,
-    request,
-    session,
-    url_for,
-)
+from flask import Flask, Response, current_app, render_template, request, session, url_for
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from waitress import serve
@@ -136,9 +128,16 @@ def _context() -> ServerContext:
 
 
 def render_result(message: str, status: int = 200) -> Response:
-    """Render the result page with a single user-facing message."""
+    """Render the result page with a single user-facing message.
+
+    The HTTP status already says whether this went well, so the template
+    takes its tone from it rather than from a second argument every call
+    site would have to keep in step. A screen reader should interrupt for a
+    failure and wait its turn for a success, which is the difference between
+    an assertive alert and a polite status region.
+    """
     return current_app.response_class(
-        render_template("result.html", message=message),
+        render_template("result.html", message=message, is_error=status >= 400),
         status=status,
         mimetype="text/html",
     )
@@ -181,9 +180,7 @@ def authorize() -> Response:
         token = context.github.authorize_access_token()
     except OAuthError as exc:
         log.info("OAuth error for Discord ID %s: %s", discord_id, exc.description)
-        return render_result(
-            messages.SIGN_IN_FAILED_REASON.format(reason=exc.description), 400
-        )
+        return render_result(messages.SIGN_IN_FAILED_REASON.format(reason=exc.description), 400)
 
     if not token:
         return render_result(messages.SIGN_IN_FAILED, 400)
@@ -226,9 +223,7 @@ def authorize() -> Response:
             github_username,
             discord_id,
         )
-        return render_result(
-            messages.ALREADY_LINKED.format(github_username=github_username), 409
-        )
+        return render_result(messages.ALREADY_LINKED.format(github_username=github_username), 409)
     except PyMongoError as exc:
         log.error("Could not save the link: %s", exc)
         return render_result(messages.SAVE_FAILED, 503)
@@ -236,9 +231,7 @@ def authorize() -> Response:
     if starred:
         return render_result(messages.VERIFIED_AND_STARRED)
     return render_result(
-        messages.VERIFIED_NOT_STARRED.format(
-            owner=context.config.owner, repo=context.config.repo
-        )
+        messages.VERIFIED_NOT_STARRED.format(owner=context.config.owner, repo=context.config.repo)
     )
 
 
@@ -312,9 +305,7 @@ def create_app(
         client_kwargs={"scope": GITHUB_OAUTH_SCOPE},
     )
 
-    app.extensions["starguard"] = ServerContext(
-        config=config, users=users, github=github
-    )
+    app.extensions["starguard"] = ServerContext(config=config, users=users, github=github)
 
     install_security(
         app,

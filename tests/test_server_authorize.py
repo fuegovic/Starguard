@@ -102,9 +102,7 @@ def build(github=None, users=_DEFAULT, **overrides):
     app.config.update(TESTING=True, SESSION_COOKIE_SECURE=False)
     # The routes read everything they need from here, so swapping the context
     # is all it takes to hand them a GitHub client that never leaves memory.
-    app.extensions["starguard"] = ServerContext(
-        config=config, users=users, github=github
-    )
+    app.extensions["starguard"] = ServerContext(config=config, users=users, github=github)
     return Flow(app.test_client(), github, users)
 
 
@@ -146,9 +144,7 @@ def test_a_star_is_recorded_and_the_visitor_is_sent_back_to_discord():
 
 def test_the_star_is_checked_against_the_configured_repository():
     flow = build(owner="fuegovic", repo="Starguard")
-    flow.github.responses["user/starred/fuegovic/Starguard"] = FakeApiResponse(
-        status_code=STARRED
-    )
+    flow.github.responses["user/starred/fuegovic/Starguard"] = FakeApiResponse(status_code=STARRED)
     assert authorize(flow).status_code == 200
     assert flow.github.requests[1][0] == "user/starred/fuegovic/Starguard"
 
@@ -214,9 +210,7 @@ def test_a_database_that_is_down_is_reported_before_github_is_called():
 def test_a_refused_sign_in_shows_the_reason_github_gave():
     flow = build(
         github=FakeGitHub(
-            token_error=OAuthError(
-                error="access_denied", description="The user denied the request"
-            )
+            token_error=OAuthError(error="access_denied", description="The user denied the request")
         )
     )
     response = authorize(flow)
@@ -290,6 +284,25 @@ def test_a_failed_save_is_reported_rather_than_raised():
 
     assert response.status_code == 503
     assert messages.SAVE_FAILED.encode() in response.data
+
+
+@pytest.mark.parametrize(
+    "status,role,label",
+    [(200, b'role="status"', b"Success:"), (400, b'role="alert"', b"Problem:")],
+)
+def test_the_page_announces_failure_more_loudly_than_success(status, role, label):
+    # A screen reader should interrupt for a failure and wait its turn for a
+    # success. The tone is taken from the HTTP status, not from a second
+    # argument every call site would have to keep in step.
+    flow = build()
+    if status == 200:
+        response = authorize(flow)
+    else:
+        response = flow.client.get("/authorize?code=abc&state=xyz")
+
+    assert response.status_code == status
+    assert role in response.data
+    assert label in response.data
 
 
 def test_healthz_is_ok_once_the_database_is_reachable():
