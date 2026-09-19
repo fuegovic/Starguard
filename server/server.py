@@ -43,6 +43,7 @@ from common.storage import (
 from server import messages
 from server.config import ServerConfig, load_server_config
 from server.security import install_security
+from server.webhooks import MAX_REQUEST_BODY_BYTES, install_webhook
 
 log = logging.getLogger("starguard.server")
 
@@ -289,6 +290,11 @@ def create_app(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         SESSION_COOKIE_SECURE=True,
+        # An oversized body is refused before it is read. Only the webhook
+        # takes a body at all, but the bound is set here rather than beside
+        # that route so it also holds for an installation that has no hook,
+        # and for whatever route is added next.
+        MAX_CONTENT_LENGTH=MAX_REQUEST_BODY_BYTES,
     )
 
     oauth = OAuth(app)
@@ -318,6 +324,18 @@ def create_app(
     app.add_url_rule("/login", view_func=login)
     app.add_url_rule("/authorize", view_func=authorize)
     app.add_url_rule("/healthz", view_func=healthz)
+
+    # Registered only when a secret is configured, and absent otherwise. The
+    # receiver is not in RATE_LIMITED_ENDPOINTS on purpose; see the module
+    # docstring in server/webhooks.py for why.
+    if config.webhook_secret is not None:
+        install_webhook(
+            app,
+            secret=config.webhook_secret,
+            owner=config.owner,
+            repo=config.repo,
+            users=users,
+        )
 
     return app
 
