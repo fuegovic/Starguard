@@ -18,6 +18,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A gated CI pipeline: lint, type-check, a security scan, tests on Python
   3.11 and 3.12, and a Docker build all have to pass before an image is
   published.
+- **Optional GitHub `star` webhook support.** Set `GITHUB_WEBHOOK_SECRET` and
+  the OAuth server serves `POST /webhooks/github`, so a star or an un-star is
+  acted on within seconds instead of at the next periodic check, and costs no
+  GitHub API budget at all. On a repository with 45,000 stars the hourly
+  check is 450 API requests an hour; the webhook replaces almost all of that
+  with one small signed request per event. Every delivery is authenticated by
+  its HMAC over the raw body and nothing else, and a delivery id is
+  remembered for ten minutes so a duplicate is not acted on twice. Without
+  the secret the route is not registered at all, and the bot behaves exactly
+  as it did before.
+- The bot applies those queued changes on its own loop, controlled by
+  `ROLE_SYNC_ENABLED` and `ROLE_SYNC_INTERVAL` (30 seconds by default). The
+  webhook reaches the server and only the bot can change a Discord role, so
+  the server records what changed and the bot picks it up; the two still
+  never talk to each other. The periodic check is unchanged and still
+  required, because GitHub does not automatically retry a failed delivery and
+  the check is the only thing that repairs one that was missed. It can now be
+  run daily rather than hourly.
 
 ### Changed
 
@@ -43,6 +61,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and the database admin UIs are published on the loopback interface only.
 - Dependencies bumped to current releases: authlib, Flask and requests all
   had published advisories at their previous pins.
+- **A linked member who stars the repository now gets the role
+  automatically**, as soon as the star webhook reports it. The recorded star
+  state used to be refreshed only during verification, and **Claim your role**
+  reads that recorded state rather than asking GitHub, so somebody who had
+  already linked their account and then starred had to go back through the
+  GitHub sign-in before the button would grant them anything. The button is
+  unchanged and is still how the first-time flow ends.
 
 ### Fixed
 
@@ -58,6 +83,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registering a command named "None" and crashing on buttons with empty
   URLs.
 - `remove_role` is no longer called on members who do not hold the role.
+- **Renaming your GitHub account no longer costs you the role.** The periodic
+  check compared the stored GitHub login against the logins in the stargazer
+  listing, and a login is not immutable: anybody who renamed their account
+  stopped matching and had the role taken away on the next cycle, despite
+  never having un-starred. The comparison is now on the numeric GitHub
+  account id, which cannot change. Rows written by much older versions have
+  no id stored and still fall back to the login, because one cannot be
+  derived from a login without another API call; they are corrected the next
+  time that member verifies.
 
 ### Security
 

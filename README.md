@@ -12,7 +12,9 @@ star through GitHub OAuth, so nobody has to be trusted or checked by hand.
 - 💫 Role Assignment: the role is granted **only** if the member has starred
   the configured repository.
 - 🔍 Periodic Checks: the bot re-checks every verified member and removes the
-  role from anyone who un-starred.
+  role from anyone who un-starred. With the optional GitHub webhook
+  configured, a star or an un-star moves the role within seconds instead, and
+  the periodic check becomes the backstop rather than the main mechanism.
 
 ## Usage
 
@@ -53,6 +55,15 @@ The two processes never talk to each other directly. The signed link token is
 what carries a Discord identity from one to the other, and the database is
 what carries the result back.
 
+That shape decides how the optional star webhook works, so it is worth
+stating plainly. GitHub delivers a `star` event to the **OAuth server**,
+because that is the half with a public address. Only the **bot** can change a
+Discord role, because that is the half connected to the Discord gateway. So
+the server does not move the role and cannot ask the bot to: it records the
+new star state and marks the row pending, and the bot drains that queue every
+`ROLE_SYNC_INTERVAL` seconds, 30 by default. The database is the entire
+channel between them, exactly as it already is for verification.
+
 ```mermaid
 sequenceDiagram
     actor M as Member
@@ -77,6 +88,16 @@ sequenceDiagram
     M->>B: Claim your role
     B->>D: Read the recorded star status
     B-->>M: Role granted
+
+    Note over M,D: Later, if the star webhook is configured
+    M->>G: Un-star the repository
+    G->>S: POST /webhooks/github, signed with GITHUB_WEBHOOK_SECRET
+    S->>S: Verify the HMAC over the raw body
+    S->>D: Record the new star state, mark the row pending
+    S-->>G: 202 Accepted
+    B->>D: Poll for pending rows, every ROLE_SYNC_INTERVAL seconds
+    D-->>B: The member's row
+    B-->>M: Role removed
 ```
 
 Every `AUTOMATIC_CHECK_DELAY` seconds the bot lists the repository's
@@ -84,6 +105,21 @@ stargazers, compares them against the database, and removes the role from
 anyone who is no longer there. The listing is fetched with conditional
 requests, so pages that have not changed cost nothing against the GitHub rate
 limit.
+
+**The webhook is optional and Starguard works without it.** Set no
+`GITHUB_WEBHOOK_SECRET` and the receiver is never registered; the periodic
+check above is then the only thing that notices a star changing, which is
+slower and costs one GitHub API request per 100 stargazers on every pass. Set
+it and most changes arrive for free, in seconds.
+
+The periodic check stays on either way. [GitHub does not automatically retry
+a failed
+delivery](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries),
+so an event sent while the server was restarting is gone unless somebody
+redelivers it by hand, and the periodic check is the only thing that repairs
+that on its own. What the webhook buys is the freedom to run the check daily
+rather than hourly. See
+[Step 12 of the installation guide](./docs/installation.md#step-12-set-up-the-star-webhook-optional).
 
 Both processes expose a health endpoint, and the compose files probe them.
 
@@ -118,6 +154,7 @@ Both processes expose a health endpoint, and the compose files probe them.
 - A GitHub OAuth app client ID and secret
 - A public HTTPS domain pointing at the OAuth server
 - Optionally, a GitHub personal access token to raise the API rate limit
+- Optionally, admin access to the repository, to add the star webhook
 
 ## Privacy
 

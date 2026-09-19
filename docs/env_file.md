@@ -144,6 +144,72 @@ This value also sets the bot health endpoint's staleness threshold: a
 completed check older than `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds makes the
 endpoint report `degraded` and return 503.
 
+### `ROLE_SYNC_ENABLED`
+
+**Optional.** Read by the bot. Default: `true`. Same accepted spellings as
+`AUTOMATIC_CHECK`.
+
+Whether the bot drains the role changes the GitHub star webhook recorded. The
+webhook arrives at the **server** process, which writes the new star state to
+the database and marks the row pending; only the **bot** process is connected
+to Discord, so only it can move the role. This loop is that second half.
+
+It is independent of `AUTOMATIC_CHECK`, and the two answer different needs, so
+any combination is valid:
+
+| `AUTOMATIC_CHECK` | `ROLE_SYNC_ENABLED` | Result |
+| --- | --- | --- |
+| `true` | `true` | Recommended with a webhook configured. Role changes land in seconds, and the sweep repairs anything a delivery missed. |
+| `true` | `false` | No webhook configured. Role changes wait for the next sweep, up to `AUTOMATIC_CHECK_DELAY` seconds. |
+| `false` | `true` | Webhook only. Nothing repairs a delivery that was lost while the server was down, because GitHub does not retry failed deliveries. |
+| `false` | `false` | Nothing happens automatically. Only `/checkstars` and the **Claim your role** button move a role. |
+
+Turning it off when no webhook is configured costs you nothing either way: the
+queue it polls is empty forever. It is worth turning off only to keep one
+fewer task and one fewer log line in play.
+
+On startup the bot logs which way it went:
+
+```
+Draining queued role changes every 30 seconds
+The role sync drain is disabled (ROLE_SYNC_ENABLED=false)
+```
+
+### `ROLE_SYNC_INTERVAL`
+
+**Optional.** Read by the bot. Default: `30` (seconds). Whole number,
+**clamped** to a minimum of `5`.
+
+How often the bot looks for queued role changes, and therefore the worst-case
+delay between somebody starring the repository and their role appearing.
+
+This can be seconds where `AUTOMATIC_CHECK_DELAY` has to be an hour, because
+the two do completely different work. A sweep is one GitHub API request per
+100 stargazers. A drain is one read of a database index that is built over
+only the rows actually waiting, so a poll that finds nothing reads nothing and
+writes nothing, however many verified members you have.
+
+A pass that did something logs a one-line summary; a pass that found an empty
+queue, which is nearly all of them, logs nothing at all:
+
+```
+Role sync drain complete: examined=1 granted=1 removed=0 failed=0
+```
+
+A non-numeric value is fatal:
+`ROLE_SYNC_INTERVAL must be a whole number, got '30s'.`
+
+On a failure the bot retries with the same exponential backoff the sweep uses:
+the first retry is one interval, it doubles on each consecutive failure up to
+about 300 seconds, and a quarter of jitter is applied either way.
+
+```
+Role sync drain failed (1 in a row); retrying in 33 seconds
+```
+
+That ceiling is far lower than the sweep's half hour, because a queued row is
+somebody holding, or missing, a role right now.
+
 ### `COMMAND_NAME`
 
 **Optional.** Read by the bot. Default: empty, meaning the command is not
@@ -375,6 +441,57 @@ verification link fails with `This verification link is not valid.`
 Changing the key invalidates all outstanding verification links and signs
 every existing session out. Nobody loses their role or their link record.
 
+### `GITHUB_WEBHOOK_SECRET`
+
+**Optional.** Read by the server. No default. At least 16 characters when it
+is set.
+
+The shared secret GitHub signs each `star` webhook delivery with. Setting it
+turns on the receiver at `POST /webhooks/github`, which is how the server
+learns about a star the moment it happens rather than at the next sweep. The
+same value goes in the **Secret** field of the webhook on GitHub. The full
+setup is
+[Step 12 of the installation guide](./installation.md#step-12-set-up-the-star-webhook-optional).
+
+**This is a second, separate secret. Do not reuse `SECRET_KEY`.** Generate
+another one the same way:
+
+```sh
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+**Leaving it unset is a supported configuration, and it is the default.** The
+route is then never registered: there is no `/webhooks/github` on the server
+at all, not a stub that answers an error, and a request for it gets the
+ordinary 404 any unknown path gets. The bot keeps working exactly as before,
+noticing star changes only at each sweep.
+
+It is validated against the same two rules as `SECRET_KEY`, which is the
+point: a webhook secret copied out of `.env.example` would let anybody sign a
+star event for anybody.
+
+```
+Configuration error: GITHUB_WEBHOOK_SECRET is still set to a placeholder value. Generate a real one with: python -c "import secrets; print(secrets.token_urlsafe(32))" and paste the same value into the webhook's secret field on GitHub.
+Configuration error: GITHUB_WEBHOOK_SECRET must be at least 16 characters, got 8.
+```
+
+The rejected placeholders are the same list as for `SECRET_KEY`.
+
+Every delivery is authenticated by its HMAC and by nothing else. The source
+address and the `User-Agent` are not checked, because both can be forged and
+the signature cannot. A delivery whose signature does not match is answered
+with HTTP 401 and `Invalid signature.`, and the server logs that only at
+`DEBUG`: the route is deliberately not rate limited, so a log line per
+rejected request would be a way to fill your disk from outside. GitHub's own
+delivery log is where you read those, not yours. See
+[the webhook section of the troubleshooting
+guide](./troubleshooting.md#the-star-webhook-is-not-working).
+
+Only the server reads this value. The bot does not need it, and the two
+processes still never talk to each other: the server records what changed in
+the database and the bot picks it up, which is what `ROLE_SYNC_ENABLED` and
+`ROLE_SYNC_INTERVAL` control.
+
 ### `LINK_TOKEN_MAX_AGE`
 
 **Optional.** Read by the server. Default: `900` (15 minutes). Whole number of
@@ -488,7 +605,11 @@ driver cannot parse at all is different: that one is logged as
 **Required.** Read by both the bot and the server. `.env.example` ships
 `starguard`, but the value is not optional: blanking it is a fatal error.
 
-The database name. Starguard uses one collection inside it, `users`.
+The database name. Starguard uses two collections inside it: `users`, one
+document per verified member, and `webhook_deliveries`, which remembers the id
+of each webhook delivery for ten minutes so a redelivered one is not acted on
+twice. The second is created on demand and its rows expire by themselves; it
+is empty on an installation with no webhook configured.
 
 ### `MONGO_INITDB_ROOT_USERNAME`
 
