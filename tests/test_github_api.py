@@ -49,8 +49,18 @@ class FakeSession:
         return response
 
 
+def account_id(login):
+    """A stable fake account id for ``login``.
+
+    Derived rather than counted out, so the same person carries the same id
+    on every page and in every cycle, which is the property the listing's id
+    set is there to preserve.
+    """
+    return 1000 + sum(ord(character) for character in login.lower())
+
+
 def user_page(*logins):
-    return [{"login": login, "id": i} for i, login in enumerate(logins, start=1)]
+    return [{"login": login, "id": account_id(login)} for login in logins]
 
 
 def no_sleep(_seconds):
@@ -66,6 +76,16 @@ def fetch(session, **kwargs):
 def test_single_page_returns_lowercased_logins():
     session = FakeSession([FakeResponse(payload=user_page("Alice", "BOB"))])
     assert fetch_stargazer_logins("o", "r", session=session) == {"alice", "bob"}
+
+
+def test_the_listing_carries_the_account_ids_as_well_as_the_logins():
+    # The id is what the un-star check matches on, because a login can be
+    # renamed and an account id cannot. It was always in the response body
+    # and used to be discarded.
+    session = FakeSession([FakeResponse(payload=user_page("Alice", "BOB"))])
+    listing = fetch_stargazer_listing("o", "r", session=session)
+    assert listing.logins == {"alice", "bob"}
+    assert listing.ids == {account_id("alice"), account_id("bob")}
 
 
 def test_follows_the_link_header_across_pages():
@@ -94,9 +114,11 @@ def test_follows_the_link_header_across_pages():
 
 def test_accepts_the_star_json_envelope():
     session = FakeSession(
-        [FakeResponse(payload=[{"starred_at": "2024-01-01", "user": {"login": "Zed"}}])]
+        [FakeResponse(payload=[{"starred_at": "2024-01-01", "user": {"login": "Zed", "id": 7}}])]
     )
-    assert fetch_stargazer_logins("o", "r", session=session) == {"zed"}
+    listing = fetch_stargazer_listing("o", "r", session=session)
+    assert listing.logins == {"zed"}
+    assert listing.ids == {7}
 
 
 def test_token_is_sent_as_a_bearer_header():
@@ -255,6 +277,10 @@ def test_an_unchanged_page_costs_nothing_and_is_still_counted():
         sleep=no_sleep,
     )
     assert listing.logins == {"alice"}
+    # The dangerous half of the cache. A page that replayed only its logins
+    # would leave the id set empty, and the un-star check matches on ids, so
+    # a single 304 would strip the role from everybody behind that page.
+    assert listing.ids == {account_id("alice")}
     assert listing.pages_unchanged == 1
     assert listing.pages_fetched == 0
     assert listing.rate_limit_remaining == 4999
@@ -279,7 +305,12 @@ def test_a_304_on_one_page_does_not_freeze_the_others():
             page("c", etag='W/"p2-new"'),
         ]
     )
-    assert fetch(second, cache=cache) == {"a", "b", "c"}
+    listing = fetch_stargazer_listing("o", "r", session=second, cache=cache, sleep=no_sleep)
+    assert listing.logins == {"a", "b", "c"}
+    # The ids have to follow the logins exactly: the cached page contributes
+    # its two, the re-fetched page its one, and the account that went away
+    # contributes neither.
+    assert listing.ids == {account_id("a"), account_id("b"), account_id("c")}
     assert second.calls[1]["url"] == "https://api.github.com/page2"
 
 
@@ -331,7 +362,12 @@ def test_entries_that_are_not_user_objects_are_ignored():
     # A page with something unexpected in it should cost the caller the
     # entries it cannot read, never the whole cycle.
     session = FakeSession([FakeResponse(payload=["nonsense", None, 17, {}, {"login": "Alice"}])])
-    assert fetch_stargazer_logins("o", "r", session=session) == {"alice"}
+    listing = fetch_stargazer_listing("o", "r", session=session)
+    assert listing.logins == {"alice"}
+    # An entry carrying a login and no id contributes to one set and not the
+    # other, which is allowed: the two sets describe the same accounts only
+    # as far as GitHub described them.
+    assert listing.ids == frozenset()
 
 
 def http_date(seconds_from_now, with_timezone=True):

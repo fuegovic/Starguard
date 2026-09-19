@@ -56,6 +56,8 @@ OPTIONAL_VARIABLES = (
     "BOT_HEALTH_ENABLED",
     "BOT_HEALTH_HOST",
     "BOT_HEALTH_PORT",
+    "ROLE_SYNC_ENABLED",
+    "ROLE_SYNC_INTERVAL",
     *[f"BTN{i}" for i in range(1, 5)],
     *[f"URL{i}" for i in range(1, 5)],
 )
