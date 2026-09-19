@@ -12,6 +12,7 @@ fix. Log lines are quoted as the code emits them, so you can search for them.
 - [MongoDB connection and authentication failures](#mongodb-connection-and-authentication-failures)
 - [A healthcheck reports unhealthy](#a-healthcheck-reports-unhealthy)
 - [Verification succeeds but the star is not detected](#verification-succeeds-but-the-star-is-not-detected)
+- [The star webhook is not working](#the-star-webhook-is-not-working)
 - [The custom links command does not appear](#the-custom-links-command-does-not-appear)
 
 ## Reading the logs
@@ -542,11 +543,287 @@ even though they say they starred it.
 - **They signed in to GitHub as a different account** from the one that
   starred. GitHub's answer is about the authenticated user only.
 - **They starred after signing in.** The check happens during the callback,
-  once. They should star first, then press **Get a new link 🔄** and sign in
-  again, or wait for the next automatic check to pick it up.
+  once, and **3: Claim your role** reads that recorded answer rather than
+  asking GitHub again. They should star first, then press **Get a new link
+  🔄** and sign in again.
+
+  With the star webhook configured they do not have to do any of that: the
+  event arrives on its own and the role follows within `ROLE_SYNC_INTERVAL`
+  seconds. Without it, waiting does not help. The periodic check only ever
+  **removes** the role, so it will never notice a star that appeared after
+  verification.
 
 The reverse case, a member who un-starred but keeps the role, resolves at the
-next automatic check, or immediately with `/checkstars`.
+next automatic check, immediately with `/checkstars`, or within seconds if
+the star webhook is configured.
+
+## The star webhook is not working
+
+The optional star webhook is set up in
+[Step 12 of the installation guide](./installation.md#step-12-set-up-the-star-webhook-optional).
+Everything below assumes you have been through it.
+
+**Start at GitHub's delivery log, not at your own.** Open the repository,
+then **Settings**, **Webhooks**, click the hook, and open **Recent
+Deliveries**. Every delivery is there with the status the server answered,
+the exact bytes GitHub sent, and a **Redeliver** button that repeats it with
+the same payload. That is the fastest loop you have for this, and for most of
+these failures it is the only place the evidence exists at all.
+
+The receiver deliberately says very little in your own log. Its route is not
+rate limited, because every real delivery comes from a handful of GitHub
+addresses and putting them all in one bucket would drop exactly the burst of
+stars you care about. A route that is not rate limited must not write a log
+line per request, or anyone on the internet could fill your disk, so a
+**rejected signature is logged at `DEBUG` on purpose**, not at warning. It is
+not a missing log line; it is a deliberate one.
+
+Find the status code in the delivery log and read the matching entry below.
+
+### Deliveries show 401 with `Invalid signature.`
+
+**Cause.** Almost always, the secret GitHub signs with is not the secret the
+server verifies with. Every delivery is authenticated by its HMAC and by
+nothing else, so a signature that does not verify is the only thing that
+produces this.
+
+The other way to get here is a proxy that strips the `X-Hub-Signature-256`
+header, since a missing signature and a wrong one are answered the same way.
+That is rare, and worth suspecting only once the secret has been ruled out.
+
+**Fix.**
+
+1. Check the server is running with the value you think it is. `.env` is read
+   at startup, so a secret edited afterwards has not reached the process:
+
+   ```sh
+   docker compose exec server printenv GITHUB_WEBHOOK_SECRET
+   ```
+
+2. Compare it with the hook's **Secret** field on GitHub. GitHub never shows
+   you the stored value, so you cannot read it back to compare: paste the
+   value from step 1 in again, exactly, and press **Update webhook**. Watch
+   for a trailing space or newline picked up when it was copied.
+3. Press **Redeliver** on the failed delivery. It should turn green without
+   anybody having to star anything.
+
+If you changed `.env` but not the container, `docker compose up -d server`
+picks up the new value.
+
+To see the rejections in your own log while you work on it, set
+`LOG_LEVEL=DEBUG` and restart the server. Each one then logs
+`Rejected a webhook delivery with a bad or missing signature.` Turn it back
+down afterwards.
+
+### Deliveries show 404
+
+There are two different 404s here, and the response body tells them apart.
+
+**With `Hook is configured for another repository.`** The signature was
+valid, so this is your hook, but the `repository.full_name` in the payload is
+not the repository the server is configured for. The server logs it at
+`ERROR`:
+
+```
+Refused a star event for 'someone/other-repo', which is not this repository.
+```
+
+*Cause.* Either the hook is on the wrong repository, or `REPO_OWNER` and
+`GITHUB_REPO` do not name the one the hook is on. The second is easy to do
+when the repository has been renamed or transferred since you set it up.
+
+*Fix.* Compare the two. `REPO_OWNER` is the owner on its own and
+`GITHUB_REPO` is the repository name on its own, never `owner/repo`:
+
+```sh
+docker compose exec server printenv REPO_OWNER GITHUB_REPO
+```
+
+Capitalisation does not matter here. The comparison is case-insensitive on
+both sides, so `Owner/Repo` in the environment matches `owner/repo` in the
+payload. Restart the server after correcting either value, then
+**Redeliver**.
+
+**With an HTML "Not Found" page instead of that one line.** Nothing matched
+the path, so the answer came from the framework's default handler or from
+your proxy rather than from the receiver. The route does not exist.
+
+*Cause.* `GITHUB_WEBHOOK_SECRET` is not set in the process. The receiver is
+registered only when a secret is configured, so without one there is no
+`/webhooks/github` to reach: not a stub that answers an error, genuinely no
+such path. This is also what you get if the secret is set in `.env` but the
+server has not been restarted since.
+
+*Fix.*
+
+```sh
+docker compose exec server printenv GITHUB_WEBHOOK_SECRET
+docker compose up -d server
+```
+
+If the variable prints nothing, set it in `.env` first. If the server refuses
+to start, the log names the reason: the secret is held to the same rules as
+`SECRET_KEY`, so a placeholder or anything under 16 characters is rejected.
+
+A wrong path in the **Payload URL** looks identical from GitHub's side. It
+must end in exactly `/webhooks/github`.
+
+### Deliveries show 503 with `Database unavailable.`
+
+**Cause.** The signature and the repository were both fine and the event was
+simply not recorded, because the server cannot reach MongoDB. Two log lines
+produce this, depending on whether the connection string was usable at
+startup:
+
+```
+Cannot record a star event: no database connection.
+Could not record a star event: <reason>
+```
+
+**Fix.** This is not a webhook problem. Work through
+[MongoDB connection and authentication failures](#mongodb-connection-and-authentication-failures),
+then come back.
+
+**Then redeliver, by hand.** This is the part that catches people out.
+[GitHub does not automatically retry a failed
+delivery](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries),
+so once the database is back, nothing replays the ones that failed while it
+was away. Press **Redeliver** on each red delivery in the log.
+
+It is worth doing rather than skipping, because the sweep only covers half of
+it. The sweep takes the role from anyone no longer in the stargazer listing,
+so it does repair a missed **un-star** at its next pass. It never grants a
+role, so a missed **star** leaves that member without one until the delivery
+is replayed, or until they go back through **Get a new link 🔄** and sign in
+again.
+
+Redelivering works even though the receiver drops duplicates: remembered
+delivery ids expire after ten minutes, which is long enough to catch GitHub's
+own immediate duplicates and short enough that a deliberate redelivery
+minutes later still goes through.
+
+### Deliveries are green but roles do not move
+
+**Symptom.** The delivery log shows 202 and `Recorded.`, and nothing happens
+in Discord.
+
+**Cause.** The delivery reached the **server**, and the server cannot touch
+Discord. Only the **bot** can. The two processes never talk to each other:
+the server writes the new star state to the database and marks the row
+pending, and the bot polls for those rows every `ROLE_SYNC_INTERVAL` seconds
+and moves the role. A green delivery proves the first half only.
+
+**Fix, in order.**
+
+1. **Is the bot running at all?** `docker compose ps discord-bot`.
+2. **Is the drain on?** It is on by default. On startup the bot logs one of:
+
+   ```
+   Draining queued role changes every 30 seconds
+   The role sync drain is disabled (ROLE_SYNC_ENABLED=false)
+   ```
+
+   If you see the second line, set `ROLE_SYNC_ENABLED=true` and restart the
+   bot.
+3. **Do both processes use the same database?** This is the one that produces
+   exactly this symptom with nothing in either log to explain it, because
+   each process is working perfectly against its own database.
+
+   ```sh
+   docker compose exec server printenv MONGO_HOST MONGO_DATABASE
+   docker compose exec discord-bot printenv MONGO_HOST MONGO_DATABASE
+   ```
+
+   Both must match.
+4. **Read the bot's log.** A pass that did something logs one line; a pass
+   over an empty queue logs nothing, which is almost every pass.
+
+   ```
+   Role sync drain complete: examined=1 granted=1 removed=0 failed=0
+   ```
+
+   | Line | Meaning |
+   | --- | --- |
+   | `failed=` above zero | The role change itself was refused. Look for `Could not add the role to ...` and see [the bot cannot assign or remove the role](#the-bot-cannot-assign-or-remove-the-role). The row keeps its flag and is retried on the next pass. |
+   | `Skipping the role sync drain: no database connection.` | The bot started without a usable `MONGO_HOST`. It does not reconnect on its own; fix the value and restart it. |
+   | `Guild <id> is not in the cache; skipping.` | `GUILD_ID` names a server the bot is not in. |
+   | `Role sync drain failed (1 in a row); retrying in 33 seconds` | Transient. The wait doubles on each consecutive failure up to about 300 seconds, with a quarter of jitter either way, and it keeps trying. |
+
+5. **Was the delivery a 204 rather than a 202?** Then nothing was queued and
+   the bot is not the problem. See
+   [a star by somebody who never verified](#a-star-by-somebody-who-never-verified-does-nothing).
+
+### Nothing arrives at all: the delivery log is empty
+
+**Cause.** GitHub never reached your server, or the hook is not sending.
+
+**Fix, cheapest first.**
+
+1. **Is the hook active?** The **Active** checkbox at the bottom of the hook's
+   settings. GitHub shows a banner on the hook's page when it has disabled it
+   for you.
+2. **Are the right events selected?** Under **Which events**, **Stars** must
+   be ticked. A hook set to **Pushes** only, which is GitHub's default, sends
+   nothing when somebody stars the repository.
+3. **Can anything reach the address from outside?** Try it from a machine
+   that is not yours, not from the server itself:
+
+   ```sh
+   curl -fsS https://starguard.example.com/healthz
+   ```
+
+   If that fails, this is not a webhook problem: your public HTTPS address or
+   your proxy is down, and member verification is broken too.
+4. **Does the proxy forward the path?** A proxy configured only for `/login`
+   and `/authorize` returns its own 404 for `/webhooks/github` without the
+   request ever reaching the server. Forward everything to the `server`
+   service on `SERVER_BIND_PORT`, as in
+   [Step 9](./installation.md#step-9-start-the-stack).
+5. **Is the Payload URL right?** It has to be the public HTTPS address with
+   `/webhooks/github` appended, and nothing else. GitHub shows the exact URL
+   it used on each delivery.
+
+Press **Redeliver** on the `ping`, or use **Recent Deliveries** and the ping
+GitHub sent when the hook was created, rather than un-starring the repository
+each time you change something. A working ping answers 200 with the body
+`pong`, and the server logs `Ping received for hook 512345678.`
+
+### A star by somebody who never verified does nothing
+
+**Symptom.** The delivery log shows 204 with an empty body, and the bot never
+wakes up.
+
+**This is correct, and it is the common case by a wide margin.** The `star`
+event fires for everybody who stars the repository, and almost none of them
+have ever used the bot. Starguard can only act on a star it can tie to a
+Discord account, which means somebody who has completed `/verify`. Everybody
+else costs one indexed lookup and is dropped.
+
+At `LOG_LEVEL=DEBUG` the server says so:
+
+```
+Star created by GitHub id 583231 belongs to no verified member.
+```
+
+The same 204 also covers two other harmless cases: an event other than `star`
+arriving because the hook is subscribed to more than you meant, and a `star`
+action this version does not know about, which would mean GitHub added one.
+None of them is a fault, and answering 204 rather than an error is what keeps
+the delivery log green for them.
+
+### Other statuses in the delivery log
+
+| Status | Body | Meaning |
+| --- | --- | --- |
+| 200 | `pong` | The `ping` GitHub sends when the hook is created. What you want to see after setting it up. |
+| 200 | `Already handled.` | A delivery id seen in the last ten minutes. GitHub's own retry of a delivery whose response it did not receive, dropped so the bot is not asked to re-apply a role. |
+| 202 | `Recorded.` | A star change by a verified member, written to the database and queued for the bot. |
+| 204 | empty | Accepted and nothing to do. See the entry above. |
+| 400 | `Body is not a JSON object.` | The hook's **Content type** is `application/x-www-form-urlencoded`. Change it to `application/json`. Note that the `ping` still passes with the wrong content type, so this shows up only on real star events. |
+| 400 | `Missing X-GitHub-Delivery.` | GitHub always sends that header, so this means something between GitHub and the server is stripping it. Check your proxy's header rules. |
+| 400 | `Missing action.`, `Missing sender id.` | The payload is not shaped like a star event. Not something a real delivery produces. |
+| 405 | an HTML page | Something sent a `GET` to the receiver. It takes `POST` only, so a browser cannot be used to test it. |
+| 413 | an HTML page | The body was over 1 MiB, and was refused before it was read. A star payload is a few kilobytes, so this is not a real delivery. |
 
 ## The custom links command does not appear
 
