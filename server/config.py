@@ -8,7 +8,15 @@ request, and so the port really is an int by the time waitress sees it.
 from dataclasses import dataclass
 from typing import Final
 
-from common.config import env_int, require_env, require_secret_key
+from common.config import (
+    MIN_SECRET_KEY_LENGTH,
+    PLACEHOLDER_SECRET_KEYS,
+    ConfigError,
+    env_int,
+    optional_env,
+    require_env,
+    require_secret_key,
+)
 
 # The default port inside the container. docker-compose publishes it on the
 # host as ${SERVER_PORT}; the two are deliberately separate, because binding
@@ -23,6 +31,36 @@ MIN_LINK_TOKEN_MAX_AGE: Final = 60
 # person needs and far less than a script wants.
 DEFAULT_RATE_LIMIT: Final = 10
 DEFAULT_RATE_WINDOW_SECONDS: Final = 60
+
+# The shared secret GitHub signs each webhook delivery with. Optional: an
+# installation that has not set up a hook has no receiver at all.
+WEBHOOK_SECRET_ENV: Final = "GITHUB_WEBHOOK_SECRET"
+
+
+def optional_secret(name: str) -> str | None:
+    """Return ``name`` as a validated secret, or None when it is not set.
+
+    Held to the same placeholder list and the same minimum length as
+    SECRET_KEY, because a webhook secret copied out of .env.example lets
+    anyone sign a star event for anyone. :func:`require_secret_key` cannot
+    be called for this: it names SECRET_KEY itself, and unset is an error
+    there and the normal state here. Its two rules are borrowed rather than
+    restated, so raising the minimum raises it for both.
+    """
+    secret = optional_env(name)
+    if secret is None:
+        return None
+    if secret.lower() in PLACEHOLDER_SECRET_KEYS:
+        raise ConfigError(
+            f"{name} is still set to a placeholder value. Generate a real one "
+            'with: python -c "import secrets; print(secrets.token_urlsafe(32))" '
+            "and paste the same value into the webhook's secret field on GitHub."
+        )
+    if len(secret) < MIN_SECRET_KEY_LENGTH:
+        raise ConfigError(
+            f"{name} must be at least {MIN_SECRET_KEY_LENGTH} characters, got {len(secret)}."
+        )
+    return secret
 
 
 @dataclass(frozen=True)
@@ -45,6 +83,11 @@ class ServerConfig:
     trusted_proxy_count: int
     rate_limit: int
     rate_limit_window: int
+    # None means no webhook is configured, and the receiver is then never
+    # registered. It carries a default so that every existing construction
+    # of this object, including the ones in the test suite, still reads as
+    # an installation without a hook.
+    webhook_secret: str | None = None
 
     @property
     def repo_url(self) -> str:
@@ -77,4 +120,5 @@ def load_server_config() -> ServerConfig:
         rate_limit_window=env_int(
             "LOGIN_RATE_LIMIT_WINDOW", DEFAULT_RATE_WINDOW_SECONDS, minimum=1
         ),
+        webhook_secret=optional_secret(WEBHOOK_SECRET_ENV),
     )
