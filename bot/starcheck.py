@@ -31,6 +31,7 @@ from common.github_api import StargazerCache, StargazerListing, fetch_stargazer_
 from common.storage import (
     MongoDocument,
     UserCollection,
+    find_link,
     iter_links,
     queue_role_sync,
     set_starred,
@@ -355,6 +356,32 @@ class StarChecker:
         # than for the cycle, so a queued webhook about anybody else is not
         # waiting on the crawl. See bot.memberlock.
         async with self._member_locks.hold(discord_id):
+            # Ask the freshness question again now the lock is held. It was
+            # answered above against the row as the cycle read it, before
+            # the wait, and a drain holding this lock in the meantime may
+            # have granted the role from an event newer than this listing.
+            # Removing it on the strength of the older row would take back
+            # a role the webhook had just earned. The write below refuses
+            # the stale state and requeues the correction, so the database
+            # is never wrong, but the member loses role-backed access until
+            # another drain pass returns it. Locking the change without
+            # locking the decision that drives it is what left that gap.
+            #
+            # A row deleted while this waited has nothing left to act on.
+            # Reached only from _sweep, so self._users is not None here; see
+            # the note on the iter_links call there.
+            current = await asyncio.to_thread(
+                find_link,
+                self._users,  # type: ignore[arg-type]
+                discord_id,
+            )
+            if current is None or star_event_is_newer(current, observed_at):
+                log.debug(
+                    "Discord ID %s changed while this cycle waited; leaving them to the drain.",
+                    discord_id,
+                )
+                return None
+
             # A member who left the guild returns None here. Calling
             # has_role on that used to raise and take the whole loop down
             # with it.
