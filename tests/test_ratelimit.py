@@ -4,6 +4,8 @@
 # deliberately mirror signatures they do not use.
 # pylint: disable=missing-function-docstring,unused-argument
 
+import threading
+
 import pytest
 
 from common.ratelimit import RateLimiter
@@ -20,6 +22,74 @@ class FakeClock:
 
     def advance(self, seconds):
         self.now += seconds
+
+
+class LockWatchingClock:
+    """A clock that records whether the limiter held its lock when it read."""
+
+    def __init__(self):
+        self.limiter = None
+        self.held = []
+
+    def __call__(self):
+        self.held.append(self.limiter._lock.locked())  # pylint: disable=protected-access
+        return 1000.0
+
+
+class GateClock:
+    """Hands the first caller an early time and holds it there.
+
+    The second caller gets a later one immediately, which is the interleaving
+    that puts an older timestamp behind a newer one in the deque.
+    """
+
+    def __init__(self):
+        self.reached = threading.Event()
+        self.release = threading.Event()
+        self.first = True
+
+    def __call__(self):
+        if not self.first:
+            return 1005.0
+        self.first = False
+        self.reached.set()
+        # Bounded, because with the clock read under the lock the second
+        # thread never gets this far and nothing would release it.
+        self.release.wait(timeout=0.5)
+        return 1000.0
+
+
+def test_the_clock_is_read_under_the_lock():
+    clock = LockWatchingClock()
+    clock.limiter = RateLimiter(5, 60, clock=clock)
+    clock.limiter.hit("a")
+    assert clock.held == [True]
+
+
+def test_two_threads_cannot_append_their_timestamps_out_of_order():
+    # Reading the clock before taking the lock lets one thread take an
+    # early timestamp, lose the processor, and append it after another
+    # thread has appended a later one. Both the expiry loop and retry_after
+    # read the deque as oldest first, so out of order there means hits that
+    # never expire and a Retry-After computed from the wrong entry.
+    clock = GateClock()
+    limiter = RateLimiter(5, 60, clock=clock)
+
+    slow = threading.Thread(target=limiter.hit, args=("a",))
+    slow.start()
+    assert clock.reached.wait(timeout=5)
+
+    fast = threading.Thread(target=limiter.hit, args=("a",))
+    fast.start()
+    # Under the fix this cannot finish: it is waiting for the lock the slow
+    # thread is holding while it reads its own clock.
+    fast.join(timeout=0.25)
+    clock.release.set()
+
+    slow.join(timeout=5)
+    fast.join(timeout=5)
+    recorded = list(limiter._hits["a"])  # pylint: disable=protected-access
+    assert recorded == sorted(recorded)
 
 
 def test_requests_under_the_limit_are_allowed():

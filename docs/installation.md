@@ -82,13 +82,22 @@ This step is optional but recommended for anything beyond a small repository.
   **Tokens (classic)**, **Generate new token (classic)**.
 - **No scopes are required for a public repository.** The token is used only
   to list stargazers, which is public information. Grant `public_repo` if you
-  prefer to scope it explicitly, or `repo` for a private repository.
+  prefer to scope it explicitly.
 - Copy the token into `GITHUB_TOKEN`.
 
 Without a token GitHub allows 60 API requests per hour from your server's
 address. The stargazer listing is fetched 100 entries per request, so one pass
 over a repository with more than a few thousand stars will run out. With a
 token the limit is 5000 requests per hour.
+
+> **Private repositories do not work end to end.** A `repo`-scoped
+> `GITHUB_TOKEN` does let the **bot** list a private repository's stargazers,
+> so the periodic check runs. The **server** does not use that token: it asks
+> `GET /user/starred/{owner}/{repo}` with the **member's own** OAuth token,
+> and that token carries only `read:user`, which cannot see a private
+> repository. GitHub answers 404, the server reads 404 as "not starred", and
+> every member is told they have not starred it however many times they try.
+> Point Starguard at a public repository.
 
 ## Step 6: Get the role, server and channel IDs
 
@@ -128,17 +137,31 @@ Keep `?authSource=admin`. The bundled image creates its root user in the
 someone later appends a database name to the path. If your password contains
 any of `: / ? # [ ] @`, percent-encode it or choose one that does not.
 
-Compose refuses to start the database if the username or password is missing,
-and Mongo Express refuses to start without `MONGO_EXPRESS_USERNAME` and
-`MONGO_EXPRESS_PASSWORD`.
+The override also brings up Mongo Express, which needs two credentials of its
+own. Uncomment them in `.env` and fill them in:
+
+```ini
+MONGO_EXPRESS_USERNAME=<a name for the admin UI>
+MONGO_EXPRESS_PASSWORD=<a long random password>
+```
+
+All four of these are required, and Compose checks them before it starts
+**anything**. Leave one out and no container comes up at all, not even the
+bot and the server:
+
+```
+error while interpolating services.mongo-express.environment.ME_CONFIG_BASICAUTH_USERNAME: required variable MONGO_EXPRESS_USERNAME is missing a value: set MONGO_EXPRESS_USERNAME in .env
+```
 
 **Option B: your own MongoDB.** Leave `docker-compose.override.yml` out and
 point `MONGO_HOST` at your instance, for example a
 `mongodb+srv://` connection string for Atlas. Starguard needs read and write
-access to two collections in `MONGO_DATABASE`: `users`, and
-`webhook_deliveries` if you set up the optional star webhook in
-[Step 12](#step-12-set-up-the-star-webhook-optional). It creates both, and
-their indexes, at startup.
+access, including the right to create indexes, on two collections in
+`MONGO_DATABASE`: `users` and `webhook_deliveries`. Both are created and
+indexed at every startup, **whether or not you set up the optional star
+webhook** in [Step 12](#step-12-set-up-the-star-webhook-optional); an
+installation without a webhook simply leaves `webhook_deliveries` empty.
+Granting `readWrite` on `MONGO_DATABASE` covers all of it.
 
 ## Step 8: Configure the .env file
 
@@ -183,6 +206,15 @@ For the bot and the server, with a database from Step 7:
 docker compose up -d --build
 ```
 
+**The server's port is published on loopback only**, as
+`127.0.0.1:${SERVER_PORT}:${SERVER_BIND_PORT}`, so after this command the
+application is reachable from the host machine and from nowhere else. Your
+TLS-terminating proxy has to run on the same host to reach it, which is what
+the all-in-one file below does. If your proxy runs on a different machine,
+remove the `127.0.0.1:` from that mapping and set `TRUSTED_PROXY_COUNT` to
+your real hop count, knowing the origin is then reachable without TLS by
+anything that can route to it.
+
 If you also want Nginx Proxy Manager to terminate TLS, use the all-in-one file
 instead. It contains the bot, the server, MongoDB, Mongo Express and NPM, and
 it is a **replacement** for `docker-compose.yml`, not an addition to it:
@@ -221,17 +253,27 @@ docker compose logs -n 50 server
 You are looking for `<botname> connected to Discord` and
 `Starguard OAuth server listening on port 5000`.
 
-Check the server from the outside, through your real domain:
+Check the server on the host, where the port is published:
+
+```sh
+curl -fsS http://127.0.0.1:5000/healthz
+```
+
+Then from the outside, through your real domain, which is what members use:
 
 ```sh
 curl -fsS https://starguard.example.com/healthz
 ```
 
+The first working and the second not is a proxy or DNS problem, not a
+Starguard one.
+
 A healthy server answers `{"status":"ok"}`. It answers 503 with
-`{"database":"unavailable","status":"degraded"}` only when it could not build
-a database client at all, which means `MONGO_HOST` is malformed. A database
-that is merely unreachable does **not** show up here: check the logs for
-`Could not prepare the users collection:` as well.
+`{"database":"unavailable","status":"degraded"}` whenever the database is not
+usable: either `MONGO_HOST` was malformed and no client could be built, or the
+probe sent a `ping` command to MongoDB and did not get an answer. The probe
+really does reach the database, so a 200 here is evidence that the last step
+of verification will work, not just that the process is up.
 
 Then run `/verify` in Discord and walk the three buttons yourself. If anything
 goes wrong, [troubleshooting.md](./troubleshooting.md) lists each failure by
@@ -246,15 +288,24 @@ stargazer list and therefore spends GitHub API budget.
 
 ## Step 12: Set up the star webhook (optional)
 
-Everything so far works without this step. Skip it and the bot notices a star
-appearing or disappearing at the next sweep, up to `AUTOMATIC_CHECK_DELAY`
-seconds later, and pays one GitHub API request per 100 stargazers each time.
-On a repository with 45,000 stars an hourly sweep is 450 requests an hour, and
-that number grows every time somebody stars it.
+Everything so far works without this step, but it is worth understanding what
+you are skipping, because the two directions are not symmetrical.
 
-With the webhook, GitHub tells the server the moment a star changes. The
-delivery costs no GitHub API budget at all, and the member's role moves within
-`ROLE_SYNC_INTERVAL` seconds instead of within `AUTOMATIC_CHECK_DELAY`.
+Without the webhook, the only automatic mechanism is the periodic sweep, and
+**the sweep only ever takes the role away**. It compares the stargazer listing
+against the database and removes the role from anyone who is no longer in the
+listing; there is no code path in which it grants one. So an un-star is
+noticed at the next sweep, up to `AUTOMATIC_CHECK_DELAY` seconds later, and a
+**star is never noticed at all**: the member has to go back through the GitHub
+sign-in, because that is the one thing that records a star. Each sweep also
+pays one GitHub API request per 100 stargazers. On a repository with 45,000
+stars an hourly sweep is 450 requests an hour, and that number grows every
+time somebody stars it.
+
+With the webhook, GitHub tells the server the moment a star changes, in either
+direction. The delivery costs no GitHub API budget at all, and the member's
+role moves within `ROLE_SYNC_INTERVAL` seconds instead of waiting for a sweep
+that, for a new star, would never come.
 
 You need admin access to the repository to add a webhook, and the public
 HTTPS address from [Step 9](#step-9-start-the-stack) has to be reachable from
@@ -387,10 +438,16 @@ still landing in seconds.
 
 If you do turn the sweep off anyway, know which direction you are exposed in.
 The sweep only ever **takes** the role away; it never grants one. So with it
-off, a lost delivery for somebody who starred is repaired by that member
-pressing **Claim your role** again, but a lost delivery for somebody who
-un-starred is repaired by nothing at all until a moderator runs
-`/checkstars`.
+off, a lost delivery for somebody who un-starred is repaired by nothing at all
+until a moderator runs `/checkstars`.
+
+A lost delivery for somebody who **starred** is not repaired by the sweep
+either, on or off. **Claim your role** does not help: it reads the star state
+recorded in the database, which a lost delivery never updated, so the button
+will keep saying they have not starred. The two things that do work are
+redelivering the event from GitHub's delivery log, and having the member press
+**Get a new link 🔄** and sign in with GitHub again, which is what re-records
+the star.
 
 ## Running without Docker
 
@@ -411,17 +468,41 @@ marked `Secure`.
 ## Upgrading from an older version
 
 Four changes need your attention when upgrading an existing deployment. Work
-through them **before** starting the new containers.
+through them **before** starting the new containers. A fifth costs you nothing
+today but changes what happens the next time you point the bot at a different
+repository, so read it and remember it.
 
 ### 1. Revoke the OAuth tokens the old version stored
 
 Earlier versions requested the `repo` scope and saved each user's GitHub
-access token in the database in clear text. On first start the new code
-removes those stored tokens automatically and logs how many it deleted:
+access token in the database in clear text. Every start attempts to delete
+those stored tokens, and logs how many it removed:
 
 ```
 Removed stored OAuth tokens/emails from 37 existing user record(s). Any GitHub tokens previously issued to this app should be revoked.
 ```
+
+The purge is attempted on its own, independently of the index creation and the
+schema upgrade that run beside it, so a failure in either of those no longer
+takes the purge with it. It is still best effort: if the purge itself fails,
+you get
+
+```
+Could not purge credentials written by older versions: <reason>
+```
+
+and the tokens are **still in the database**. Fix the reason, usually a
+missing `readWrite` grant, and restart. Confirm it with a count of the rows
+that still carry one:
+
+```sh
+docker compose exec mongodb mongosh --quiet \
+  -u starguard -p 'the password you put in .env' \
+  --authenticationDatabase admin \
+  --eval 'db.getSiblingDB("starguard").users.countDocuments({github_token:{$exists:true}})'
+```
+
+Zero means the purge has run.
 
 Tokens already handed out stay valid until they are revoked. Revoke them from
 your OAuth app's page under <https://github.com/settings/developers>, and
@@ -444,6 +525,58 @@ credentials by anything on the compose network. It now sets
 `MONGO_INITDB_ROOT_USERNAME` and `MONGO_INITDB_ROOT_PASSWORD`, and both
 compose files refuse to start it without them.
 
+**Pulling this release does not change your database service, and that alone
+will leave it unauthenticated.** If you use the bundled database through
+`docker-compose.override.yml`, that file is a copy you made of
+`override.example.yml` and it is listed in `.gitignore`, so `git pull` leaves
+your old copy exactly as it was, `command: mongod --noauth` and all. Setting
+the two variables in `.env` changes nothing while that line is still there:
+you would create a root user in step 5 below and go on running a database
+that asks nobody for it. Replace or merge the file, after the backup in step
+2 below and before you start anything:
+
+```sh
+cp docker-compose.override.yml docker-compose.override.yml.bak
+cp override.example.yml docker-compose.override.yml
+```
+
+If your copy carries edits of your own, such as a memory limit or an extra
+service, merge them into the new file by hand rather than keeping the old one.
+Then ask Compose what it will actually run, which folds every file it reads
+into one document and drops the comments:
+
+```sh
+docker compose config | grep -n noauth
+```
+
+That must print nothing. A stale override shows itself as
+
+```
+      - --noauth
+```
+
+`docker-compose.alt.yml` is tracked, so `git pull` does update it; the trap is
+the override copy only. Add `-f docker-compose.alt.yml` to the command above
+if that is the file you deploy with.
+
+> **The new file also moves the image from `mongo:4.4.18` to `mongo:7`, and
+> MongoDB cannot make that jump in one go.** MongoDB supports upgrading one
+> major release at a time, 4.4 to 5.0 to 6.0 to 7.0, setting
+> `featureCompatibilityVersion` at each step; started straight on 4.4 data
+> files, `mongod` 7.0 refuses to come up and says so in the `mongodb`
+> container's log. If your `./server/mongo-data` was written by the 4.4 image
+> that earlier versions of this file pinned, do **not** simply start the new
+> one. Either follow MongoDB's own
+> [release upgrade procedure](https://www.mongodb.com/docs/manual/release-notes/7.0-upgrade-standalone/)
+> through each major version in turn, pinning `image:` to each as you go, or
+> take a `mongodump` with 4.4, start 7 on an empty data directory, and
+> `mongorestore` into it. Either way the backup in step 2 below is what makes
+> this recoverable. This is independent of the authentication change; it is
+> the same data directory and the same restart, so do both in one pass.
+>
+> A deployment that never used the bundled database, or whose data directory
+> was created by `mongo:7` already, is unaffected.
+
 Here is the trap. The official `mongo` image adds `--auth` to `mongod` as soon
 as those two variables are set, but it only **creates** the root user when the
 data directory is empty. Its entrypoint skips initialisation if any of
@@ -454,12 +587,20 @@ all do, because `./server/mongo-data` is bind-mounted there.
 So on an existing deployment the result of simply setting the variables is:
 authentication is **on**, and there is **no user to authenticate as**. The
 `mongodb` container's healthcheck fails permanently, and on every start the
-bot and the server log a `Could not prepare the users collection:` line whose
-reason is an authentication failure from the driver.
+bot and the server log four `Could not ...` lines, one per piece of startup
+work, each ending in an authentication failure from the driver:
+
+```
+Could not index the users collection: <reason>
+Could not index the deliveries collection: <reason>
+Could not purge credentials written by older versions: <reason>
+Could not upgrade user records: <reason>
+```
 
 They do not exit over it. They keep running with no working database, which
 means verification appears to work right up to the point where the result is
-saved.
+saved. The server's `/healthz` does report it, with 503 and
+`{"database":"unavailable","status":"degraded"}`.
 
 You do not have to delete anything to fix this. MongoDB has a documented
 [localhost exception](https://www.mongodb.com/docs/manual/core/localhost-exception/):
@@ -469,6 +610,16 @@ first user. That is exactly the situation here, and `mongosh` run inside the
 container is exactly such a connection.
 
 **Step by step:**
+
+> **If you deploy with `docker-compose.alt.yml`, every command below needs
+> `-f docker-compose.alt.yml`**, right after `docker compose` and before the
+> subcommand, for example `docker compose -f docker-compose.alt.yml down`.
+> Without it Compose reads `docker-compose.yml` plus any override, which is a
+> different set of services: `docker compose down` then stops the wrong
+> stack and `docker compose exec mongodb` reports no such service. Exporting
+> `COMPOSE_FILE=docker-compose.alt.yml` in your shell for the duration of the
+> upgrade does the same thing once, for every command in this section and the
+> one in [section 1](#1-revoke-the-oauth-tokens-the-old-version-stored).
 
 1. **Stop everything.** From the repository root:
 
@@ -489,10 +640,15 @@ container is exactly such a connection.
    empty. Everything below is reversible from this backup; nothing below is
    reversible without it.
 
-3. **Set the new variables** in `.env`, exactly as in
-   [Step 7](#step-7-choose-your-mongodb). The credentials in `MONGO_HOST` must
-   match `MONGO_INITDB_ROOT_USERNAME` and `MONGO_INITDB_ROOT_PASSWORD`, and
-   `MONGO_HOST` should carry `?authSource=admin`.
+3. **Replace `docker-compose.override.yml` and set the new variables.** The
+   override file is the part that is easy to skip, because nothing in the
+   release changes it for you; the two `cp` commands and the
+   `docker compose config | grep -n noauth` check are above, and that grep
+   must print nothing before you go on. Then set the variables in `.env`,
+   exactly as in [Step 7](#step-7-choose-your-mongodb): the credentials in
+   `MONGO_HOST` must match `MONGO_INITDB_ROOT_USERNAME` and
+   `MONGO_INITDB_ROOT_PASSWORD`, and `MONGO_HOST` should carry
+   `?authSource=admin`.
 
 4. **Start the database on its own**, so nothing else is retrying against it
    while you work:
@@ -590,6 +746,37 @@ file in [Step 9](#step-9-start-the-stack) includes one.
 
 While you are there, set `TRUSTED_PROXY_COUNT` to match the number of proxies
 you operate. It defaults to `1`.
+
+### 5. If you ever change which repository the bot watches
+
+This one does not bite on this upgrade. It bites the first time you change
+`REPO_OWNER` or `GITHUB_REPO` while keeping the same database, so read it now
+and remember where it is.
+
+**Claiming the role is now refused unless the member's link was made for the
+repository you have configured.** Every row records the repository it was
+created against, and the claim button compares it. Existing rows name the old
+repository, so after a change **every member has to run `/verify` and sign in
+with GitHub again** before they can claim.
+
+That is a security fix, not a limitation. Without the comparison, a
+`starred_repo: true` row proved only that somebody had starred *some*
+repository at some point, and repointing the bot silently handed the role to
+everyone who had starred the old one, none of whom had starred the new one.
+There was nothing in the logs to show it happening.
+
+Plan for it when you repoint:
+
+- Tell members in advance that they have to re-verify, because the button
+  will otherwise look broken to them.
+- Run `/checkstars` afterwards. Roles granted for the old repository are not
+  taken back by the change itself; the sweep is what reconciles them against
+  the new stargazer listing.
+- If you changed the values by mistake, put them back and the existing rows
+  work again immediately. Nothing is deleted or rewritten by the refusal.
+
+The symptom, and what the member sees, is in
+[the troubleshooting guide](./troubleshooting.md#everybody-who-verified-before-is-suddenly-not-linked).
 
 ### Also worth knowing
 

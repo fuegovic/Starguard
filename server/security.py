@@ -79,6 +79,19 @@ def client_ip() -> str:
     return request.remote_addr or "unknown"
 
 
+def rate_limit_key() -> str:
+    """Return the bucket one request counts against.
+
+    Per endpoint as well as per address. A verification is two requests,
+    /login and the /authorize GitHub redirects back to, so one bucket for
+    both charges an ordinary flow twice: LOGIN_RATE_LIMIT=1 refuses the
+    callback of the single attempt it allows, and the default of ten permits
+    five. The endpoint is Flask's own name for the route, not anything the
+    client chose, so this adds nothing a caller can pick.
+    """
+    return f"{request.endpoint}:{client_ip()}"
+
+
 def new_request_id() -> str:
     """Return the ID for the request being handled."""
     supplied = request.headers.get(REQUEST_ID_HEADER, "")
@@ -112,7 +125,7 @@ def install_security(
         if request.endpoint not in limited:
             return None
 
-        decision = limiter.hit(client_ip())
+        decision = limiter.hit(rate_limit_key())
         if decision.allowed:
             return None
 

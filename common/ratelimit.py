@@ -72,10 +72,16 @@ class RateLimiter:
 
     def hit(self, key: str) -> RateLimitDecision:
         """Record an event for ``key`` and say whether it is allowed."""
-        now = self._clock()
-        cutoff = now - self._window
-
+        # The clock is read under the lock, not before it. Read outside, two
+        # threads can take their timestamps in one order and reach the
+        # append in the other, leaving a deque that is no longer oldest
+        # first: the expiry loop stops at the first entry still inside the
+        # window and leaves older ones behind it, and retry_after is
+        # computed from an entry that is not the one about to expire.
         with self._lock:
+            now = self._clock()
+            cutoff = now - self._window
+
             if len(self._hits) > self._max_keys:
                 self._evict(cutoff)
 

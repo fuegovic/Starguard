@@ -132,6 +132,21 @@ def test_a_port_that_cannot_be_bound_does_not_stop_the_bot(monkeypatch, caplog):
     assert "Address already in use" in caplog.text
 
 
+def test_a_port_above_the_ceiling_does_not_kill_the_bot(caplog):
+    # Nothing validates BOT_HEALTH_PORT against 65535, and bind answers a
+    # port above it with OverflowError, which is not an OSError. Catching
+    # only OSError meant one mistyped digit took the whole bot down before
+    # it ever reached the gateway, over an endpoint that is optional.
+    #
+    # The real server is used rather than a stand-in, because the point of
+    # this test is which exception the standard library actually raises.
+    with caplog.at_level("ERROR", logger="starguard.bot"):
+        assert serve_health(HealthState(), "127.0.0.1", 70000, lambda: None) is None
+
+    assert "70000" in caplog.text
+    assert "0-65535" in caplog.text
+
+
 def test_the_endpoint_matches_the_path_and_not_the_query_string(endpoint):
     # A container healthcheck may add a cache buster, and a request for
     # another path must not become a health check by naming one.

@@ -30,6 +30,12 @@ PLACEHOLDER_SECRET_KEYS: Final[frozenset[str]] = frozenset(
 
 MIN_SECRET_KEY_LENGTH: Final = 16
 
+# The range a TCP port can actually be. Zero is excluded on purpose: the
+# kernel reads it as "any free port", which is useful in a test and useless
+# in a deployment, where nothing would know where the service ended up.
+MIN_PORT: Final = 1
+MAX_PORT: Final = 65535
+
 
 # The overloads exist so that ``optional_env(name, "")`` is a str at the call
 # site rather than ``str | None``. Half the callers pass a default precisely so
@@ -67,7 +73,15 @@ def require_env(name: str, hint: str | None = None) -> str:
 
 
 def env_int(name: str, default: int, minimum: int | None = None) -> int:
-    """Return ``name`` as an int, clamped to ``minimum`` when one is given."""
+    """Return ``name`` as an int, clamped to ``minimum`` when one is given.
+
+    ``minimum`` clamps rather than raising, which is right for the values
+    that use it: an ``AUTOMATIC_CHECK_DELAY`` under the floor becomes the
+    floor and the deployment carries on with a value the operator can live
+    with. There is deliberately no ``maximum`` to match, because a ceiling
+    that clamped would be wrong wherever one is wanted. See
+    :func:`env_port`, which is the case that wanted one.
+    """
     raw = optional_env(name)
     if raw is None:
         value = default
@@ -78,6 +92,32 @@ def env_int(name: str, default: int, minimum: int | None = None) -> int:
             raise ConfigError(f"{name} must be a whole number, got {raw!r}.") from exc
     if minimum is not None and value < minimum:
         return minimum
+    return value
+
+
+def env_port(name: str, default: int) -> int:
+    """Return ``name`` as a TCP port, rejecting anything outside 1-65535.
+
+    A reader of its own rather than a bound passed to :func:`env_int`,
+    because this one raises where that one clamps, and the difference is
+    the whole point. Clamping a port is not a smaller version of what was
+    asked for, it is a different address: ``BOT_HEALTH_PORT=70000`` would
+    quietly bind 65535, and an operator hunting their typo would find a
+    service listening and answering on a port they never named.
+
+    Raising is also what the alternative costs. ``bind()`` answers a port
+    above the ceiling with ``OverflowError``, and a caller that survives
+    that is a caller that came up without the socket: for the bot's
+    optional health endpoint, a container whose healthcheck then fails
+    every probe for its whole life, explained only by one startup log line
+    that has long scrolled past. Naming the variable at startup is what
+    every other unusable value in this module does.
+    """
+    value = env_int(name, default)
+    if not MIN_PORT <= value <= MAX_PORT:
+        raise ConfigError(
+            f"{name} must be a TCP port between {MIN_PORT} and {MAX_PORT}, got {value}."
+        )
     return value
 
 

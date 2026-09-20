@@ -22,6 +22,7 @@ from pymongo.errors import PyMongoError
 
 from server import messages
 from server.server import ServerContext, connect_users, create_app, main
+from server.webhooks import MAX_REQUEST_BODY_BYTES
 from tests.test_server_routes import ENVIRONMENT, make_config
 from tests.test_storage import FakeCollection
 
@@ -80,6 +81,32 @@ class FakeGitHub:
         if isinstance(result, Exception):
             raise result
         return result
+
+
+class FakeDatabase:
+    """The one call the health probe makes, and whether it answers.
+
+    /healthz pings rather than trusting the handle, because pymongo connects
+    lazily: a collection object exists whether or not MongoDB is reachable.
+    """
+
+    def __init__(self, error=None):
+        self.error = error
+        self.commands = []
+
+    def command(self, name):
+        self.commands.append(name)
+        if self.error is not None:
+            raise self.error
+        return {"ok": 1.0}
+
+
+class ProbeableCollection(FakeCollection):
+    """A collection whose database answers the probe, or refuses to."""
+
+    def __init__(self, documents=None, error=None):
+        super().__init__(documents)
+        self.database = FakeDatabase(error)
 
 
 class ExplodingCollection(FakeCollection):
@@ -173,6 +200,35 @@ def test_a_visitor_who_has_not_starred_is_told_which_repository_to_star():
     assert response.status_code == 200
     assert b"you have not starred owner/repo yet" in response.data
     # The link is still recorded, so the claim button knows who they are.
+    assert stored(flow)["starred_repo"] is False
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500, 502, 301])
+def test_a_star_check_github_could_not_answer_is_not_an_absent_star(status):
+    # Only 404 means unstarred. Reading a 401, a 429 or a 5xx as "no" wrote
+    # starred_repo=False over a link that was true and sent the visitor off
+    # to star a repository they had already starred.
+    flow = build()
+    flow.github.responses[STARRED_PATH] = FakeApiResponse(status_code=status)
+
+    response = authorize(flow)
+    assert response.status_code == 502
+    assert messages.PROFILE_UNREADABLE.encode() in response.data
+    # Nothing was recorded, so a link that already said starred survives.
+    assert flow.users.documents == []
+
+
+def test_the_page_for_an_unstarred_visitor_asks_them_to_sign_in_again():
+    # The claim button answers from the star state recorded here, and
+    # nothing turns a recorded false back into true on its own: the
+    # periodic check only ever records an un-star, and the webhook that
+    # would record the star is optional. "Star it, then claim" was advice
+    # that failed for precisely the person who followed it.
+    flow = build()
+    flow.github.responses[STARRED_PATH] = FakeApiResponse(status_code=NOT_STARRED)
+
+    page = authorize(flow).data
+    assert b"run /verify in Discord again" in page
     assert stored(flow)["starred_repo"] is False
 
 
@@ -306,10 +362,30 @@ def test_the_page_announces_failure_more_loudly_than_success(status, role, label
 
 
 def test_healthz_is_ok_once_the_database_is_reachable():
-    flow = build()
+    users = ProbeableCollection()
+    flow = build(users=users)
     response = flow.client.get("/healthz")
     assert response.status_code == 200
     assert response.get_json() == {"status": "ok"}
+    # It really asked the server, rather than reporting on the handle.
+    assert users.database.commands == ["ping"]
+
+
+def test_healthz_reports_a_database_that_has_stopped_answering(caplog):
+    # connect() logs a failed preparation and returns the handle anyway, and
+    # pymongo connects lazily, so a non-None collection says nothing about
+    # whether MongoDB is up. Without a real command this endpoint answered
+    # 200 straight through an outage and the compose healthcheck kept the
+    # container in service while every link attempt failed.
+    users = ProbeableCollection(error=PyMongoError("no primary available"))
+    flow = build(users=users)
+
+    with caplog.at_level("ERROR", logger="starguard.server"):
+        response = flow.client.get("/healthz")
+
+    assert response.status_code == 503
+    assert response.get_json() == {"status": "degraded", "database": "unavailable"}
+    assert "no primary available" in caplog.text
 
 
 def test_connect_users_returns_the_collection(monkeypatch):
@@ -357,3 +433,9 @@ def test_main_serves_the_application_with_waitress(monkeypatch):
     assert served["app"][0] == "app"
     assert served["port"] == 5055
     assert served["host"] == "0.0.0.0"
+    # The same bound as MAX_CONTENT_LENGTH, and it has to be given twice:
+    # Flask checks once the request reaches the application, by which time
+    # waitress has already spooled the body under its own one gibibyte
+    # default. The webhook route is public and deliberately not rate
+    # limited, and a body this bounds is the stated reason that is safe.
+    assert served["max_request_body_size"] == MAX_REQUEST_BODY_BYTES

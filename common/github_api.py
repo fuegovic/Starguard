@@ -32,9 +32,14 @@ MAX_PAGES: Final = 1000
 
 # Statuses worth trying again. 429 is GitHub's secondary rate limit, which is
 # short lived and usually carries a Retry-After; the 5xx family is GitHub
-# having a bad moment. A 403 with no rate limit left is the primary limit and
-# is deliberately absent, because it does not clear for up to an hour.
+# having a bad moment. 403 is deliberately absent: GitHub uses it for the
+# primary limit, which does not clear for up to an hour.
 RETRY_STATUSES: Final[frozenset[int]] = frozenset({429, 500, 502, 503, 504})
+
+# The two statuses GitHub spells the primary rate limit with. The status alone
+# does not say which limit was hit, because the secondary limit shares both;
+# the remaining count at zero is what separates them.
+PRIMARY_LIMIT_STATUSES: Final[frozenset[int]] = frozenset({403, 429})
 MAX_ATTEMPTS_PER_PAGE: Final = 4
 RETRY_BASE_DELAY_SECONDS: Final = 2.0
 RETRY_MAX_DELAY_SECONDS: Final = 60.0
@@ -71,6 +76,10 @@ class CachedPage:
     that replayed only its logins would contribute nothing to the id set on
     a 304, and the un-star check matches on ids, so every member behind a
     cached page would look as though they had un-starred.
+
+    ``next_url`` is the link as it stood when the page was read. A page whose
+    link could have appeared since is never cached, so replaying this one
+    cannot truncate the walk; :func:`_hides_a_future_page` is that rule.
     """
 
     etag: str
@@ -112,6 +121,10 @@ class StargazerCache:
     union of the pages actually walked this cycle, so a reused page can only
     contribute accounts that really are still in that page's body.
 
+    The one page that does not follow from that argument is a last page with
+    no room left, which is kept out of the cache entirely; see
+    :func:`_hides_a_future_page`.
+
     The point of all this is that a 304 does not count against the REST rate
     limit, so a repository whose early pages rarely change costs a fraction of
     a full listing per cycle.
@@ -148,9 +161,8 @@ def _headers(token: str | None = None) -> dict[str, str]:
 def _describe_failure(response: requests.Response) -> str:
     """Turn a failed response into a message that names the actual problem."""
     status = response.status_code
-    remaining = response.headers.get("X-RateLimit-Remaining")
 
-    if status in (403, 429) and remaining == "0":
+    if _is_primary_rate_limit(response):
         return (
             "GitHub API rate limit exceeded. Set GITHUB_TOKEN to raise the "
             "limit, or increase AUTOMATIC_CHECK_DELAY."
@@ -198,6 +210,19 @@ def _rate_limit_remaining(response: requests.Response) -> int | None:
         return int(raw)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _is_primary_rate_limit(response: requests.Response) -> bool:
+    """True when the response is the primary rate limit, not a passing blip.
+
+    One predicate serves both the retry decision and the message, because the
+    two disagreeing was the bug: the message already called a 429 with
+    nothing left the primary limit, while the retry loop went on treating it
+    as the short-lived secondary one and slept out its Retry-After three
+    times before reporting the same exhaustion anyway.
+    """
+    remaining = _rate_limit_remaining(response)
+    return response.status_code in PRIMARY_LIMIT_STATUSES and remaining == 0
 
 
 def _retry_after_seconds(response: requests.Response) -> float | None:
@@ -258,6 +283,16 @@ def _get_page(
         if final or response.status_code not in RETRY_STATUSES:
             return response, attempt
 
+        # The primary limit wears a retryable status but is not retryable: it
+        # takes up to an hour to clear, so the whole budget would go on
+        # sleeping and the caller would hear about it three minutes later
+        # than it could have. Handing the response back lets
+        # _describe_failure name it. 403 needs no such test because it is not
+        # in RETRY_STATUSES at all; 429 is, because the secondary limit that
+        # the retries exist for uses the same status.
+        if _is_primary_rate_limit(response):
+            return response, attempt
+
         # Held under its own name rather than reassigned over ``delay``: the
         # transport-error branch above has already fixed that variable as a
         # plain float, and this one is "what GitHub asked for, if anything".
@@ -309,6 +344,27 @@ class _Walk:
         )
 
 
+def _hides_a_future_page(entry_count: int, next_url: str | None) -> bool:
+    """True when caching this page could hide a page that does not exist yet.
+
+    Stargazers come back oldest first, so a new star always lands at the end
+    of the listing. When the last page is already full, that star opens a
+    brand new page without touching the body of the page before it: the ETag
+    still matches, GitHub answers 304, and the cached ``next_url`` of None
+    ends the walk one page early. The listing then looks as though everyone
+    on the new page had un-starred, and the check strips their roles.
+
+    Only the final page can be caught this way, which is what keeps the 304
+    saving intact for the pages that make up almost all of a listing. A page
+    that already has a next link keeps it whatever happens behind it, and a
+    page with room left absorbs the new star into its own body, which changes
+    the ETag and produces a 200. So the only entry left out of the cache is
+    the last page, and only in the one case where the listing ends exactly on
+    a page boundary; that costs a single unconditional request per cycle.
+    """
+    return next_url is None and entry_count >= PER_PAGE
+
+
 def _absorb_page(walk: _Walk, url: str, response: requests.Response, caching: bool) -> str | None:
     """Fold a 200 response into ``walk``. Returns the next page's URL."""
     if response.status_code != OK:
@@ -330,7 +386,7 @@ def _absorb_page(walk: _Walk, url: str, response: requests.Response, caching: bo
     next_url = response.links.get("next", {}).get("url")
 
     etag = response.headers.get("ETag")
-    if caching and etag:
+    if caching and etag and not _hides_a_future_page(len(page), next_url):
         walk.pages[url] = CachedPage(etag, logins, ids, next_url)
 
     return next_url
@@ -381,6 +437,10 @@ def fetch_stargazer_listing(
             walk.logins |= cached.logins
             walk.ids |= cached.ids
             walk.pages[url] = cached
+            # Trusting the cached link is only safe because of the rule in
+            # _hides_a_future_page: a page that was both full and last was
+            # never cached, so a cached None really does mean the listing
+            # ends here, not merely that it ended here last time.
             next_url = cached.next_url
         else:
             next_url = _absorb_page(walk, url, response, cache is not None)

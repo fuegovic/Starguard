@@ -53,8 +53,10 @@ log = logging.getLogger("starguard.server")
 # what a Discord role bot needs, and a serious thing to ask of a visitor.
 GITHUB_OAUTH_SCOPE: Final = "read:user"
 
-# GitHub answers "is this repo starred by me" with 204 (yes) or 404 (no).
+# GitHub answers "is this repo starred by me" with 204 (yes) or 404 (no),
+# and with nothing else; see _read_star_check.
 STARRED_STATUS: Final = 204
+NOT_STARRED_STATUS: Final = 404
 
 RATE_LIMITED_ENDPOINTS: Final[tuple[str, ...]] = ("login", "authorize")
 
@@ -164,6 +166,23 @@ def login() -> WerkzeugResponse:
     return context.github.authorize_redirect(redirect_uri)
 
 
+def _read_star_check(status: int) -> bool:
+    """Turn the starred endpoint's status into an answer, or refuse to guess.
+
+    There are two answers and everything else is GitHub failing to give one.
+    This used to read any status other than 204 as "not starred", so a 401,
+    a 403, a 429 or a 5xx during an outage wrote ``starred_repo=False`` over
+    a link that was true and sent the visitor off to star a repository they
+    had already starred. ValueError so the caller reports it as the
+    unreadable reply it is, rather than recording a fact nobody established.
+    """
+    if status == STARRED_STATUS:
+        return True
+    if status == NOT_STARRED_STATUS:
+        return False
+    raise ValueError(f"the starred check answered {status}")
+
+
 def authorize() -> Response:
     """Complete the OAuth flow and record the user's star status."""
     context = _context()
@@ -191,12 +210,11 @@ def authorize() -> Response:
         github_username = profile["login"]
         github_id = profile["id"]
 
-        # 204 means the authenticated user has starred the repository.
         starred_response = context.github.get(
             f"user/starred/{context.config.owner}/{context.config.repo}",
             token=token,
         )
-        starred = starred_response.status_code == STARRED_STATUS
+        starred = _read_star_check(starred_response.status_code)
     except (OAuthError, KeyError, ValueError) as exc:
         log.warning("Could not read the GitHub profile: %s", exc)
         return render_result(messages.PROFILE_UNREADABLE, 502)
@@ -238,8 +256,22 @@ def authorize() -> Response:
 
 def healthz() -> tuple[dict[str, str], int]:
     """Liveness probe that also reports database reachability."""
-    if _context().users is None:
+    users = _context().users
+    if users is None:
         return {"status": "degraded", "database": "unavailable"}, 503
+
+    try:
+        # A handle is not a connection. pymongo connects lazily and connect()
+        # logs a failed preparation rather than raising, so this object
+        # exists whether or not MongoDB is reachable; only a command that
+        # goes to the server tells the two apart. Without one, the compose
+        # healthcheck reads 200 straight through an outage and keeps the
+        # container in service while every link attempt fails.
+        users.database.command("ping")
+    except PyMongoError as exc:
+        log.error("Health probe could not reach MongoDB: %s", exc)
+        return {"status": "degraded", "database": "unavailable"}, 503
+
     return {"status": "ok"}, 200
 
 
@@ -273,18 +305,26 @@ def create_app(
         users = connect_users(config)
 
     app = Flask(__name__, template_folder="./html")
-    # The server sits behind a reverse proxy, which terminates TLS. Without
-    # this the OAuth redirect_uri would be built as http:// and GitHub would
-    # reject it. The hop count is configurable because ProxyFix counts from
-    # the right, so a second proxy in front silently shifts the client
-    # address the rate limiter sees.
+    # The server usually sits behind a reverse proxy, which terminates TLS.
+    # Without this the OAuth redirect_uri would be built as http:// and
+    # GitHub would reject it. The hop count is configurable because ProxyFix
+    # counts from the right, so a second proxy in front silently shifts the
+    # client address the rate limiter sees.
+    #
+    # Zero hops means the port is reached directly, which docker-compose.yml
+    # publishes it to be, and then the middleware is left off entirely: with
+    # it installed, one hop of trust is all a client needs to hand itself
+    # any X-Forwarded-For it likes and take a fresh rate-limit bucket per
+    # request. A deployment with no proxy has no forwarded header worth
+    # believing, so the safe reading is to believe none of it.
     hops = config.trusted_proxy_count
-    # Replacing wsgi_app is Flask's documented way to wrap the application in
-    # WSGI middleware; mypy only objects because the attribute is declared as
-    # a method on the class.
-    app.wsgi_app = ProxyFix(  # type: ignore[method-assign]
-        app.wsgi_app, x_for=hops, x_proto=hops, x_host=hops
-    )
+    if hops:
+        # Replacing wsgi_app is Flask's documented way to wrap the
+        # application in WSGI middleware; mypy only objects because the
+        # attribute is declared as a method on the class.
+        app.wsgi_app = ProxyFix(  # type: ignore[method-assign]
+            app.wsgi_app, x_for=hops, x_proto=hops, x_host=hops
+        )
     app.secret_key = config.secret_key
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
@@ -359,11 +399,26 @@ def main() -> None:
     # B104: binding to every interface is the point. This process runs
     # in a container and is reached from another one, so loopback would make
     # it unreachable; what is and is not published is the compose file's job.
-    # Bandit prints "nosec encountered (B104), but no failed test" here. That
-    # warning is wrong: delete the suppression and B104 fires on this line. A
-    # bare "# nosec" silences the warning but would also hide any future
-    # finding on this line, so the scoped form stays.
-    serve(app, host="0.0.0.0", port=config.port, ident="Starguard")  # nosec B104
+    # Bandit prints "nosec encountered (B104), but no failed test" here.
+    # That warning is wrong: delete the suppression and B104 fires on the
+    # host line below. A bare "# nosec" silences the warning but would also
+    # hide any future finding on that line, so the scoped form stays.
+    #
+    # max_request_body_size is the same bound as MAX_CONTENT_LENGTH and has
+    # to be stated twice, because the two enforce it in different places.
+    # Flask's check runs once the request has reached the application, by
+    # which time waitress has already spooled the body: its own default is
+    # one gibibyte, so without this an unauthenticated client could make the
+    # public webhook endpoint buffer a thousand times what that route is
+    # documented to bound. The bounded body is the stated reason that route
+    # is safe to leave unlimited, so it has to hold at the front door.
+    serve(
+        app,
+        host="0.0.0.0",  # nosec B104
+        port=config.port,
+        ident="Starguard",
+        max_request_body_size=MAX_REQUEST_BODY_BYTES,
+    )
 
 
 if __name__ == "__main__":

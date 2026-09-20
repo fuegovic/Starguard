@@ -25,8 +25,10 @@ would put the entire event stream in one bucket, and a burst of stars is
 exactly when the bucket overflows. GitHub does not retry a failed delivery,
 so a 429 is not a delay, it is an event that never arrives and a role that
 never moves. The flood case that limiting would answer is already cheap here:
-an unsigned request costs one SHA-256 over a body that ``MAX_CONTENT_LENGTH``
-bounds, and touches no database, no socket and no log line. Volume control
+an unsigned request costs one SHA-256 over a body that is bounded twice
+before it gets here, and touches no database, no socket and no log line. The
+two bounds are :data:`MAX_REQUEST_BODY_BYTES`, and they are both needed: see
+its comment. Volume control
 belongs at the proxy in front, which can drop a connection for less than this
 process spends accepting one.
 """
@@ -46,10 +48,13 @@ from pymongo.errors import PyMongoError
 
 from common.storage import (
     STAR_SOURCE_WEBHOOK,
+    MongoDocument,
     UserCollection,
     claim_delivery,
     deliveries_for,
+    read_datetime,
     record_star_event,
+    release_delivery,
 )
 
 log = logging.getLogger("starguard.webhooks")
@@ -77,8 +82,14 @@ STAR_ACTIONS: Final[Mapping[str, bool]] = {"created": True, "deleted": False}
 # far above anything GitHub sends and far below what an unauthenticated
 # sender could make this process hash: the body has to be read into memory
 # before the signature over it can be computed, so the bound is what keeps
-# that cost fixed. Applied as Flask's MAX_CONTENT_LENGTH in create_app, which
-# refuses an oversized body rather than reading it.
+# that cost fixed.
+#
+# It is applied in two places, because one of them is too late on its own.
+# Flask's MAX_CONTENT_LENGTH, set in create_app, refuses an oversized body
+# rather than reading it, but it is only consulted once the request has
+# reached the application, by which time the WSGI server has already spooled
+# what arrived. So main() also hands this to waitress as
+# max_request_body_size, whose own default is a gibibyte.
 MAX_REQUEST_BODY_BYTES: Final = 1024 * 1024
 
 HTTP_OK: Final = 200
@@ -193,6 +204,45 @@ def _sender_id(payload: Mapping[str, object]) -> int | None:
     return github_id
 
 
+def _release_claim(users: UserCollection, delivery_id: str) -> None:
+    """Forget a claimed delivery whose work did not happen.
+
+    Best effort, and silent about its own failure on purpose. The database
+    this has to reach is the one that just refused the write, so a second
+    refusal is the expected outcome and says nothing new; the caller is
+    already answering 503 and that answer must not change into a traceback.
+    """
+    try:
+        release_delivery(deliveries_for(users), delivery_id)
+    except PyMongoError as exc:
+        log.error("Could not release webhook delivery %s: %s", delivery_id, exc)
+
+
+def _was_recorded(document: MongoDocument, occurred_at: datetime) -> bool:
+    """Say whether the row ``record_star_event`` returned is this delivery's.
+
+    It has three outcomes and only two of them wrote anything. A row that
+    already carries a star event later than this delivery is returned
+    untouched, because a delivery that arrives behind a newer one must not
+    write its older state over it, and the caller cannot tell that from the
+    return value alone.
+
+    The read-side mirror of the ``$lte`` in
+    :func:`common.storage._not_newer_than`, against the same horizon the
+    write used, so the two answer the same question. That pairing is named
+    at both ends on purpose: only the filter knows whether it matched, so
+    moving the operator there means moving it here.
+    Deliberately not :func:`common.storage.star_event_is_newer`, which
+    steps its horizon back one millisecond for the sweep's benefit and
+    would therefore call every successful write superseded: after the
+    write the stored instant is this delivery's own, truncated to the
+    millisecond BSON holds, which is later than that stepped-back horizon
+    and no later than ``occurred_at``.
+    """
+    star_event_at = read_datetime(document, "star_event_at")
+    return star_event_at is not None and star_event_at <= occurred_at
+
+
 def _handle_star(users: UserCollection, payload: Mapping[str, object]) -> Response:
     """Record one verified star event. Raises PyMongoError to the caller."""
     delivery_id = request.headers.get(DELIVERY_HEADER)
@@ -223,13 +273,28 @@ def _handle_star(users: UserCollection, payload: Mapping[str, object]) -> Respon
     if github_id is None:
         return _reply(HTTP_BAD_REQUEST, "Missing sender id.")
 
-    updated = record_star_event(
-        users,
-        github_id=github_id,
-        starred=STAR_ACTIONS[action],
-        source=STAR_SOURCE_WEBHOOK,
-        occurred_at=datetime.now(UTC),
-    )
+    # One clock read, used for the write and then to ask what the write
+    # did, so the two cannot disagree about when this delivery arrived.
+    occurred_at = datetime.now(UTC)
+    try:
+        updated = record_star_event(
+            users,
+            github_id=github_id,
+            starred=STAR_ACTIONS[action],
+            source=STAR_SOURCE_WEBHOOK,
+            occurred_at=occurred_at,
+        )
+    except PyMongoError:
+        # The claim was taken before the work was attempted and the work did
+        # not happen, so the claim is a lie the next ten minutes would tell.
+        # Redelivering by hand is the documented way to recover from exactly
+        # this failure, and the claim left standing is what would answer it
+        # with "Already handled" and record nothing. Released here rather
+        # than by the caller, because this is the only place that knows the
+        # delivery was claimed and not completed.
+        _release_claim(users, delivery_id)
+        raise
+
     if updated is None:
         # Nobody has linked that GitHub account. This is the common case by
         # a wide margin, because the event fires for everyone who stars the
@@ -238,6 +303,23 @@ def _handle_star(users: UserCollection, payload: Mapping[str, object]) -> Respon
         log.debug("Star %s by GitHub id %s belongs to no verified member.", action, github_id)
         return _reply(HTTP_NO_CONTENT)
 
+    if not _was_recorded(updated, occurred_at):
+        # A newer star event reached the row first, so nothing was written
+        # and the row still holds the later fact. Saying "Recorded" here
+        # would be the one line an operator reads when a role did not move,
+        # and it would contradict what the database actually holds.
+        log.info(
+            "Star %s for GitHub id %s arrived behind a newer event; left as it stands.",
+            action,
+            github_id,
+        )
+        return _reply(HTTP_ACCEPTED, "Superseded by a newer event.")
+
+    # 2XX is all GitHub asks for, and the body is the line an operator reads
+    # in the delivery log. It says the delivery was written and nothing
+    # more: the flag is the row's state, not a promise that this delivery
+    # raised it, because an event that repeats what the row already says
+    # records the delivery and queues no work.
     log.info(
         "Recorded star %s for GitHub id %s (pending role sync: %s).",
         action,
