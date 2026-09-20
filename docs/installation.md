@@ -294,11 +294,20 @@ Starguard one.
 A healthy server answers `{"status":"ok"}`. It answers 503 with
 `{"database":"unavailable","status":"degraded"}` whenever it sends a `ping`
 command to MongoDB and does not get an answer. The probe really does reach
-the database, so a 200 here is evidence that the last step of verification
-will work, not just that the process is up. A `MONGO_HOST` the driver cannot
-use does not appear here at all: the server checks that value as it loads its
-configuration and exits rather than serving, with `Configuration error:
-MONGO_HOST is not a usable MongoDB connection string`.
+the database, so a 200 here is more than the process being up.
+
+**It is not proof that verification will save anything, though.** `ping` asks
+whether the database answers, not whether this account may write to it, and
+the startup that creates the indexes treats a failure as best effort and
+carries on. So a MongoDB user who can connect but cannot update `users`
+produces exactly this 200 while every OAuth callback fails at the last step.
+That is the deployment this check will certify and the walkthrough below will
+not, which is why the walkthrough is the one that settles it.
+
+A `MONGO_HOST` the driver cannot use does not appear here at all: the server
+checks that value as it loads its configuration and exits rather than serving,
+with `Configuration error: MONGO_HOST is not a usable MongoDB connection
+string`.
 
 Then run `/verify` in Discord and walk the three buttons yourself. If anything
 goes wrong, [troubleshooting.md](./troubleshooting.md) lists each failure by
