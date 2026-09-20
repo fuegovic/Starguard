@@ -845,6 +845,18 @@ def test_startup_with_the_drain_turned_off_starts_nothing(caplog):
 # which is the whole point. See TrackedMember.
 COMPANY_TURNS = 500
 
+# How long the two hang guards in test_a_drain_does_not_wait_out_a_sweep_of
+# _other_members wait before giving up. Not a timing assumption: with the
+# locks split both events are set within microseconds of being waited on,
+# and the bound exists only so a regression that puts the drain back behind
+# the cycle fails rather than hangs forever. Generous on purpose, because
+# what has to finish inside it is a whole drain pass, and ten seconds was
+# short enough that a loaded machine turned a passing run into a spurious
+# failure reported against the wrong assertion: the guard fires inside the
+# worker thread, asyncio.to_thread hands the error to the sweep task, and
+# the test then reports that the sweep had finished.
+HANG_GUARD_SECONDS = 60
+
 
 class TrackedMember(FakeMember):
     """A member counting how many role changes are in flight on them at once.
@@ -929,18 +941,18 @@ def test_a_drain_does_not_wait_out_a_sweep_of_other_members(monkeypatch):
     # fetch_stargazer_listing, documented as minutes on a repository with
     # 45,000 stargazers, and across the whole member sweep after it.
     # Handing that lock to the drain meant a webhook queued for anybody at
-    # all waited out an entire cycle, so the five to thirty second
-    # ROLE_SYNC_INTERVAL described nothing that happens.
+    # all waited out an entire cycle, so ROLE_SYNC_INTERVAL, thirty seconds
+    # by default, described nothing that happens.
     crawling = threading.Event()
     finish_crawl = threading.Event()
 
     def slow_fetch(owner, repo, token=None, cache=None):
         crawling.set()
         # Stands in for the minutes a crawl costs. Waited on rather than
-        # slept through, so the test runs as fast as the code does; the
-        # timeout is there to fail rather than hang if the drain ever goes
-        # back to queueing behind the cycle.
-        assert finish_crawl.wait(timeout=10)
+        # slept through, so the test runs as fast as the code does, and
+        # released by the test once the drain has been all the way through.
+        # See HANG_GUARD_SECONDS for why the bound is what it is.
+        assert finish_crawl.wait(timeout=HANG_GUARD_SECONDS)
         return listing("kept", ids={account_id("Kept")})
 
     documents = [link(1, "Gone"), pending(2, True, username="Kept")]
@@ -957,7 +969,7 @@ def test_a_drain_does_not_wait_out_a_sweep_of_other_members(monkeypatch):
 
     async def scenario():
         sweep = asyncio.create_task(checker.run_once())
-        assert await asyncio.to_thread(crawling.wait, 10)
+        assert await asyncio.to_thread(crawling.wait, HANG_GUARD_SECONDS)
 
         result = await drainer.drain_once()
         # The crawl has not returned, so the drain really did deliver a
