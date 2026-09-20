@@ -294,6 +294,10 @@ Discord gateway connects, that is the whole of it, with **503**:
 {"status": "starting", "uptime_seconds": 5.0, "gateway": "connecting"}
 ```
 
+Neither loop field appears there, because nothing has been measured yet. A
+monitor that reads them has to tolerate their absence in this state as well
+as in the ones below.
+
 Once connected, the payload also names each of the bot's two reconciling
 loops, whether or not that loop is turned on:
 
@@ -742,17 +746,23 @@ above works either way, but the moment anyone appends a database name, as in
 the user in `starguard` and authentication would start failing. Saying
 `authSource` explicitly makes that impossible.
 
-**Percent-encode the credentials.** PyMongo parses this value as a URI, so
-anything in the username or password that means something in a URI has to be
-percent-encoded: `@`, `:`, `/`, `?`, `%` and `+`, with `# [ ]` thrown in
-because encoding them costs nothing and saves you having to remember which
-ones the driver happens to tolerate. `@`, `:`, `/` and `%` make the driver
-reject the string outright. `?` is the unpredictable one, because it ends the
-part of the string the driver reads as credentials and host, so what happens
-next depends on what precedes it: usually a rejection, sometimes a fatal one,
-and if the text before it happens to be all digits, a client that is silently
-pointed at the wrong host. `+` is the quiet one, decoded to a space with no
-error anywhere.
+**Percent-encode the credentials.** PyMongo parses this value as a URI, so a
+reserved character in the username or password has to be percent-encoded.
+The ones that matter, and what each does when you leave it unencoded:
+
+- `@`, `:`, `/` and `%` raise a caught error. Something goes wrong at
+  startup and says so.
+- `?` raises an **uncaught** error, in the form this file's examples use:
+  everything after the `?` is read as the connection string's query part,
+  which leaves the rest of the password sitting where the port belongs, and
+  a port that is not a number is fatal. A mistyped port such as
+  `mongodb://mongodb:70000/` fails the same way for the same reason. (A `?`
+  in a string carrying no `?authSource=admin` or other trailing option is
+  caught instead, but every example here carries one.)
+- `+` is the worst of them, because nothing complains at all. It is silently
+  decoded to a space, so the password is quietly wrong.
+- `#`, `[`, `]`, `!` and `$` need no encoding. Encoding them anyway does no
+  harm if you would rather not remember the list.
 
 **Encode it in `MONGO_HOST` and nowhere else.** MongoDB is handed the
 password literally, through `MONGO_INITDB_ROOT_PASSWORD`, and so are the

@@ -469,9 +469,9 @@ connection string](#a-malformed-connection-string).
    second form.
 2. The username and password in `MONGO_HOST` must match
    `MONGO_INITDB_ROOT_USERNAME` and `MONGO_INITDB_ROOT_PASSWORD` exactly.
-3. Percent-encode anything in the password that means something in a URI:
-   `@ : / ? % +`, and `# [ ]` for good measure. Encode it in `MONGO_HOST`
-   and **only** there. `MONGO_INITDB_ROOT_PASSWORD` is the literal password
+3. Percent-encode the reserved characters in the password: `@ : / ? % +`.
+   (`# [ ] ! $` need no encoding.) Encode them in `MONGO_HOST` and **only**
+   there. `MONGO_INITDB_ROOT_PASSWORD` is the literal password
    MongoDB was created with, and the healthcheck and Mongo Express use it
    literally too, so a database that reports healthy while the bot and the
    server cannot sign in is the signature of encoding it in both places.
@@ -558,14 +558,15 @@ outcomes, and which of them depends on how the driver fails:
 
 - `@`, `:`, `/` or `%` is reported as a MongoDB error. The bot catches it,
   logs the `Error connecting to MongoDB` line, and runs on granting no roles.
-- **A malformed port is not caught**, and it is the case that ends in the
-  traceback. `mongodb://mongodb:70000/` and `mongodb://mongodb:notaport/`
-  reach it directly. An unencoded `?` reaches it the long way round: it ends
-  the part of the string the driver reads as credentials and host, which can
-  leave what was meant to be password text sitting where the port belongs.
-  Either way the `ValueError` that raises is not a MongoDB error, so nothing
-  catches it. The container exits, `restart: always` brings it back, and it
-  exits again.
+- **A non-numeric port is not caught**, and it is the case that ends in the
+  traceback. A mistyped port, `mongodb://mongodb:70000/` or
+  `mongodb://mongodb:notaport/`, reaches it directly. An unencoded `?` in
+  the password reaches it the long way round, and in the connection string
+  this project ships it reaches it every time: everything after the `?` is
+  read as the query part, which leaves the rest of the password sitting
+  where the port belongs. Either way the `ValueError` that raises is not a
+  MongoDB error, so nothing catches it. The container exits, `restart:
+  always` brings it back, and it exits again.
 
 There is a third character with no symptom at all here: a `+` neither breaks
 the string nor stops the process, it is silently decoded to a space, so the
@@ -646,7 +647,7 @@ or `stale`. Read the one that is not `ok`:
 
 | Body | Status | Meaning |
 | --- | --- | --- |
-| `{"status": "starting", ..., "gateway": "connecting"}` | 503 | Not connected to the Discord gateway yet. Normal for the first few seconds; the healthcheck allows 60. If it persists, see [restarts in a loop](#without-a-configuration-error). |
+| `{"status": "starting", ..., "gateway": "connecting"}` | 503 | Not connected to the Discord gateway yet, and neither loop field is present. Normal for the first few seconds; the healthcheck allows 60. If it persists, see [restarts in a loop](#without-a-configuration-error). |
 | `..., "star_check": "disabled"` or `"role_sync": "disabled"` | 200 | Healthy. That loop is off, through `AUTOMATIC_CHECK=false` or `ROLE_SYNC_ENABLED=false`. |
 | `..., "star_check": "pending"` or `"role_sync": "pending"` | 200 | Healthy. That loop is on and its first pass has not finished yet, so it carries no age field. |
 | `{"status": "degraded", ..., "star_check": "stale"}` | 503 | Automatic checks are on, but no pass has completed within `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds, counting from startup if none ever has. Look for `Automatic star check failed` in the log: usually GitHub is rate limiting or the database is unreachable. |

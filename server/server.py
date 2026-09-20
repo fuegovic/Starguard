@@ -419,8 +419,12 @@ def main() -> None:
     # it unreachable; what is and is not published is the compose file's job.
     # Bandit prints "nosec encountered (B104), but no failed test" here.
     # That warning is wrong: delete the suppression and B104 fires on the
-    # host line below. A bare "# nosec" silences the warning but would also
-    # hide any future finding on that line, so the scoped form stays.
+    # host line below. An unscoped suppression, one with no test id after
+    # it, silences that warning but would also hide any future finding on
+    # that line, so the scoped form stays. Spelling the unscoped form out
+    # here is not an option either: bandit reads the token wherever it
+    # appears in a comment, prose included, and parses the rest of the
+    # line as test ids, so quoting it printed six warnings of its own.
     #
     # max_request_body_size is the same bound as MAX_CONTENT_LENGTH and has
     # to be stated twice, because the two enforce it in different places.
