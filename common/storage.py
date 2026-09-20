@@ -537,7 +537,15 @@ def link_account(
         raise AccountAlreadyLinkedError(github_id) from exc
 
     wrote_star = collection.update_one(
-        _not_newer_than(horizon, discord_id=discord_id),
+        # Named by the identity above as well as the Discord ID, because
+        # this is a second write and the row can change owner between the
+        # two. Two callbacks for one Discord account carrying different
+        # GitHub accounts interleave exactly there: the other one replaces
+        # the identity, and a filter that knows only the Discord ID would
+        # then write this call's star state onto that account, which never
+        # had its star checked. Not matching is the correct outcome, and
+        # the fall-through below already reads the row back for it.
+        _not_newer_than(horizon, discord_id=discord_id, github_id=github_id),
         {"$set": {"starred_repo": starred}},
     )
     matched: int = getattr(wrote_star, "matched_count", 0)
