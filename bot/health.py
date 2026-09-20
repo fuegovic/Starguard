@@ -42,10 +42,12 @@ log = logging.getLogger("starguard.bot")
 HEALTH_PATH: Final = "/healthz"
 
 # A pass is late rather than broken until three intervals have passed, plus
-# a margin for a cycle that is simply slow on a large repository. The margin
-# is generous for the drain, whose interval is seconds rather than minutes,
-# and that is the right way to be wrong: the number that matters is that
-# there is a ceiling at all.
+# a margin for a cycle that is simply slow on a large repository. The three
+# intervals are what scales with the loop, so the same arithmetic suits both
+# of them; the flat margin is what a drain left on its default of thirty
+# seconds mostly pays, and being generous there is the right way to be
+# wrong, because the number that matters is that there is a ceiling at all
+# rather than where it falls.
 STALE_CYCLE_MULTIPLIER: Final = 3
 STALE_CYCLE_GRACE_SECONDS: Final = 300
 

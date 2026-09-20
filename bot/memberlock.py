@@ -13,9 +13,10 @@ check's own cycle lock. It did keep the sweep and the drain apart, but at
 the wrong granularity and over the wrong span. That lock is held across
 ``fetch_stargazer_listing`` and the whole member sweep, which is minutes on
 a repository with 45,000 stars, so a queued webhook waited out an entire
-cycle whichever member it was about and the configured five to thirty
-second drain interval described nothing that happens. A claim button made
-to wait the same way is a person watching a spinner for minutes.
+cycle whichever member it was about, and ROLE_SYNC_INTERVAL, which
+defaults to thirty seconds and floors at five, described nothing that
+happens. A claim button made to wait the same way is a person watching a
+spinner for minutes.
 
 So the one mutex is split, because it was doing two jobs with different
 scopes and different costs:
