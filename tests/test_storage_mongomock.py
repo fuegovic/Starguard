@@ -481,6 +481,46 @@ def test_a_relink_does_not_write_over_a_star_event_it_did_not_see(users):
     assert document["starred_repo"] is False
 
 
+def test_a_relink_cannot_write_its_star_state_onto_another_identity(users):
+    # Two OAuth callbacks for one Discord account carrying different GitHub
+    # accounts, interleaved between link_account's two statements: A writes
+    # its identity, B replaces it wholesale, and A then writes the star
+    # state it observed. The second statement is what makes this reachable,
+    # because it is a separate write from the identity it belongs to.
+    #
+    # Matching on the Discord ID alone is not enough to own that write. The
+    # row still has the Discord ID, so A's answer lands on B's account and
+    # the row ends up claiming that B stars the repository on the strength
+    # of a check that was run against A. Naming the identity it just wrote
+    # is what ties the two statements together.
+    link(users, "1", 100, "Alice", starred=True)
+
+    original = users.update_one
+    interleaved = []
+
+    def update_one(filter_, update, **kwargs):
+        result = original(filter_, update, **kwargs)
+        # Only after A's identity upsert, which is the one carrying
+        # $setOnInsert, and only once, so B's own writes do not recurse.
+        if not interleaved and "$setOnInsert" in update:
+            interleaved.append(True)
+            link(users, "1", 200, "Bob", starred=False, observed_at=OBSERVED_AT)
+        return result
+
+    users.update_one = update_one
+    try:
+        document = link(users, "1", 100, "Alice", starred=True, observed_at=OBSERVED_AT)
+    finally:
+        users.update_one = original
+
+    row = find_link(users, "1")
+    # B got there second, so B owns both halves of the row.
+    assert row["github_id"] == 200
+    assert row["starred_repo"] is False
+    # And A is told what the row actually holds, not what it tried to write.
+    assert document["starred_repo"] is False
+
+
 def test_a_relink_writes_over_a_star_event_older_than_the_oauth_check(users):
     # A stale event ages out of the way, so re-verifying still repairs a
     # row whose webhook was never delivered.
