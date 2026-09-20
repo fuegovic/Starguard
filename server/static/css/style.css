@@ -4,7 +4,6 @@
   --bg-color-alt: #202020;
   --surface-color: #3a3a3a;
   --text-color: #f5f5f5;
-  --focus-color: #8ab4ff;
   --error-color: #ff8a80;
   --success-color: #7ddf9a;
 }
@@ -15,7 +14,6 @@
     --bg-color-alt: #e4e4e7;
     --surface-color: #ffffff;
     --text-color: #1c1c1e;
-    --focus-color: #1a56db;
     --error-color: #b3261e;
     --success-color: #116533;
   }
@@ -109,12 +107,6 @@ p {
   padding: 1rem 1.5rem;
   border-radius: 0.5rem;
   background-color: var(--surface-color);
-  outline: none;
-}
-
-.message:focus {
-  outline: 3px solid var(--focus-color);
-  outline-offset: 3px;
 }
 
 /* The result message states its outcome in words as well as colour, so the

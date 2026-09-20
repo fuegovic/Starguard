@@ -152,6 +152,12 @@ def _still_stars(entry: MongoDocument, listing: StargazerListing) -> bool:
 class StarChecker:
     """Strips the role from linked users who no longer star the repository."""
 
+    # Three collaborators it is handed and five pieces of state a cycle
+    # leaves behind, one over the default. Splitting it would put the lock,
+    # the count of cycles it guards and the ETag cache it protects into
+    # different objects, which is how two of them get out of step.
+    # pylint: disable=too-many-instance-attributes
+
     def __init__(self, client: Client, config: BotConfig, users: UserCollection | None) -> None:
         self._client = client
         self._config = config
@@ -161,6 +167,14 @@ class StarChecker:
         # was removed twice and the same "sorry to see you go" message was
         # posted twice.
         self._lock = asyncio.Lock()
+        # How many cycles are running or queued behind the lock. Counted
+        # separately from the lock because the role-sync drain holds this
+        # same lock, and testing the lock made /checkstars tell an
+        # administrator a star check was already running when nothing but a
+        # drain was in progress. A count rather than a flag so two callers
+        # cannot clear each other's: the timer loop waits for its turn where
+        # /checkstars refuses to, and both are cycles.
+        self._cycles_in_flight = 0
         # Owned by this checker and only ever touched under the lock above,
         # which is what makes it safe to keep across cycles.
         self._cache = StargazerCache()
@@ -169,8 +183,14 @@ class StarChecker:
 
     @property
     def running(self) -> bool:
-        """Whether a cycle is in progress right now."""
-        return self._lock.locked()
+        """Whether a check cycle is in progress or waiting for its turn.
+
+        Not the same question as whether :attr:`lock` is held, because the
+        role-sync drain holds that lock too. A drain is not a star check,
+        and answering /checkstars as though it were told the administrator
+        something that was not true.
+        """
+        return self._cycles_in_flight > 0
 
     @property
     def lock(self) -> asyncio.Lock:
@@ -198,14 +218,22 @@ class StarChecker:
         stargazers can take minutes, an interaction token is only good for
         fifteen, and the answer the user asked for is being produced right
         now anyway.
+
+        A drain holding the shared lock is not that, and does not raise. It
+        finishes in well under an interaction's lifetime, so waiting for it
+        is the honest answer where claiming a check was running was not.
         """
-        # There is no await between this test and taking the lock, so on a
+        # There is no await between this test and the increment, so on a
         # single event loop the pair cannot interleave with another caller.
-        if not wait and self._lock.locked():
+        if not wait and self.running:
             raise CheckAlreadyRunningError("A star check is already running.")
 
-        async with self._lock:
-            return await self._run_cycle()
+        self._cycles_in_flight += 1
+        try:
+            async with self._lock:
+                return await self._run_cycle()
+        finally:
+            self._cycles_in_flight -= 1
 
     async def run_forever(self) -> None:
         """Re-check every linked user on an interval, forever.
@@ -373,33 +401,49 @@ class StarChecker:
                 False,
                 observed_at,
             )
-            if landed:
-                return True
-
-            # A webhook wrote a newer observation in the window between the
-            # freshness check above and this write, so the write matched
-            # nothing and the row keeps the newer fact. Saying so makes a
-            # race that is otherwise invisible show up in the log.
-            log.info(
-                "A star event overtook the check for %s; leaving the newer state alone.",
-                discord_id,
-            )
-            # The role change has already committed to Discord, on
-            # information this refusal proves was stale, so this cycle owes
-            # the row a reconciliation. See queue_role_sync for why the
-            # same event does not queue anything on its way in.
-            await asyncio.to_thread(
-                queue_role_sync,
-                self._users,  # type: ignore[arg-type]
-                discord_id,
-            )
-            return False
         except PyMongoError as exc:
             log.error("Could not update star state for %s: %s", discord_id, exc)
             # Only the bookkeeping failed. The role really is gone and
             # nothing newer is known about this member, so the cycle still
             # reports the removal it actually made.
             return True
+
+        if landed:
+            return True
+
+        # A webhook wrote a newer observation in the window between the
+        # freshness check above and this write, so the write matched
+        # nothing and the row keeps the newer fact. Saying so makes a
+        # race that is otherwise invisible show up in the log.
+        log.info(
+            "A star event overtook the check for %s; leaving the newer state alone.",
+            discord_id,
+        )
+        # The role change has already committed to Discord, on information
+        # this refusal proves was stale, so this cycle owes the row a
+        # reconciliation. See queue_role_sync for why the same event does
+        # not queue anything on its way in.
+        try:
+            await asyncio.to_thread(
+                queue_role_sync,
+                self._users,  # type: ignore[arg-type]
+                discord_id,
+            )
+        except PyMongoError as exc:
+            # Caught apart from the write above, and deliberately not read
+            # as "the removal stands". This failure leaves the role removed
+            # from somebody the row says stars the repository, with nothing
+            # queued to put it back and no later sweep that would: a sweep
+            # only ever takes roles away. Returning True here announced a
+            # farewell to that member and reported the loss to the
+            # administrator, both about a state the database contradicts.
+            log.error(
+                "Could not queue the role sync for %s after a refused write; "
+                "their role stays removed until they claim it again: %s",
+                discord_id,
+                exc,
+            )
+        return False
 
     def _log_summary(
         self,

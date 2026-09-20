@@ -133,7 +133,16 @@ def register_verification(client: Client, config: BotConfig, users: UserCollecti
             await ctx.send(content=messages.CLAIM_LOOKUP_FAILED, ephemeral=True)
             return
 
-        if not user_entry:
+        # The repository is part of the question, not just the row. An
+        # operator who repoints REPO_OWNER or GITHUB_REPO while keeping the
+        # database leaves rows that say starred_repo about the repository
+        # they used to watch, and that is no evidence at all about the new
+        # one. Without this, everybody who had verified before the move
+        # could claim the role for a repository they have never starred.
+        # Every row a Discord ID can find was written by link_account,
+        # which always stores linked_repo, so this cannot lock out a row
+        # that simply predates the field.
+        if not user_entry or user_entry.get("linked_repo") != config.repo_url:
             await ctx.send(
                 content=messages.CLAIM_NOT_LINKED.format(
                     relink_label=messages.VERIFY_BUTTON_RELINK

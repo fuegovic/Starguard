@@ -134,6 +134,32 @@ def test_check_delay_is_clamped_to_the_minimum(environment):
     assert load_bot_config().check_delay == 300
 
 
+@pytest.mark.parametrize("port", ["70000", "65536", "0"])
+def test_a_health_port_outside_the_range_aborts_startup(environment, port, caplog):
+    # The health endpoint is optional, so serve_health logs a port it
+    # cannot bind and lets the bot carry on. For a number above 65535 that
+    # produced a bot running with nothing listening at all and a container
+    # healthcheck failing every probe for the life of the container,
+    # explained only by one startup line nobody was still looking at.
+    # Refusing to start names the variable while somebody is watching.
+    environment(BOT_HEALTH_PORT=port)
+    with pytest.raises(ConfigError, match="BOT_HEALTH_PORT"):
+        load_bot_config()
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    assert excinfo.value.code == 1
+    assert "BOT_HEALTH_PORT" in caplog.text
+
+
+@pytest.mark.parametrize("port", ["1", "65535"])
+def test_a_health_port_at_either_end_of_the_range_is_accepted(environment, port):
+    # The other half: the check is a range and not something that turns
+    # every deployment that names a port away.
+    environment(BOT_HEALTH_PORT=port)
+    assert load_bot_config().health_port == int(port)
+
+
 def test_links_command_is_skipped_when_unconfigured(environment):
     # Previously the bot registered a command literally named "None" and
     # crashed on buttons with empty URLs.

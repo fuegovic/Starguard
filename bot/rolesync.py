@@ -34,6 +34,7 @@ from common.storage import (
     MongoDocument,
     UserCollection,
     clear_role_sync_pending,
+    clear_role_sync_pending_by_id,
     iter_pending_role_syncs,
 )
 
@@ -55,7 +56,7 @@ DRAIN_ERROR_BACKOFF_MAX_SECONDS: Final = 300
 # What one queued row turned into. Counted rather than logged per row: a
 # popular repository can queue a lot of stars at once and a line each would
 # bury everything else in the log.
-Outcome = Literal["granted", "removed", "settled", "failed"]
+Outcome = Literal["granted", "removed", "settled", "failed", "unusable"]
 
 
 @dataclass(frozen=True)
@@ -65,13 +66,19 @@ class DrainResult:
     ``settled`` rows are deliberately absent: a row Discord already agreed
     with is the ordinary case (a redelivered webhook, or a star the sweep
     reached first) and counting it would only make an uneventful pass look
-    busy. ``examined`` minus the other three is how many there were.
+    busy. ``examined`` minus the other fields is how many there were.
+
+    ``failed`` and ``unusable`` are counted apart because the loop treats
+    them differently. A failure is worth retrying and backing off for; an
+    unusable row is a row nothing here can act on at all, and letting it
+    drive the backoff would slow every other row down on its account.
     """
 
     examined: int = 0
     granted: int = 0
     removed: int = 0
     failed: int = 0
+    unusable: int = 0
 
 
 class RoleSyncDrainer:
@@ -101,13 +108,19 @@ class RoleSyncDrainer:
         the task silently, and nothing ran again until the bot restarted.
         Here that would mean roles that never move, with a webhook the
         operator can see being delivered successfully.
+
+        A pass that completes while leaving rows queued backs off the same
+        way a pass that raised does. Only the raising kind used to, and a
+        Discord refusal is not one: with the role above the bot's in the
+        hierarchy, or the permission missing, every row in a burst fails,
+        stays queued and is resent a few seconds later, forever, holding
+        the shared lock against the sweep each time. Nothing about that
+        recovers faster for being retried at the polling interval.
         """
         while True:
             delay: float
             try:
-                await self.drain_once()
-                self._consecutive_failures = 0
-                delay = self._config.role_sync_interval
+                result = await self.drain_once()
             # CancelledError derives from BaseException, so cancellation
             # still propagates out of this handler and stops the loop.
             except Exception:  # pylint: disable=broad-except
@@ -118,7 +131,31 @@ class RoleSyncDrainer:
                     self._consecutive_failures,
                     delay,
                 )
+            else:
+                delay = self._delay_after(result)
             await asyncio.sleep(delay)
+
+    def _delay_after(self, result: DrainResult) -> float:
+        """Return the wait after a pass that finished, and record its outcome.
+
+        No traceback and no ``log.exception`` here: nothing was raised, and
+        each individual failure has already been logged by the row that
+        produced it. What this line adds is that they are not clearing.
+        """
+        if not result.failed:
+            self._consecutive_failures = 0
+            return self._config.role_sync_interval
+
+        self._consecutive_failures += 1
+        delay = self._error_delay()
+        log.warning(
+            "Role sync drain left %s row(s) queued (%s pass(es) in a row); "
+            "retrying in %.0f seconds",
+            result.failed,
+            self._consecutive_failures,
+            delay,
+        )
+        return delay
 
     async def drain_once(self) -> DrainResult:
         """Apply every queued role change once. Returns what it did."""
@@ -174,6 +211,7 @@ class RoleSyncDrainer:
                     granted=outcomes["granted"],
                     removed=outcomes["removed"],
                     failed=outcomes["failed"],
+                    unusable=outcomes["unusable"],
                 )
 
             for entry in batch:
@@ -204,14 +242,32 @@ class RoleSyncDrainer:
         starred = bool(entry.get("starred_repo"))
 
         if not discord_id:
-            # There is nobody to move a role for. The flag comes down all
-            # the same, because leaving it up would have this same unusable
-            # row read, logged and skipped on every poll from now on. Only
-            # rows written by the oldest version, keyed on a GitHub email,
-            # can look like this.
-            log.warning("A queued role sync has no Discord ID; dropping it.")
-            await self._clear(discord_id, starred)
-            return "failed"
+            # There is nobody to move a role for, so the flag comes down
+            # and the row leaves the queue. It has to come down by the
+            # Mongo _id: clear_role_sync_pending is keyed on the Discord ID
+            # this row does not have, and handing it the missing value
+            # searched for the literal string "None". That matched nothing,
+            # so the flag stayed raised, the row came back on the next poll
+            # and the same line claiming it had been dropped was written
+            # every thirty seconds for as long as the bot ran.
+            #
+            # Counted apart from a failure because it is not one. Nothing
+            # was refused and there is nothing to retry, so an unusable row
+            # must not push the loop into the backoff a Discord refusal
+            # earns.
+            #
+            # These rows are commoner than they look, and it is worth being
+            # accurate about where they come from rather than filing them
+            # under "ancient data". From October 2023 until the rebuild,
+            # /login read the Discord ID from an unvalidated query
+            # parameter and stored whatever came back, so an
+            # unauthenticated GET with no id, followed by OAuth, wrote a
+            # null Discord ID. That is nearly three years of releases, and
+            # the signed link token that closed it did not backfill what it
+            # left behind. Null is therefore the shape to expect; an absent
+            # key and an empty string reach here too.
+            await self._clear_unusable(entry)
+            return "unusable"
 
         member = guild.get_member(discord_id)
         if member is None:
@@ -254,6 +310,43 @@ class RoleSyncDrainer:
         await self._clear(discord_id, starred)
         await announce_unstarred(channel, discord_id)
         return "removed"
+
+    async def _clear_unusable(self, entry: MongoDocument) -> None:
+        """Take a row nothing can act on off the queue, and say which.
+
+        Two things set this apart from :meth:`_clear`, and neither is
+        interchangeable with it. It names the row by its Mongo ``_id``,
+        because the Discord ID that method needs is the very thing this row
+        is missing. And it is unconditional, where that method guards on
+        the star state the bot acted on: the guard is there to keep a
+        webhook that landed mid-call from being unqueued, and nothing here
+        talked to Discord about a member that does not exist.
+
+        Warned rather than dropped quietly. This deletes queued work, and
+        the row is the only evidence that a link nobody can use is sitting
+        in the collection, so the line has to carry enough to find it
+        again by hand.
+        """
+        log.warning(
+            "A queued role sync has no Discord ID; clearing it. Mongo _id %r, "
+            "GitHub account %r. There is no member to move a role for. Rows like "
+            "this were left by the releases where /login took the Discord ID from "
+            "an unvalidated query parameter.",
+            entry.get("_id"),
+            entry.get("github_username") or entry.get("github_id"),
+        )
+        try:
+            # Reached only from _drain, so self._users is not None here; see
+            # the note on the iter_pending_role_syncs call there.
+            await asyncio.to_thread(
+                clear_role_sync_pending_by_id,
+                self._users,  # type: ignore[arg-type]
+                entry.get("_id"),
+            )
+        except PyMongoError as exc:
+            # Nothing was going to happen to this row anyway, so a failed
+            # clear costs only the same line again on the next poll.
+            log.error("Could not clear the unusable pending role sync: %s", exc)
 
     async def _clear(self, discord_id: object, starred: bool) -> None:
         """Take a row off the pending queue, now that Discord matches it.

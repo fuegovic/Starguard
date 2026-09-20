@@ -38,13 +38,19 @@ Under Docker this looks like a container that starts and immediately exits,
 with `restart: always` putting it into a restart loop. Read the reason with
 `docker compose logs discord-bot` or `docker compose logs server`.
 
-Three kinds of validation appear below:
+Four kinds of validation appear below:
 
 - **Required.** Unset or blank is a fatal error. Leading and trailing
   whitespace is stripped from every value, so a line of spaces counts as
   blank.
 - **Clamped.** A number below the documented minimum is silently raised to
-  that minimum. This is not an error and is not logged.
+  that minimum. This is not an error and is not logged. Every clamped value
+  is an interval or a duration, where the floor is still a value you can run
+  with.
+- **A TCP port.** `1` to `65535`, and anything outside it is a fatal error
+  naming the variable. Ports are the one number that is not clamped, because
+  a clamped port is a different address rather than a smaller value. This
+  applies to `SERVER_BIND_PORT` and `BOT_HEALTH_PORT`.
 - **Falls back.** An unrecognised value is silently replaced with the default.
   This applies only to `LOG_LEVEL` and `LOG_FORMAT`.
 
@@ -160,9 +166,9 @@ any combination is valid:
 | `AUTOMATIC_CHECK` | `ROLE_SYNC_ENABLED` | Result |
 | --- | --- | --- |
 | `true` | `true` | Recommended with a webhook configured. Role changes land in seconds, and the sweep repairs anything a delivery missed. |
-| `true` | `false` | No webhook configured. Role changes wait for the next sweep, up to `AUTOMATIC_CHECK_DELAY` seconds. |
+| `true` | `false` | No webhook configured. An un-star is acted on at the next sweep, up to `AUTOMATIC_CHECK_DELAY` seconds later. A new star is never acted on automatically at all: the sweep only ever takes the role away, so the member has to sign in with GitHub again. |
 | `false` | `true` | Webhook only. Nothing repairs a delivery that was lost while the server was down, because GitHub does not retry failed deliveries. |
-| `false` | `false` | Nothing happens automatically. Only `/checkstars` and the **Claim your role** button move a role. |
+| `false` | `false` | Nothing happens automatically. Only `/checkstars`, which removes, and the **Claim your role** button, which grants from the star state recorded at sign-in, move a role. |
 
 Turning it off when no webhook is configured costs you nothing either way: the
 queue it polls is empty forever. It is worth turning off only to keep one
@@ -180,8 +186,14 @@ The role sync drain is disabled (ROLE_SYNC_ENABLED=false)
 **Optional.** Read by the bot. Default: `30` (seconds). Whole number,
 **clamped** to a minimum of `5`.
 
-How often the bot looks for queued role changes, and therefore the worst-case
-delay between somebody starring the repository and their role appearing.
+How often the bot looks for queued role changes when it finds none: the idle
+polling interval, not a deadline. A queued change is normally applied within
+one interval of the webhook recording it, but the drain shares a single lock
+with the star check so that the two cannot move the same member's role at
+once, and a sweep over a large repository holds that lock for as long as it
+takes to walk the stargazer listing, which can be minutes. A change queued
+during a sweep waits for the sweep. Nothing is lost while it waits, because
+the flag stays raised until the bot itself lowers it.
 
 This can be seconds where `AUTOMATIC_CHECK_DELAY` has to be an hour, because
 the two do completely different work. A sweep is one GitHub API request per
@@ -290,12 +302,18 @@ system.
 ### `BOT_HEALTH_PORT`
 
 **Optional.** Read by the bot **and by Docker Compose**. Default: `8080`.
-Whole number, **clamped** to a minimum of `1`.
+A TCP port, `1` to `65535`, refused by name at startup rather than clamped,
+exactly as [`SERVER_BIND_PORT`](#server_bind_port) is:
+
+```
+Configuration error: BOT_HEALTH_PORT must be a TCP port between 1 and 65535, got 70000.
+```
 
 The port the health endpoint listens on. Both compose files interpolate this
 into the healthcheck command, so changing it here moves both sides together.
 
-If the port cannot be bound, the bot logs
+If the port is in the range but cannot be bound, because something else holds
+it, the bot logs
 `Could not start the health endpoint on <host>:<port>: <reason>` and carries
 on without it. The bot keeps working; the container is reported unhealthy.
 
@@ -330,10 +348,22 @@ The port published on the **host** machine for the OAuth server. Change it
 freely if something else on the host already uses 5000. The application never
 reads this.
 
+**Both compose files publish it on the loopback interface only**, as
+`127.0.0.1:${SERVER_PORT}:${SERVER_BIND_PORT}`, so nothing off the machine can
+reach the application directly. That is not a restriction in the intended
+setup: `DOMAIN` must be an HTTPS address, so a TLS-terminating proxy is
+required anyway, and a proxy on the same host reaches loopback. If your proxy
+runs on a **different** machine, remove the `127.0.0.1:` from the mapping in
+your own compose file, and set [`TRUSTED_PROXY_COUNT`](#trusted_proxy_count)
+to your real hop count, knowing that the origin is then reachable without TLS
+by anything that can route to it.
+
 ### `SERVER_BIND_PORT`
 
 **Optional.** Read by the server **and by Docker Compose**. Default: `5000`.
-Whole number, **clamped** to a minimum of `1`.
+A TCP port, `1` to `65535`. A value outside that range is **refused by name**
+at startup rather than clamped, because a clamped port is not a smaller
+version of what you asked for, it is a different address.
 
 The port the server listens on **inside** its container. Leave it at 5000
 unless something else in your setup needs that port internally. Both compose
@@ -393,8 +423,15 @@ the callback and the visitor sees `GitHub sign-in failed: <reason>` with HTTP
 
 A GitHub personal access token, used only to list the repository's
 stargazers. **No scopes are needed for a public repository**; `public_repo` is
-enough if you prefer to grant one. A private repository needs a token that can
-read it.
+enough if you prefer to grant one.
+
+**A private repository cannot be made to work by granting this token more.**
+It would let the bot's sweep read the stargazer listing, but the sweep is
+only half of the flow. The server decides whether a member has starred by
+asking GitHub with the **member's own** OAuth token, which carries only
+`read:user` and cannot see a private repository, so GitHub answers 404 and
+the server records "not starred" for everyone. See
+[Step 5 of the installation guide](./installation.md#step-5-create-a-github-personal-access-token).
 
 The listing is fetched 100 stargazers per request. Without a token, GitHub
 allows 60 requests per hour from your server's address, so a single full pass
@@ -448,9 +485,10 @@ is set.
 
 The shared secret GitHub signs each `star` webhook delivery with. Setting it
 turns on the receiver at `POST /webhooks/github`, which is how the server
-learns about a star the moment it happens rather than at the next sweep. The
-same value goes in the **Secret** field of the webhook on GitHub. The full
-setup is
+learns about a star the moment it happens. Without it the server learns about
+a new star only when the member signs in with GitHub again, because the sweep
+only ever takes the role away. The same value goes in the **Secret** field of
+the webhook on GitHub. The full setup is
 [Step 12 of the installation guide](./installation.md#step-12-set-up-the-star-webhook-optional).
 
 **This is a second, separate secret. Do not reuse `SECRET_KEY`.** Generate
@@ -477,11 +515,17 @@ Configuration error: GITHUB_WEBHOOK_SECRET must be at least 16 characters, got 8
 
 The rejected placeholders are the same list as for `SECRET_KEY`.
 
-Every delivery is authenticated by its HMAC and by nothing else. The source
-address and the `User-Agent` are not checked, because both can be forged and
-the signature cannot. A delivery whose signature does not match is answered
-with HTTP 401 and `Invalid signature.`, and the server logs that only at
-`DEBUG`: the route is deliberately not rate limited, so a log line per
+**Treat it as a credential of the same weight as the others.** Every delivery
+is authenticated by this value and by nothing else, so anybody who has it can
+sign a star event claiming any GitHub account starred or un-starred your
+repository, and the server will act on it. Redact it from anything you paste
+into an issue, and if it is ever exposed, generate a new one, put it in both
+`.env` and the hook's **Secret** field on GitHub, and restart the server.
+
+The source address and the `User-Agent` are not checked, because both can be
+forged and the signature cannot. A delivery whose signature does not match is
+answered with HTTP 401 and `Invalid signature.`, and the server logs that
+only at `DEBUG`: the route is deliberately not rate limited, so a log line per
 rejected request would be a way to fill your disk from outside. GitHub's own
 delivery log is where you read those, not yours. See
 [the webhook section of the troubleshooting
@@ -508,26 +552,40 @@ change this value the message will no longer match. Edit
 ### `TRUSTED_PROXY_COUNT`
 
 **Optional.** Read by the server. Default: `1`. Whole number, **clamped** to a
-minimum of `1`.
+minimum of `0`.
 
 How many reverse proxies **you operate** sit directly in front of the server.
 The server passes this to Werkzeug's `ProxyFix`, which rewrites the request's
 scheme, host and client address from the last N entries of the
 `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` headers. Two
 things depend on getting it right: the OAuth `redirect_uri` is rebuilt as
-`https://` from the forwarded scheme, and the per-address rate limit on
-`/login` and `/authorize` keys on the resulting client address.
+`https://` from the forwarded scheme, and the rate limit on `/login` and
+`/authorize` keys on the resulting client address.
 
 Count the hops, starting at the server and working outwards, that you control:
 
 | Your setup | Value |
 | --- | --- |
+| Nothing in front: you removed the `127.0.0.1:` from the port mapping and clients reach the container directly | `0` |
 | The bundled Nginx Proxy Manager from `docker-compose.alt.yml`, nothing in front of it | `1` |
 | Your own Nginx, Caddy or Traefik in front of the container | `1` |
 | A CDN or load balancer (Cloudflare, an ALB) in front of your own proxy | `2` |
 | Two of your own proxies plus a CDN | `3` |
 
 Do not count proxies that are not yours, and do not count the client.
+
+`0` is not a hop count but an instruction: install no `ProxyFix` at all and
+believe no forwarded header. Use it whenever a client can reach the server's
+port without passing through something you run. With even one trusted hop,
+such a client can put any address it likes in `X-Forwarded-For` and take a
+fresh rate-limit bucket for every request.
+
+Out of the box that cannot happen, because both compose files publish the
+port as `127.0.0.1:${SERVER_PORT}:${SERVER_BIND_PORT}` and only something on
+the same host can reach it. `1` is therefore the right default. If you widen
+that mapping so the container is reachable from elsewhere, decide again: `0`
+if clients arrive directly, your hop count if they still pass through a proxy
+you run.
 
 Setting it **too low** means every visitor behind your own proxy is seen as
 that proxy's address, so one busy proxy trips the rate limit for everyone.
@@ -536,20 +594,59 @@ from the right, so a client that prepends forged entries to `X-Forwarded-For`
 can make the server read an address the client chose, defeating the rate limit
 entirely and putting a value of the attacker's choosing into the logs.
 
-If you are unsure, start at `1`, make a request through your real front door,
-and check the address the server logged for it.
+**How to check what the server actually resolved.** Nothing is logged for an
+ordinary request, so a single visit tells you nothing. The client address
+appears in exactly one line, the one written when the rate limit refuses a
+request, so the way to see it is to trip the limit on purpose from a machine
+that reaches the server the way a real member does:
+
+```sh
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w '%{http_code}\n' 'https://starguard.example.com/login?token=x'
+done
+```
+
+The first ten answer 400, because the token is nonsense, and the rest answer
+429. Then read the server's log:
+
+```sh
+docker compose logs -n 20 server | grep 'Rate limited'
+```
+
+```
+Rate limited login for 203.0.113.7
+```
+
+That address is what `TRUSTED_PROXY_COUNT` resolved to. Compare it with the
+public address of the machine you ran `curl` on. If it is your proxy's
+address, or a container address such as `172.18.0.1`, the value is too low.
+If it matches the client, it is right. Wait out
+`LOGIN_RATE_LIMIT_WINDOW` afterwards, or restart the server, since the
+limiter is held in memory.
+
+Do the same check from a second machine if you can: two different clients
+must produce two different addresses. One address for both is the collapse
+that too low a value causes, and it is invisible from a single client.
 
 ### `LOGIN_RATE_LIMIT`
 
 **Optional.** Read by the server. Default: `10`. Whole number, **clamped** to
 a minimum of `1`.
 
-How many requests to `/login` and `/authorize` a single client address may
-make within `LOGIN_RATE_LIMIT_WINDOW`. Over the limit, the visitor gets HTTP
-429 with a `Retry-After` header and the page
+How many requests a single client address may make within
+`LOGIN_RATE_LIMIT_WINDOW`. Over the limit, the visitor gets HTTP 429 with a
+`Retry-After` header and the page
 `Too many verification attempts from your address. Please wait a moment and
 try again.`, and the server logs
 `Rate limited <endpoint> for <address>`.
+
+**`/login` and `/authorize` are counted separately**, one bucket per route
+per address, so the default of `10` is ten of each rather than ten between
+them. One verification is one request to each, so it spends one of the ten on
+each side. A shared bucket would charge an ordinary flow twice, and
+`LOGIN_RATE_LIMIT=1` would then refuse the callback of the single attempt it
+had just allowed. Only these two routes are limited at all; `/healthz`, the
+landing page and the webhook receiver are not.
 
 The limiter is a sliding window held in memory by the single server process.
 It resets when the server restarts, and it counts per process rather than
@@ -592,12 +689,23 @@ the user in `starguard` and authentication would start failing. Saying
 If the password contains any of `: / ? # [ ] @`, percent-encode it, or use a
 password that avoids them.
 
-Neither process refuses to start when MongoDB is unreachable. Both log
-`Could not prepare the users collection: <reason>` and keep going, and each
-database operation then fails as it is attempted. A connection string the
-driver cannot parse at all is different: that one is logged as
-`Error connecting to MongoDB: <reason>` and leaves the server answering
-`/healthz` with 503. See
+Neither process refuses to start when MongoDB is unreachable. Both attempt
+four pieces of startup work, each reported by name when it fails, and keep
+going:
+
+```
+Could not index the users collection: <reason>
+Could not index the deliveries collection: <reason>
+Could not purge credentials written by older versions: <reason>
+Could not upgrade user records: <reason>
+```
+
+Each database operation then fails as it is attempted. A connection string
+the driver cannot parse at all is different: that one is logged as
+`Error connecting to MongoDB: <reason>` and no client is built. The server's
+`/healthz` answers 503 in **both** cases, because it sends a `ping` to
+MongoDB on every probe rather than assuming a client that exists is a
+database that answers. See
 [MongoDB connection and authentication failures](./troubleshooting.md#mongodb-connection-and-authentication-failures).
 
 ### `MONGO_DATABASE`
@@ -608,8 +716,13 @@ driver cannot parse at all is different: that one is logged as
 The database name. Starguard uses two collections inside it: `users`, one
 document per verified member, and `webhook_deliveries`, which remembers the id
 of each webhook delivery for ten minutes so a redelivered one is not acted on
-twice. The second is created on demand and its rows expire by themselves; it
-is empty on an installation with no webhook configured.
+twice.
+
+**Both are created and indexed at every startup**, whether or not a webhook
+is configured, so a database user that can write only one of them logs a
+failure for the other. On an installation with no webhook,
+`webhook_deliveries` exists and stays empty. Its rows expire by themselves,
+through a TTL index, so nothing has to clean it up.
 
 ### `MONGO_INITDB_ROOT_USERNAME`
 

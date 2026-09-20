@@ -153,10 +153,16 @@ def serve_health(
     current value rather than a copy taken at startup. Returns None when the
     port cannot be bound: a missing health endpoint must not stop the bot
     from doing its actual job.
+
+    OverflowError is caught alongside OSError because it is not one, and
+    bind raises it rather than an OSError for a port above 65535. Nothing
+    validates BOT_HEALTH_PORT against that ceiling, so catching only OSError
+    meant a single mistyped digit killed the whole bot before it reached the
+    gateway, over an endpoint that is documented as optional.
     """
     try:
         server = ThreadingHTTPServer((host, port), _handler_class(state, last_completed))
-    except OSError as exc:
+    except (OSError, OverflowError) as exc:
         log.error("Could not start the health endpoint on %s:%s: %s", host, port, exc)
         return None
 

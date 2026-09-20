@@ -19,6 +19,7 @@ from common.storage import (
     all_links,
     claim_delivery,
     clear_role_sync_pending,
+    clear_role_sync_pending_by_id,
     connect,
     find_link,
     find_link_by_github_id,
@@ -28,6 +29,7 @@ from common.storage import (
     purge_legacy_secrets,
     read_updated_at,
     record_star_event,
+    release_delivery,
     set_starred,
     star_event_is_newer,
 )
@@ -191,6 +193,82 @@ def test_a_github_account_cannot_be_reused_by_another_discord_user():
     assert find_link(collection, "1")["discord_id"] == "1"
 
 
+def test_a_legacy_row_with_no_id_still_reserves_its_github_account():
+    # Rows written before github_id was recorded cannot be found by it,
+    # and one of them is still a link and still holds the role. Without a
+    # second lookup the same GitHub account authenticates for another
+    # Discord ID and gets a row of its own, so one star earns the role
+    # twice for as long as the original member does not re-verify.
+    collection = FakeCollection(
+        [{"discord_id": "1", "github_username": "Octocat", "github_username_lower": "octocat"}]
+    )
+
+    with pytest.raises(AccountAlreadyLinkedError) as excinfo:
+        link(collection, "2", 100, "Octocat")
+
+    assert excinfo.value.existing_discord_id == "1"
+    assert len(collection.documents) == 1
+
+
+def test_the_owner_of_a_legacy_row_re_verifies_into_it():
+    # The same lookup must not lock somebody out of their own row, which
+    # is how a legacy row gets its id and stops being ambiguous at all.
+    collection = FakeCollection(
+        [{"discord_id": "1", "github_username": "Octocat", "github_username_lower": "octocat"}]
+    )
+
+    link(collection, "1", 100, "Octocat")
+
+    assert len(collection.documents) == 1
+    assert find_link(collection, "1")["github_id"] == 100
+
+
+@pytest.mark.parametrize(
+    "orphan",
+    # Null is the shape production actually holds: every server from
+    # 2023-10-28 until the rebuild read the Discord ID off the query
+    # string unvalidated and wrote it, so a bare GET to /login with no
+    # id, followed by OAuth, stored one of these. Missing is the
+    # one-day schema before that field existed at all.
+    [{}, {"discord_id": None}, {"discord_id": ""}],
+    ids=["missing", "null", "empty"],
+)
+def test_a_legacy_row_that_names_no_discord_user_does_not_block_a_link(orphan):
+    # The other half of the lookup above, and the reason it checks the
+    # Discord ID rather than trusting the name match. Nothing can hold a
+    # role for a row that names no Discord user, whichever of the three
+    # shapes it is, so it is not a competing claim on the star. Blocking
+    # would
+    # hold the GitHub account hostage to a row that redeems nothing, and
+    # tell its rightful owner it is already linked to Discord ID None.
+    collection = FakeCollection(
+        [{**orphan, "github_username": "Octocat", "github_username_lower": "octocat"}]
+    )
+
+    document = link(collection, "1", 100, "Octocat")
+
+    assert document["discord_id"] == "1"
+    assert find_link(collection, "1")["github_id"] == 100
+    # The orphan is left where it was. Nothing here can say whose it was.
+    assert len(collection.documents) == 2
+
+
+def test_a_login_its_previous_owner_gave_up_is_not_refused():
+    # The false rejection the lookup has to avoid. A login is not
+    # immutable: renaming a GitHub account leaves the old one free for
+    # somebody else to register. The row that still records that spelling
+    # has a github_id, so it has already been ruled out on the one field
+    # that cannot change, and matching it by name would refuse the new
+    # owner a link they are entitled to.
+    collection = FakeCollection()
+    link(collection, "1", 999, "Octocat")
+
+    link(collection, "2", 100, "Octocat")
+
+    assert len(collection.documents) == 2
+    assert find_link(collection, "2")["github_id"] == 100
+
+
 def test_different_github_accounts_coexist():
     collection = FakeCollection()
     link(collection, "1", 100, "one")
@@ -339,6 +417,46 @@ def test_an_event_that_does_move_the_state_queues_the_bot():
     assert updated["role_sync_pending"] is True
 
 
+def test_a_delivery_that_arrives_behind_a_newer_one_is_not_recorded():
+    # Deliveries are not ordered, and GitHub retries the ones whose
+    # response it did not see, so an older event can reach this after a
+    # newer one has already been recorded. It reports the row as it
+    # stands rather than winding it back.
+    collection = FakeCollection()
+    link(collection, "1", 100, "Octocat", starred=False)
+    later = WHEN + timedelta(seconds=1)
+    record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, later)
+
+    outcome = record_star_event(collection, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
+
+    assert outcome["starred_repo"] is False
+    assert outcome["star_event_at"] == later
+    assert not list(iter_pending_role_syncs(collection))
+
+
+def test_an_overtaken_delivery_does_not_write_its_older_state():
+    # The interleaving itself, driven rather than hoped for. From a row
+    # that says un-starred, the star delivery is the older event and the
+    # un-star the newer one, and the star's write lands last. Deciding
+    # from a read taken before the un-star ran left the row saying
+    # starred with work queued, and the bot then handed out the role for
+    # a star that had already been taken back.
+    collection = InterleavingCollection()
+    link(collection, "1", 100, "Octocat", starred=False)
+    later = WHEN + timedelta(seconds=1)
+    collection.before_first_write(
+        lambda: record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, later)
+    )
+
+    outcome = record_star_event(collection, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
+
+    assert outcome["starred_repo"] is False
+    row = find_link(collection, "1")
+    assert row["starred_repo"] is False
+    assert row["star_event_at"] == later
+    assert not list(iter_pending_role_syncs(collection))
+
+
 def test_a_star_event_from_somebody_who_never_verified_is_silent():
     # Most star events are these: no row, nothing written, nothing said.
     collection = FakeCollection()
@@ -363,6 +481,61 @@ def test_the_pending_queue_streams_rather_than_building_a_list():
     assert next(rows)["discord_id"] == "1"
     with pytest.raises(StopIteration):
         next(rows)
+
+
+@pytest.mark.parametrize(
+    "orphan",
+    # The two shapes that are genuinely stuck. Null is the one released
+    # code produced for nearly three years, from an unvalidated Discord
+    # ID written straight through; missing is the schema of the day
+    # before that field existed. The empty string is not here on
+    # purpose: see the test below for why it proves nothing.
+    [{}, {"discord_id": None}],
+    ids=["missing", "null"],
+)
+def test_a_row_with_no_discord_id_is_cleared_by_its_mongo_id(orphan):
+    collection = FakeCollection(
+        [{**orphan, "_id": "row-1", "starred_repo": True, "role_sync_pending": True}]
+    )
+    queued = next(iter_pending_role_syncs(collection))
+
+    # What the drain can reach with the Discord-keyed clear: nothing. It
+    # stringifies what it is handed, so the filter asks for the literal
+    # "None" and the row is read and reported again on every poll for as
+    # long as the process runs.
+    clear_role_sync_pending(collection, queued.get("discord_id"), True)
+    assert [row["_id"] for row in iter_pending_role_syncs(collection)] == ["row-1"]
+
+    clear_role_sync_pending_by_id(collection, queued["_id"])
+
+    assert not list(iter_pending_role_syncs(collection))
+
+
+def test_an_empty_discord_id_was_never_the_row_that_got_stuck():
+    # Why the case above excludes it, written down rather than left to
+    # be rediscovered. An empty string round-trips through str(), so the
+    # Discord-keyed clear matches and the row comes off the queue on its
+    # own. A regression test built on this shape passes without the by-id
+    # clear existing at all, which is how the real bug survived one.
+    collection = FakeCollection(
+        [{"_id": "row-1", "discord_id": "", "starred_repo": True, "role_sync_pending": True}]
+    )
+
+    clear_role_sync_pending(collection, "", True)
+
+    assert not list(iter_pending_role_syncs(collection))
+
+
+def test_clearing_by_id_does_not_need_the_star_state_to_match():
+    # The guard the Discord-keyed clear carries is against a webhook
+    # moving the row while the bot talked to Discord. Nothing talked to
+    # Discord about a member that does not exist, so here it would only
+    # be a second way to match nothing.
+    collection = FakeCollection([{"_id": "row-1", "role_sync_pending": True}])
+
+    clear_role_sync_pending_by_id(collection, "row-1")
+
+    assert not list(iter_pending_role_syncs(collection))
 
 
 def test_clearing_the_flag_takes_the_row_off_the_queue():
@@ -477,7 +650,11 @@ def test_an_ordinary_row_no_webhook_has_touched_is_written_normally():
     [
         (None, False),
         (SWEPT_AT - timedelta(seconds=1), False),
-        (SWEPT_AT, False),
+        # The last stored instant that can only have happened before the
+        # listing was taken. Anything after this shares a millisecond with
+        # it, which the database cannot tell apart from after it.
+        (SWEPT_AT - timedelta(milliseconds=1), False),
+        (SWEPT_AT, True),
         (SWEPT_AT + timedelta(seconds=1), True),
         # What the driver hands back: BSON dates are UTC but arrive naive.
         # Comparing one of those against an aware instant raises, which
@@ -488,6 +665,20 @@ def test_an_ordinary_row_no_webhook_has_touched_is_written_normally():
 def test_star_event_is_newer_reads_the_boundary_the_sweep_depends_on(stored, expected):
     document = {"discord_id": "1"} if stored is None else {"star_event_at": stored}
     assert star_event_is_newer(document, SWEPT_AT) is expected
+
+
+def test_a_star_event_in_the_listings_own_millisecond_counts_as_newer():
+    # BSON holds a datetime as whole milliseconds, so a star event stamped
+    # a few hundred microseconds after the listing was taken is stored as
+    # having happened before it. Comparing that stored value against the
+    # sweep's own microseconds read it as older, and the sweep then took
+    # the role and wrote its stale state over the newer one.
+    observed_at = SWEPT_AT + timedelta(microseconds=500)
+    # What the database kept of a webhook that landed at .000900.
+    assert star_event_is_newer({"star_event_at": SWEPT_AT}, observed_at) is True
+    # A whole millisecond earlier is unambiguous, and still the sweep's.
+    earlier = SWEPT_AT - timedelta(milliseconds=1)
+    assert star_event_is_newer({"star_event_at": earlier}, observed_at) is False
 
 
 def test_the_sweep_does_not_queue_a_role_sync():
@@ -508,6 +699,49 @@ def test_different_delivery_ids_are_claimed_independently():
     deliveries = FakeDeliveryCollection()
     assert claim_delivery(deliveries, "abc", WHEN) is True
     assert claim_delivery(deliveries, "def", WHEN) is True
+
+
+def test_a_released_delivery_is_new_work_again():
+    # The receiver claims a delivery before it records anything, so a
+    # delivery whose recording failed is claimed and unrecorded at once.
+    # Leaving the claim standing turns the operator's manual redelivery,
+    # which is the documented recovery, into "already handled".
+    deliveries = FakeDeliveryCollection()
+    assert claim_delivery(deliveries, "abc", WHEN) is True
+
+    release_delivery(deliveries, "abc")
+
+    assert claim_delivery(deliveries, "abc", WHEN) is True
+
+
+def test_releasing_one_delivery_leaves_the_others_claimed():
+    deliveries = FakeDeliveryCollection()
+    claim_delivery(deliveries, "abc", WHEN)
+    claim_delivery(deliveries, "def", WHEN)
+
+    release_delivery(deliveries, "abc")
+
+    assert claim_delivery(deliveries, "def", WHEN) is False
+    assert claim_delivery(deliveries, "abc", WHEN) is True
+
+
+def test_releasing_a_delivery_nobody_claimed_does_nothing():
+    # The caller releases on a failure path and cannot always know which
+    # side of the claim it failed on.
+    deliveries = FakeDeliveryCollection()
+    release_delivery(deliveries, "never-seen")
+    assert deliveries.documents == []
+
+
+def test_a_delivery_id_is_released_as_the_string_it_was_claimed_as():
+    # Both ends normalise here rather than at the call site, so the
+    # release names the row the claim wrote whatever the caller holds.
+    deliveries = FakeDeliveryCollection()
+    claim_delivery(deliveries, 17, WHEN)
+
+    release_delivery(deliveries, "17")
+
+    assert deliveries.documents == []
 
 
 def test_a_delivery_id_is_stored_as_a_string():
@@ -536,11 +770,41 @@ class RecordingCollection(FakeCollection):
         return kwargs.get("name")
 
 
+class UnpurgeableCollection(RecordingCollection):
+    """A collection the credential purge is not allowed to write to."""
+
+    def update_many(self, query, update):
+        raise PyMongoError("not authorized on starguard to execute update")
+
+
 class RacingCollection(FakeCollection):
     """A collection that loses the race to a concurrent link."""
 
     def update_one(self, query, update, upsert=False):
         raise DuplicateKeyError("github_id_unique")
+
+
+class InterleavingCollection(FakeCollection):
+    """A collection that lets a second delivery run inside the first.
+
+    Two deliveries for the same account racing each other is not a thing
+    to hope a test reproduces. The hook runs once, immediately before the
+    first write statement, which is the point the losing delivery used to
+    have already decided what it was going to write.
+    """
+
+    def __init__(self, documents=None):
+        super().__init__(documents)
+        self._hook = None
+
+    def before_first_write(self, hook):
+        self._hook = hook
+
+    def find_one_and_update(self, query, update, projection=None, return_document=None):
+        if self._hook is not None:
+            hook, self._hook = self._hook, None
+            hook()
+        return super().find_one_and_update(query, update, projection, return_document)
 
 
 class FakeDeliveryCollection(FakeCollection):
@@ -551,6 +815,13 @@ class FakeDeliveryCollection(FakeCollection):
             raise DuplicateKeyError("delivery_id_unique")
         self.documents.append(dict(document))
 
+    def delete_one(self, query):
+        for index, document in enumerate(self.documents):
+            if matches(document, query):
+                del self.documents[index]
+                return None
+        return None
+
 
 class FakeDatabase(dict):
     """Enough of a pymongo database to walk to a collection by name."""
@@ -560,8 +831,8 @@ class FakeDatabase(dict):
         return created
 
 
-def mongo_factory(collection):
-    """A client_factory that hands connect() the collection given here."""
+def mongo_factory(collection, deliveries=None):
+    """A client_factory that hands connect() the collections given here."""
 
     class FakeMongoClient:
         """Enough of a MongoClient for connect() to walk to a collection."""
@@ -570,6 +841,8 @@ def mongo_factory(collection):
             self.host = host
             self.database_name = None
             self.database = FakeDatabase({COLLECTION_NAME: collection})
+            if deliveries is not None:
+                self.database[DELIVERY_COLLECTION_NAME] = deliveries
 
         def get_database(self, name):
             self.database_name = name
@@ -636,6 +909,67 @@ def test_a_database_that_refuses_the_preparation_still_yields_a_collection(caplo
 
     assert users is collection
     assert "not primary" in caplog.text
+
+
+def legacy_row_holding_a_token():
+    """One row from the version that stored OAuth tokens in clear text."""
+    return {
+        "_id": "row-1",
+        "discord_id": "1",
+        "github_username": "OldUser",
+        "github_token": {"access_token": "gho_leaked", "scope": "repo"},
+    }
+
+
+def test_an_index_that_cannot_be_created_does_not_skip_the_purge(caplog):
+    # The pairing that makes this more than bookkeeping. A collection
+    # carrying rows from the version that keyed on the GitHub email holds
+    # several rows per Discord account, so the unique discord_id index is
+    # exactly what fails, on exactly the upgrade that also has to delete
+    # that version's stored tokens. One shared try meant the index error
+    # skipped the purge and the tokens stayed in the database.
+    collection = RecordingCollection(
+        [legacy_row_holding_a_token()],
+        index_error=DuplicateKeyError("discord_id_unique"),
+    )
+
+    with caplog.at_level("WARNING", logger="common.storage"):
+        connect("mongodb://db/", "starguard", mongo_factory(collection))
+
+    assert "github_token" not in collection.documents[0]
+    assert collection.documents[0]["schema_version"] == SCHEMA_VERSION
+    # And the operator is told which step it was, rather than that
+    # something about the collection did not work.
+    assert "index the users collection" in caplog.text
+
+
+def test_a_delivery_index_that_cannot_be_created_does_not_skip_the_purge(caplog):
+    # The deliveries collection is new in this version, so the permission
+    # to create it is the one an upgraded deployment is most likely to be
+    # missing. Preparing it must not cost the users collection the
+    # maintenance the upgrade is for.
+    collection = RecordingCollection([legacy_row_holding_a_token()])
+    deliveries = RecordingCollection(index_error=PyMongoError("not authorized"))
+
+    with caplog.at_level("WARNING", logger="common.storage"):
+        connect("mongodb://db/", "starguard", mongo_factory(collection, deliveries))
+
+    assert "discord_id_unique" in collection.indexes
+    assert "github_token" not in collection.documents[0]
+    assert collection.documents[0]["schema_version"] == SCHEMA_VERSION
+    assert "index the deliveries collection" in caplog.text
+
+
+def test_a_purge_that_cannot_run_does_not_skip_the_upgrade(caplog):
+    # The general property, rather than the two pairs above: every step
+    # is attempted, whichever of them the database refuses.
+    collection = UnpurgeableCollection([{"_id": "row-1", "discord_id": "1"}])
+
+    with caplog.at_level("WARNING", logger="common.storage"):
+        connect("mongodb://db/", "starguard", mongo_factory(collection))
+
+    assert collection.documents[0]["schema_version"] == SCHEMA_VERSION
+    assert "purge credentials written by older versions" in caplog.text
 
 
 def test_losing_the_race_to_link_a_github_account_is_not_a_crash():

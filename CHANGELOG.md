@@ -68,9 +68,106 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already linked their account and then starred had to go back through the
   GitHub sign-in before the button would grant them anything. The button is
   unchanged and is still how the first-time flow ends.
+- The result page shown to a member who has not starred yet now tells them to
+  run `/verify` again rather than to claim their role. Claiming reads the star
+  state recorded during sign-in, and without the optional webhook nothing
+  turns a recorded false back into true, so the old wording failed for
+  precisely the person who followed it.
+- The result page's message no longer sets `aria-live` alongside `role` or
+  takes focus. The two roles already imply the right live region, and moving
+  focus opened a second, competing announcement path.
+- **Documented: private repositories are not supported.** A `repo`-scoped
+  `GITHUB_TOKEN` lets the bot's sweep list a private repository's stargazers,
+  but the OAuth callback asks GitHub whether the member starred it using the
+  member's own token, which carries only `read:user` and cannot see a private
+  repository. GitHub answers 404, which means "not starred", so every member
+  fails verification. Nothing changed in the code; the limitation is now
+  stated in the installation and environment guides rather than implied away
+  by a mention of the `repo` scope.
 
 ### Fixed
 
+- **A GitHub outage no longer records that a member has not starred the
+  repository.** The callback read any answer other than 204 from the starred
+  check as "not starred", so a 401, a 403, a 429 or a 5xx during an outage
+  overwrote a true star with a false one and sent the member off to star a
+  repository they had already starred. There are exactly two answers, 204 and
+  404; anything else is now reported as HTTP 502 `Could not read your GitHub
+  profile. Please try again.` and nothing is written.
+- **The server's `/healthz` now reaches the database.** It sends a `ping` on
+  every probe instead of treating the existence of a client object as proof of
+  a connection, so an unreachable or refusing MongoDB answers 503 rather than
+  a green 200 that kept the container in service while every verification
+  failed at the last step.
+- **`/login` and `/authorize` are rate limited in separate buckets.** One
+  verification is one request to each, and a single bucket charged an ordinary
+  flow twice: `LOGIN_RATE_LIMIT=1` refused the callback of the one attempt it
+  had just allowed, and the default of 10 permitted five verifications a
+  minute rather than ten.
+- **`TRUSTED_PROXY_COUNT=0` now means what it says.** The floor used to be 1,
+  so an operator writing 0 to say "nothing is in front of me" was clamped back
+  up to trusting one hop of `X-Forwarded-For`, which anybody reaching the
+  published port can send. Zero now installs no `ProxyFix` at all and believes
+  no forwarded header.
+- **The un-star check no longer strips the role from everybody on a newly
+  opened page.** Stargazers come back oldest first, so a star that lands on a
+  full final page opens a new one without changing the page before it: the
+  ETag still matched, GitHub answered 304, and the cached "no next page" ended
+  the walk one page early, which read as though everyone on the new page had
+  un-starred. A full final page is no longer cached.
+- **A star webhook delivery that failed can be redelivered immediately.** The
+  receiver claims a delivery id before acting on it and drops a repeat of a
+  claimed id, but a delivery whose database write was refused never completed,
+  so the claim is now released and the redelivery is treated as new work
+  instead of being answered `Already handled.` for ten minutes, which is the
+  documented recovery from exactly that failure.
+- **A star webhook delivery that arrives behind a newer one no longer
+  overwrites it.** Deliveries are not ordered, so an old `deleted` could land
+  after a new `created` and take back a role the member had just earned. Such
+  a delivery is now refused and answered 202 with `Superseded by a newer
+  event.`, leaving the row holding the newer state. Whether the star state
+  moved is also decided by the write itself rather than by a read taken a
+  moment earlier, so two deliveries racing cannot queue a role change for the
+  older of the two events.
+- **The sweep no longer writes stale state over a webhook's.** A cycle over a
+  large repository takes minutes, and a star recorded during the crawl used to
+  be overwritten when the sweep reached that row, leaving a member who had
+  starred with no role and a database that agreed with itself for ever after.
+  Every write the sweep makes is now conditional on no newer star event having
+  reached the row, and a refused write hands the row to the role-sync drain to
+  reconcile.
+- **A GitHub account linked by a very old version can no longer be linked a
+  second time.** The check for an existing link looked only at the numeric
+  account id, which the oldest rows do not carry, so the same GitHub account
+  could take a second row under another Discord ID until the original member
+  happened to re-verify.
+- The legacy-secret purge, the schema upgrade and the two index creations at
+  startup are now attempted independently. They shared one `try`, and the
+  pairing was the worst available: a collection carrying rows from the version
+  keyed on the GitHub email raises on the unique `discord_id` index, which
+  took the purge of that same version's stored OAuth tokens down with it. Each
+  step now reports itself by name, as `Could not index the users collection`,
+  `Could not index the deliveries collection`, `Could not purge credentials
+  written by older versions` or `Could not upgrade user records`.
+- `/checkstars` no longer fails to answer when a sweep removed enough roles
+  for the list of names to exceed Discord's 2000 character limit. The list is
+  shortened with an exact count of what was left out; the roles had already
+  been removed, so failing the reply reported work that did happen as a
+  failure.
+- The primary GitHub rate limit is no longer retried. It wears a retryable
+  status but takes up to an hour to clear, so the bot slept out three
+  `Retry-After` waits before reporting the exhaustion it could have reported
+  at once.
+- `SERVER_BIND_PORT` and `BOT_HEALTH_PORT` are validated as TCP ports and
+  refused by name when they are outside 1 to 65535. A clamped port is a
+  different address rather than a smaller value, and `BOT_HEALTH_PORT=70000`
+  used to kill the bot outright with an `OverflowError` from `bind`, over an
+  endpoint that is optional.
+- A queued role change for a row with no Discord ID, which only the version
+  keyed on the GitHub email could have written, is now taken off the queue by
+  its database id. The flag could not be lowered by a Discord ID the row does
+  not have, so the same line was logged every thirty seconds for the life of
+  the process.
 - `/starcount` no longer raises a `TypeError` when GitHub rate-limits the
   request.
 - The periodic star check no longer dies silently when a verified member has
@@ -95,6 +192,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Claiming the role now requires a link made for the repository you have
+  configured.** The claim button read only `starred_repo`, which proved that
+  somebody had starred *some* repository at some point, so an operator who
+  repointed `REPO_OWNER` or `GITHUB_REPO` while keeping the database silently
+  handed the new role to everyone who had starred the **old** one, none of
+  whom had starred the new one, with nothing in the logs to show it. Each row
+  records the repository it was created against and the two are now compared.
+  **The necessary consequence: after changing either variable, every member
+  must run `/verify` and sign in again before they can claim.** Nothing is
+  deleted or rewritten, so restoring the old values restores the old rows.
+- **The OAuth server's port is now published on the loopback interface only**,
+  as `127.0.0.1:${SERVER_PORT}:${SERVER_BIND_PORT}`, in both compose files.
+  Published on every interface, a client could skip the reverse proxy, reach
+  `ProxyFix` directly and hand itself any `X-Forwarded-For` it liked, taking a
+  fresh rate-limit bucket for every request; it also left an origin speaking
+  plain HTTP open to anything that could route to it. A proxy on the same host
+  is unaffected. **If your reverse proxy runs on another machine, this breaks
+  your deployment until you remove the `127.0.0.1:` from the mapping** and set
+  `TRUSTED_PROXY_COUNT` to your real hop count.
+- `GITHUB_WEBHOOK_SECRET` is now named in the redaction guidance, in
+  `.env.example`, the environment reference and the troubleshooting guide. It
+  is the only thing authenticating a star event, so anybody holding it can
+  forge one for any account, and it was missing from the list of values to
+  remove before pasting logs into an issue while the guide asked operators to
+  print it.
 - Reduced the requested GitHub OAuth scope from `repo` to `read:user`. The
   old scope granted read and write access to every private repository a
   verifying user owns.

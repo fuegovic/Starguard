@@ -107,10 +107,13 @@ requests, so pages that have not changed cost nothing against the GitHub rate
 limit.
 
 **The webhook is optional and Starguard works without it.** Set no
-`GITHUB_WEBHOOK_SECRET` and the receiver is never registered; the periodic
-check above is then the only thing that notices a star changing, which is
-slower and costs one GitHub API request per 100 stargazers on every pass. Set
-it and most changes arrive for free, in seconds.
+`GITHUB_WEBHOOK_SECRET` and the receiver is never registered. The periodic
+check is then the only automatic mechanism, and it works in one direction
+only: it **removes** the role from anyone who has left the stargazer listing,
+and it never grants one, so a member who stars after verifying has to sign in
+with GitHub again before the role can be claimed. It also costs one GitHub API
+request per 100 stargazers on every pass. Set the secret and both directions
+arrive on their own, in seconds and for free.
 
 The periodic check stays on either way. [GitHub does not automatically retry
 a failed
@@ -136,8 +139,15 @@ Both processes expose a health endpoint, and the compose files probe them.
    python -c "import secrets; print(secrets.token_urlsafe(32))"
    ```
 3. 🗄️ Pick a database. For the bundled MongoDB, copy `override.example.yml` to
-   `docker-compose.override.yml` and set `MONGO_INITDB_ROOT_USERNAME`,
-   `MONGO_INITDB_ROOT_PASSWORD` and a matching `MONGO_HOST`.
+   `docker-compose.override.yml` and set **four** variables plus a matching
+   `MONGO_HOST`: `MONGO_INITDB_ROOT_USERNAME`, `MONGO_INITDB_ROOT_PASSWORD`,
+   `MONGO_EXPRESS_USERNAME` and `MONGO_EXPRESS_PASSWORD`. That override file
+   brings up the Mongo Express admin UI as well as the database, and it
+   requires all four: leave any of them unset and Compose stops before it
+   starts anything, with `required variable MONGO_EXPRESS_USERNAME is missing
+   a value` or the equivalent for whichever is missing. The two Mongo Express
+   lines are commented out in `.env.example`, so uncomment them and fill them
+   in.
 4. 🐳 Run `docker compose up -d --build`.
 
 > **Upgrading from an older version?** See

@@ -89,12 +89,43 @@ class ExplodingGuild(FakeGuild):
 
 
 def pending(discord_id, starred, username="Someone"):
-    """A link the server has queued for the bot to act on."""
+    """A link the server has queued for the bot to act on.
+
+    It carries an ``_id`` because the pending cursor is the one that keeps
+    it. For a row with no usable ``discord_id`` that is the only identity
+    the drain has to clear the flag by, so a fake without one would let
+    the clear be deleted with the suite still green.
+    """
     return {
+        "_id": f"oid-{discord_id}",
         **link(discord_id, username, starred=starred),
         "role_sync_pending": True,
         "star_source": "webhook",
     }
+
+
+# Every shape a queued row with no usable Discord ID comes in.
+#
+# ``null`` is the one production actually holds. From b715c73 (October
+# 2023) until the rebuild, /login read the Discord ID from an unvalidated
+# query parameter and stored whatever came back, so an unauthenticated GET
+# with no id, followed by OAuth, wrote ``discord_id: None``. That is nearly
+# three years of releases and nothing ever backfilled them.
+#
+# ``missing`` was only producible for about a day in the same month, and
+# ``empty`` is the one the original bug hid behind: it round-trips through
+# str() and so matched the Discord-keyed clear that the other two do not.
+NO_DISCORD_ID = ("null", "missing", "empty")
+
+
+def unusable(spelling, discord_id=1, starred=False):
+    """A queued row carrying no Discord ID, in one of the three shapes."""
+    document = pending(discord_id, starred)
+    if spelling == "missing":
+        del document["discord_id"]
+    else:
+        document["discord_id"] = None if spelling == "null" else ""
+    return document
 
 
 def build(documents, holds=(), members=None, guild=None, **config_overrides):
@@ -275,19 +306,81 @@ def test_one_unusable_row_does_not_strand_the_rest_of_the_queue(caplog):
     assert "member cache is confused" in caplog.text
 
 
-def test_a_row_with_no_discord_id_is_dropped_rather_than_read_forever(caplog):
-    # Only rows written by the oldest version, keyed on a GitHub email, can
-    # look like this. There is nobody to move a role for, and leaving the
-    # flag up would put this row in front of the drain on every poll.
-    document = {**pending(1, False), "discord_id": ""}
+@pytest.mark.parametrize("spelling", NO_DISCORD_ID)
+def test_a_row_with_no_discord_id_is_cleared_by_its_mongo_id(caplog, spelling):
+    # There is nobody to move a role for, and the clear this used to issue
+    # was keyed on the very field the row does not have: a null or absent
+    # `discord_id` was searched for as the literal string "None", which
+    # matched nothing, so the flag stayed raised and the row came back on
+    # the next poll, and the next, with the same line claiming it had been
+    # dropped every thirty seconds for as long as the bot ran. The
+    # empty-string spelling happened to match, which is why a passing test
+    # did not catch it. All three take the by-id path now.
+    document = unusable(spelling)
     drainer, _, channel, users = build([document])
 
-    with caplog.at_level("WARNING", logger="starguard.bot"):
-        assert asyncio.run(drainer.drain_once()) == DrainResult(examined=1, failed=1)
+    async def two_polls():
+        return [await drainer.drain_once() for _ in range(2)]
 
+    with caplog.at_level("WARNING", logger="starguard.bot"):
+        results = asyncio.run(two_polls())
+
+    # The flag really comes down, so the second poll reads an empty queue
+    # rather than the same row again.
     assert users.documents[0]["role_sync_pending"] is False
+    assert results == [DrainResult(examined=1, unusable=1), DrainResult()]
+    # Cleared by the Mongo _id, unconditionally. Naming the star state
+    # here would be a second way to match nothing, not a safeguard.
+    assert users.writes == [({"_id": "oid-1"}, {"$set": {"role_sync_pending": False}})]
+    # Counted apart from a failure, so a row nothing can act on does not
+    # put the drain into the backoff a Discord refusal earns.
+    assert drainer._consecutive_failures == 0
     assert not channel.sent
-    assert "no Discord ID" in caplog.text
+    # Said out loud, once, with enough to find the row again by hand: this
+    # deletes queued work, and a silent delete is the worse failure.
+    assert caplog.text.count("no Discord ID") == 1
+    assert "clearing it" in caplog.text
+    assert "oid-1" in caplog.text
+
+
+@pytest.mark.parametrize("spelling", NO_DISCORD_ID)
+def test_an_unusable_row_does_not_stop_the_rest_of_the_queue(caplog, spelling):
+    # The counterpart to the test above: clearing the row is only the right
+    # answer if everything behind it still moves.
+    row = unusable(spelling, starred=True)
+    drainer, members, _, users = build([row, pending(2, True, username="Other")])
+
+    with caplog.at_level("WARNING", logger="starguard.bot"):
+        result = asyncio.run(drainer.drain_once())
+
+    assert result == DrainResult(examined=2, granted=1, unusable=1)
+    assert members["2"].roles == {ROLE_ID}
+    assert users.documents[0]["role_sync_pending"] is False
+    assert users.documents[1]["role_sync_pending"] is False
+    # Pinned to the by-id filter, not just to the flag coming down. The
+    # empty-string spelling is the one the Discord-keyed clear reaches on
+    # its own, so a test that only checks the queue emptied would pass for
+    # it with the fix removed, and that parameter would be decoration.
+    assert ({"_id": "oid-1"}, {"$set": {"role_sync_pending": False}}) in users.writes
+
+
+@pytest.mark.parametrize("spelling", NO_DISCORD_ID)
+def test_a_failed_clear_of_an_unusable_row_is_logged_not_raised(caplog, spelling):
+    # The same shrug as an ordinary clear that fails. Nothing was going to
+    # happen to this row in any case, so the cost of the failure is the
+    # same line again on the next poll, not a traceback out of the drain.
+    drainer, _, _, users = build([unusable(spelling, starred=True)])
+
+    def refuse(query, update, upsert=False):
+        raise PyMongoError("no primary available")
+
+    users.update_one = refuse
+
+    with caplog.at_level("ERROR", logger="starguard.bot"):
+        assert asyncio.run(drainer.drain_once()) == DrainResult(examined=1, unusable=1)
+
+    assert "Could not clear the unusable pending role sync" in caplog.text
+    assert "no primary available" in caplog.text
 
 
 def test_a_clear_that_fails_does_not_undo_the_role_change(caplog):
@@ -364,6 +457,32 @@ def test_a_failing_drain_is_logged_and_retried_rather_than_killing_the_loop(monk
     assert 22.5 <= delays[0] <= 37.5
     assert "Role sync drain failed" in caplog.text
     assert "no primary available" in caplog.text
+
+
+def test_a_pass_that_leaves_rows_queued_backs_off_like_a_failure(monkeypatch, caplog):
+    # A role above the bot's own in the hierarchy, or a missing permission,
+    # fails every row in the queue and fails it again on every pass. The
+    # loop used to call that a completed drain: the counter was reset, the
+    # ordinary interval was used, and the same refused requests went back
+    # out a few seconds later, forever, taking the shared lock off the
+    # sweep each time. Nothing about it recovers faster for being retried.
+    members = {"1": RefusingMember("1", roles=())}
+    drainer, _, _, users = build([pending(1, True)], members=members, role_sync_interval=30)
+
+    with caplog.at_level("WARNING", logger="starguard.bot"):
+        delays = drive_loop(monkeypatch, drainer, cycles=3)
+
+    assert drainer._consecutive_failures == 3
+    assert delays == sorted(delays)
+    assert 22.5 <= delays[0] <= 37.5
+    assert delays[-1] > delays[0]
+    # Still queued, which is the point: the row is retried, just not at
+    # the polling interval.
+    assert users.documents[0]["role_sync_pending"] is True
+    assert "left 1 row(s) queued" in caplog.text
+    # Nothing was raised, so nothing prints a traceback. A stack trace for
+    # a Discord refusal the row already logged is noise.
+    assert "Traceback" not in caplog.text
 
 
 def test_the_drain_backoff_tops_out_well_below_the_sweeps(monkeypatch):

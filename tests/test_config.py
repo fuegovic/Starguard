@@ -7,9 +7,12 @@
 import pytest
 
 from common.config import (
+    MAX_PORT,
+    MIN_PORT,
     ConfigError,
     env_bool,
     env_int,
+    env_port,
     optional_env,
     require_env,
     require_https_url,
@@ -59,6 +62,41 @@ def test_env_int_rejects_nonsense(monkeypatch):
     monkeypatch.setenv("DELAY", "one hour")
     with pytest.raises(ConfigError, match="whole number"):
         env_int("DELAY", 3600)
+
+
+@pytest.mark.parametrize("raw", [str(MIN_PORT), "8080", str(MAX_PORT)])
+def test_env_port_accepts_the_whole_range_including_its_ends(monkeypatch, raw):
+    monkeypatch.setenv("PORT", raw)
+    assert env_port("PORT", 5000) == int(raw)
+
+
+def test_env_port_uses_the_default_when_unset(monkeypatch):
+    monkeypatch.delenv("PORT", raising=False)
+    assert env_port("PORT", 5000) == 5000
+
+
+@pytest.mark.parametrize("raw", [str(MIN_PORT - 1), str(MAX_PORT + 1), "70000", "-1"])
+def test_env_port_refuses_a_number_that_is_not_a_port(monkeypatch, raw):
+    # Refused rather than clamped, which is the difference from env_int's
+    # minimum. A clamped port is not a smaller version of what was asked
+    # for, it is a different address: 70000 would bind 65535 and answer
+    # there, and the operator hunting the typo would find a working
+    # service on a port they never named.
+    monkeypatch.setenv("PORT", raw)
+    with pytest.raises(ConfigError, match="PORT") as excinfo:
+        env_port("PORT", 5000)
+
+    # The message has to name the variable and the range, because it is
+    # the only thing the operator gets.
+    assert "TCP port" in str(excinfo.value)
+    assert f"{MIN_PORT} and {MAX_PORT}" in str(excinfo.value)
+    assert raw in str(excinfo.value)
+
+
+def test_env_port_rejects_nonsense_the_way_env_int_does(monkeypatch):
+    monkeypatch.setenv("PORT", "http")
+    with pytest.raises(ConfigError, match="whole number"):
+        env_port("PORT", 5000)
 
 
 @pytest.mark.parametrize(
