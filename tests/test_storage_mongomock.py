@@ -493,7 +493,7 @@ def test_a_relink_cannot_write_its_star_state_onto_another_identity(users):
     # the row ends up claiming that B stars the repository on the strength
     # of a check that was run against A. Naming the identity it just wrote
     # is what ties the two statements together.
-    link(users, "1", 100, "Alice", starred=True)
+    link(users, "1", 100, "Alice", starred=False)
 
     original = users.update_one
     interleaved = []
@@ -504,20 +504,23 @@ def test_a_relink_cannot_write_its_star_state_onto_another_identity(users):
         # $setOnInsert, and only once, so B's own writes do not recurse.
         if not interleaved and "$setOnInsert" in update:
             interleaved.append(True)
-            link(users, "1", 200, "Bob", starred=False, observed_at=OBSERVED_AT)
+            link(users, "1", 200, "Bob", starred=True, observed_at=OBSERVED_AT)
         return result
 
     users.update_one = update_one
     try:
-        document = link(users, "1", 100, "Alice", starred=True, observed_at=OBSERVED_AT)
+        document = link(users, "1", 100, "Alice", starred=False, observed_at=OBSERVED_AT)
     finally:
         users.update_one = original
 
     row = find_link(users, "1")
     # B got there second, so B owns both halves of the row.
     assert row["github_id"] == 200
-    assert row["starred_repo"] is False
-    # And A is told what the row actually holds, not what it tried to write.
+    assert row["starred_repo"] is True
+    # And A is not handed B's answer. The two accounts disagree on purpose:
+    # with both saying the same thing the read below would coincide with
+    # the safe value and this would pass whether or not it is tied to the
+    # identity.
     assert document["starred_repo"] is False
 
 
