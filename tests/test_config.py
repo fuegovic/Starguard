@@ -16,6 +16,7 @@ from common.config import (
     optional_env,
     require_env,
     require_https_url,
+    require_mongo_host,
     require_secret_key,
     require_snowflake,
 )
@@ -190,3 +191,48 @@ def test_require_https_url_rejects_a_query_string_or_fragment(monkeypatch, raw):
     monkeypatch.setenv("DOMAIN", raw)
     with pytest.raises(ConfigError, match="no query string or fragment"):
         require_https_url("DOMAIN")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "mongodb",  # a Docker service name, which is what compose gives you
+        "127.0.0.1",
+        "mongodb://127.0.0.1:27017/",
+        "mongodb://user:pass@a.example:27017,b.example:27017/?replicaSet=rs0",
+    ],
+)
+def test_require_mongo_host_accepts_everything_the_driver_does(monkeypatch, raw):
+    # Not a pattern of this module's own: a bare hostname, a service name,
+    # a host list and a URI with options are all valid here, and a rule
+    # written by hand would refuse something the driver takes.
+    monkeypatch.setenv("MONGO_HOST", raw)
+    assert require_mongo_host("MONGO_HOST") == raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "mongodb://host:notaport/",  # ValueError, which is not a PyMongoError
+        "mongodb://host:70000/",
+        "mongodb://host:0/",
+    ],
+)
+def test_require_mongo_host_names_the_variable_for_an_impossible_port(monkeypatch, raw):
+    # The reason this validator exists. These raise ValueError out of the
+    # driver's constructor, which the server's connect_users does not catch
+    # because it guards PyMongoError, so the process died with a traceback
+    # and the container restarted into the same traceback forever.
+    monkeypatch.setenv("MONGO_HOST", raw)
+    with pytest.raises(ConfigError, match="MONGO_HOST is not a usable"):
+        require_mongo_host("MONGO_HOST")
+
+
+@pytest.mark.parametrize("raw", ["mongodb://user:pa%ss@host/", "mongodb://"])
+def test_require_mongo_host_names_the_variable_for_a_malformed_uri(monkeypatch, raw):
+    # These raise InvalidURI, which is a PyMongoError and so was caught:
+    # the server came up, answered every request and could link nobody,
+    # explained by one startup log line. Refused by name instead.
+    monkeypatch.setenv("MONGO_HOST", raw)
+    with pytest.raises(ConfigError, match="MONGO_HOST is not a usable"):
+        require_mongo_host("MONGO_HOST")

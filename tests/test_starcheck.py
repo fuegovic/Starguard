@@ -12,6 +12,7 @@ from interactions.client.errors import Forbidden, HTTPException
 from pymongo.errors import PyMongoError
 
 from bot.config import BotConfig
+from bot.memberlock import MemberLocks
 from bot.starcheck import CheckAlreadyRunningError, StarChecker
 from common.github_api import GitHubError, StargazerListing
 from common.storage import STAR_SOURCE_SWEEP, STAR_SOURCE_WEBHOOK, record_star_event
@@ -228,8 +229,17 @@ def listing(*logins, ids=None):
     )
 
 
-def build(monkeypatch, documents, stargazers, fetch=None, ids=None, **config_overrides):
-    """Wire a checker up to fakes. Returns (checker, members, channel, users)."""
+def build(
+    monkeypatch, documents, stargazers, fetch=None, ids=None, member_locks=None, **config_overrides
+):
+    """Wire a checker up to fakes. Returns (checker, members, channel, users).
+
+    ``member_locks`` is the registry the sweep takes a member's mutex from.
+    A private one is right for a checker on its own; the tests that run a
+    sweep against a drain or a claim pass the registry they share, because
+    three private registries would be three sets of mutexes and no
+    exclusion at all.
+    """
     # Rows with no usable Discord ID name no member, the same way the
     # drain's build does. Indexing them unconditionally raised KeyError on
     # the shape the sweep most needs to be handed: a document whose
@@ -247,7 +257,12 @@ def build(monkeypatch, documents, stargazers, fetch=None, ids=None, **config_ove
         return listing(*stargazers, ids=ids)
 
     monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", fetch or default_fetch)
-    checker = StarChecker(client, make_config(**config_overrides), users)
+    checker = StarChecker(
+        client,
+        make_config(**config_overrides),
+        users,
+        MemberLocks() if member_locks is None else member_locks,
+    )
     return checker, members, channel, users
 
 
@@ -413,37 +428,34 @@ def test_checkstars_is_told_a_cycle_is_already_running(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_a_drain_holding_the_lock_is_not_reported_as_a_running_check(monkeypatch):
-    # The drain is handed this very lock, so /checkstars used to answer "a
-    # star check is already running" whenever a non-empty drain happened to
-    # be in progress. That is a sentence an administrator can do nothing
+def test_a_drain_in_progress_is_neither_a_running_check_nor_something_to_wait_for(monkeypatch):
+    # The drain used to be handed this very lock, so /checkstars answered
+    # "a star check is already running" whenever a non-empty drain happened
+    # to be in progress. That is a sentence an administrator can do nothing
     # with: no check was running, no results were coming, and pressing it
-    # again a second later said the same thing.
-    checker, _, _, _ = build(monkeypatch, [], set())
+    # again a second later said the same thing. The cycle lock holds cycles
+    # now, and the drain holds one member's mutex at a time.
+    member_locks = MemberLocks()
+    checker, _, _, _ = build(monkeypatch, [], set(), member_locks=member_locks)
 
     async def scenario():
         release = asyncio.Event()
 
         async def drain():
-            async with checker.lock:
+            async with member_locks.hold("1"):
                 await release.wait()
 
         holder = asyncio.create_task(drain())
         await asyncio.sleep(0)
-        assert checker.lock.locked()
 
         assert checker.running is False
-        # It waits for the drain instead. A drain pass is bounded work
-        # against a partial index, which is well inside the fifteen minutes
-        # an interaction token lives, unlike the sweep this guard is for.
-        answer = asyncio.create_task(checker.run_once(wait=False))
-        await asyncio.sleep(0)
-        assert not answer.done()
+        # Nor does the check queue behind it. The sweep takes each
+        # member's mutex as it reaches them, and it reaches nobody here.
+        assert await checker.run_once(wait=False) == []
+        assert checker.running is False
 
         release.set()
         await holder
-        assert await answer == []
-        assert checker.running is False
 
     asyncio.run(scenario())
 

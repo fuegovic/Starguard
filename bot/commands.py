@@ -27,6 +27,7 @@ from pymongo.errors import PyMongoError
 
 from bot import messages
 from bot.config import BotConfig
+from bot.memberlock import MemberLocks
 from bot.starcheck import CheckAlreadyRunningError, StarChecker
 from bot.verification import register_verification
 from common.github_api import GitHubError, fetch_stargazer_logins
@@ -82,11 +83,12 @@ def register_commands(
     config: BotConfig,
     checker: StarChecker,
     users: UserCollection | None,
+    member_locks: MemberLocks,
 ) -> None:
     """Register every command and callback against ``client``."""
     register_info_commands(client, config)
     register_star_commands(client, config, checker)
-    register_verification(client, config, users)
+    register_verification(client, config, users, member_locks)
     register_links_command(client, config)
 
 

@@ -177,17 +177,19 @@ the database or to the logs.
 ## Development
 
 ```sh
-pip install -r requirements-dev.txt
-pytest -q
+pip install --require-hashes -r requirements-dev.lock
+pytest -q --cov
 ```
 
 Run the two processes directly with `python -m bot.bot` and
 `python -m server.server`; both read the same `.env`.
 
-CI gates every push on ruff, mypy, pylint, bandit, pip-audit, the test suite
-on Python 3.11 and 3.12, and a build of both Docker images. See
-[CONTRIBUTING.md](./CONTRIBUTING.md) for how to run the same checks locally,
-and [CHANGELOG.md](./CHANGELOG.md) for what has changed.
+CI gates every pull request, and every push to `main`, on ruff, mypy, pylint,
+bandit, an audit of both lockfiles, a check that neither lockfile has drifted
+from its `.txt` source, the test suite on Python 3.11 and 3.12 under a
+100 percent coverage gate, and hadolint plus a build of both Docker images.
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the commands to run the same
+checks locally, and [CHANGELOG.md](./CHANGELOG.md) for what has changed.
 
 ## Python Libraries and Resources
 

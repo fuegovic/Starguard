@@ -94,6 +94,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   repository they had already starred. There are exactly two answers, 204 and
   404; anything else is now reported as HTTP 502 `Could not read your GitHub
   profile. Please try again.` and nothing is written.
+- **The bot's `/healthz` now measures both loops that reconcile roles, not
+  just the sweep.** The payload gained `role_sync`, carrying the same
+  `disabled`, `pending`, `ok` and `stale` values as `star_check`, plus
+  `last_role_sync_age_seconds` once a pass has completed; either loop going
+  stale makes the response `degraded` with 503, and both fields are reported
+  so the payload names which one stopped. The drain's budget is
+  `ROLE_SYNC_INTERVAL * 3 + 300` seconds, 390 with the default. A
+  webhook-only deployment, `AUTOMATIC_CHECK=false` with
+  `ROLE_SYNC_ENABLED=true`, had the drain as its only reconciling loop and no
+  deadline at all, so a bot whose drain had never once reached the database
+  answered 200 for as long as it ran. **Such a container will now correctly
+  report `unhealthy`.** `star_check` and `last_check_age_seconds` are
+  unchanged in name, values and meaning.
+- **The sweep, the drain and the claim button now exclude each other one
+  member at a time instead of sharing one process-wide mutex.** The single
+  lock was the star check's own cycle lock, held across the stargazer listing
+  and the whole member sweep, which is minutes on a large repository: a
+  queued webhook waited out an entire cycle whichever member it was about, so
+  the configured drain interval described nothing that actually happened, and
+  a member pressing **Claim your role** watched a spinner for the same
+  minutes. Each path now takes only the lock for the member it is acting on,
+  held across that member's read, role change and write, so different members
+  are handled concurrently and the conflict that mattered is still excluded.
+  `/checkstars` also stops reporting that a star check is running when only a
+  drain is in progress.
 - **The server's `/healthz` now reaches the database.** It sends a `ping` on
   every probe instead of treating the existence of a client object as proof of
   a connection, so an unreachable or refusing MongoDB answers 503 rather than
@@ -225,7 +250,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collection a set of credentials for every verified user; nothing ever read
   it back. Existing installations purge any previously stored tokens at
   startup, and see [SECURITY.md](./SECURITY.md) for what operators upgrading
-  from an older version should do.
+  from an older version should do. The purge removes your copy but does not
+  revoke anything, and GitHub's revocation endpoint needs the token itself,
+  so take a copy before the first start if you intend to revoke through the
+  API rather than asking every member to do it.
 - Stopped logging the access token and the verifying user's email address.
 - `.env.example` is no longer baked into the Docker images, which previously
   shipped a publicly known `SECRET_KEY` as the runtime default.

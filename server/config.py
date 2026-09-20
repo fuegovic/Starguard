@@ -16,6 +16,7 @@ from common.config import (
     env_port,
     optional_env,
     require_env,
+    require_mongo_host,
     require_secret_key,
 )
 
@@ -104,7 +105,10 @@ def load_server_config() -> ServerConfig:
         secret_key=require_secret_key(),
         client_id=require_env("GITHUB_CLIENT_ID"),
         client_secret=require_env("GITHUB_CLIENT_SECRET"),
-        mongo_host=require_env("MONGO_HOST"),
+        # Validated by constructing the driver rather than only read, so a
+        # port that is not a port names the variable here instead of killing
+        # the process with a ValueError connect_users cannot catch.
+        mongo_host=require_mongo_host("MONGO_HOST"),
         mongo_database=require_env("MONGO_DATABASE"),
         # A port rather than a number with a floor. env_port raises where
         # env_int clamps, and its docstring says why a port is the case that

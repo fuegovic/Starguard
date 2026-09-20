@@ -19,6 +19,7 @@ import logging
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Final, Literal, Protocol, TypedDict
 
 from authlib.integrations.flask_client import OAuth, OAuthError
@@ -210,6 +211,13 @@ def authorize() -> Response:
         github_username = profile["login"]
         github_id = profile["id"]
 
+        # Taken before the question is asked, not after it is answered.
+        # The answer describes some instant inside the call, and an earlier
+        # horizon is the direction that lets a star event landing during it
+        # win: link_account refuses to write over anything newer than this,
+        # and the webhook's out-of-band fact should beat a read that was
+        # already in flight. The sweep takes its own instant the same way.
+        star_checked_at = datetime.now(UTC)
         starred_response = context.github.get(
             f"user/starred/{context.config.owner}/{context.config.repo}",
             token=token,
@@ -227,7 +235,7 @@ def authorize() -> Response:
     )
 
     try:
-        link_account(
+        recorded = link_account(
             context.users,
             discord_id=discord_id,
             discord_username=discord_username,
@@ -235,6 +243,11 @@ def authorize() -> Response:
             github_username=github_username,
             linked_repo=context.config.repo_url,
             starred_repo=starred,
+            # Without this the horizon is link_account's own clock, which
+            # is later than the answer it stands for by however long the
+            # OAuth exchange took, and a webhook that landed inside that
+            # window is written over. Only the caller knows when it asked.
+            observed_at=star_checked_at,
         )
     except AccountAlreadyLinkedError:
         log.info(
@@ -247,7 +260,12 @@ def authorize() -> Response:
         log.error("Could not save the link: %s", exc)
         return render_result(messages.SAVE_FAILED, 503)
 
-    if starred:
+    # The page follows the row rather than the answer GitHub gave, because
+    # the two can differ: link_account declines to write a star state a
+    # newer webhook event has already contradicted, and hands back what the
+    # row holds instead. Saying "not starred" to somebody the database
+    # records as starred would send them round the whole flow for nothing.
+    if recorded["starred_repo"]:
         return render_result(messages.VERIFIED_AND_STARRED)
     return render_result(
         messages.VERIFIED_NOT_STARRED.format(owner=context.config.owner, repo=context.config.repo)

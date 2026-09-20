@@ -24,6 +24,7 @@ from interactions.client.errors import Forbidden, HTTPException
 from pymongo.errors import PyMongoError
 
 from bot.config import BotConfig
+from bot.memberlock import MemberLocks
 from bot.messages import SORRY
 from bot.roles import safe_remove_role
 from common.github_api import StargazerCache, StargazerListing, fetch_stargazer_listing
@@ -152,13 +153,19 @@ def _still_stars(entry: MongoDocument, listing: StargazerListing) -> bool:
 class StarChecker:
     """Strips the role from linked users who no longer star the repository."""
 
-    # Three collaborators it is handed and five pieces of state a cycle
-    # leaves behind, one over the default. Splitting it would put the lock,
-    # the count of cycles it guards and the ETag cache it protects into
-    # different objects, which is how two of them get out of step.
+    # Four collaborators it is handed and four pieces of state a cycle
+    # leaves behind, one over the default. Splitting it would put the cycle
+    # lock and the ETag cache it protects into different objects, which is
+    # how the two get out of step.
     # pylint: disable=too-many-instance-attributes
 
-    def __init__(self, client: Client, config: BotConfig, users: UserCollection | None) -> None:
+    def __init__(
+        self,
+        client: Client,
+        config: BotConfig,
+        users: UserCollection | None,
+        member_locks: MemberLocks,
+    ) -> None:
         self._client = client
         self._config = config
         self._users = users
@@ -166,15 +173,19 @@ class StarChecker:
         # while the timer loop could already be inside it, so the same role
         # was removed twice and the same "sorry to see you go" message was
         # posted twice.
+        #
+        # Cycle serialisation and nothing else. This used to be handed to
+        # the role-sync drain as well, on the reasoning that one mutex is
+        # the only way two loops can be kept off one member, and that
+        # conflated two jobs: it is held across the stargazer crawl and the
+        # whole sweep, so it parked every queued webhook behind a cycle
+        # that takes minutes. Keeping two components off one member is now
+        # member_locks' job, which is the granularity that question
+        # actually has. See bot.memberlock.
         self._lock = asyncio.Lock()
-        # How many cycles are running or queued behind the lock. Counted
-        # separately from the lock because the role-sync drain holds this
-        # same lock, and testing the lock made /checkstars tell an
-        # administrator a star check was already running when nothing but a
-        # drain was in progress. A count rather than a flag so two callers
-        # cannot clear each other's: the timer loop waits for its turn where
-        # /checkstars refuses to, and both are cycles.
-        self._cycles_in_flight = 0
+        # Shared with the drain and the claim button, which is what makes
+        # it exclusion rather than three private mutexes.
+        self._member_locks = member_locks
         # Owned by this checker and only ever touched under the lock above,
         # which is what makes it safe to keep across cycles.
         self._cache = StargazerCache()
@@ -185,24 +196,13 @@ class StarChecker:
     def running(self) -> bool:
         """Whether a check cycle is in progress or waiting for its turn.
 
-        Not the same question as whether :attr:`lock` is held, because the
-        role-sync drain holds that lock too. A drain is not a star check,
-        and answering /checkstars as though it were told the administrator
-        something that was not true.
+        The lock answers this on its own now that only cycles take it. It
+        could not while the role-sync drain held the same mutex: a drain is
+        not a star check, and /checkstars telling an administrator one was
+        running because a drain happened to be in progress was a sentence
+        they could do nothing with.
         """
-        return self._cycles_in_flight > 0
-
-    @property
-    def lock(self) -> asyncio.Lock:
-        """The mutex that serialises every role change this process makes.
-
-        Handed to the role-sync drain so the sweep and the drain take turns
-        over the same members. A lock of the drain's own would be no
-        exclusion at all: two mutexes held independently let both loops into
-        the same member at once, which is precisely the double role change
-        and double announcement this one was added to stop.
-        """
-        return self._lock
+        return self._lock.locked()
 
     @property
     def last_completed(self) -> float | None:
@@ -219,21 +219,17 @@ class StarChecker:
         fifteen, and the answer the user asked for is being produced right
         now anyway.
 
-        A drain holding the shared lock is not that, and does not raise. It
-        finishes in well under an interaction's lifetime, so waiting for it
-        is the honest answer where claiming a check was running was not.
+        A drain in progress is not that and never reaches here, because it
+        no longer takes this lock at all.
         """
-        # There is no await between this test and the increment, so on a
-        # single event loop the pair cannot interleave with another caller.
+        # Acquiring is synchronous when the lock is free, so there is no
+        # window between this test and taking it in which another caller
+        # could slip past on a single event loop.
         if not wait and self.running:
             raise CheckAlreadyRunningError("A star check is already running.")
 
-        self._cycles_in_flight += 1
-        try:
-            async with self._lock:
-                return await self._run_cycle()
-        finally:
-            self._cycles_in_flight -= 1
+        async with self._lock:
+            return await self._run_cycle()
 
     async def run_forever(self) -> None:
         """Re-check every linked user on an interval, forever.
@@ -353,37 +349,45 @@ class StarChecker:
         if not discord_id:
             return None
 
-        # A member who left the guild returns None here. Calling has_role on
-        # that used to raise and take the whole loop down with it.
-        member = guild.get_member(discord_id)
-        if member is None:
-            log.info(
-                "Discord ID %s is no longer in the guild; marking un-starred.",
-                discord_id,
-            )
-            await self._record_unstarred(discord_id, observed_at)
-            return None
+        # Everything below reads Discord's state, changes it and records
+        # the change, which is the same sequence the drain and the claim
+        # button run against the same member. Held for one member rather
+        # than for the cycle, so a queued webhook about anybody else is not
+        # waiting on the crawl. See bot.memberlock.
+        async with self._member_locks.hold(discord_id):
+            # A member who left the guild returns None here. Calling
+            # has_role on that used to raise and take the whole loop down
+            # with it.
+            member = guild.get_member(discord_id)
+            if member is None:
+                log.info(
+                    "Discord ID %s is no longer in the guild; marking un-starred.",
+                    discord_id,
+                )
+                await self._record_unstarred(discord_id, observed_at)
+                return None
 
-        if not member.has_role(self._config.role_id):
-            await self._record_unstarred(discord_id, observed_at)
-            return None
+            if not member.has_role(self._config.role_id):
+                await self._record_unstarred(discord_id, observed_at)
+                return None
 
-        if not await safe_remove_role(member, self._config.role_id, "no_star"):
-            return None
+            if not await safe_remove_role(member, self._config.role_id, "no_star"):
+                return None
 
-        if not await self._record_unstarred(discord_id, observed_at):
-            # A newer star event overtook this cycle, so the row has been
-            # queued and the drain hands the role back within the poll
-            # interval. This cycle therefore has nothing true to say about
-            # this member: a farewell to somebody who stars the repository
-            # would stay in the channel long after the role came back, and
-            # counting them as removed would have /checkstars report a loss
-            # to an admin about a member who holds the role.
-            return None
+            if not await self._record_unstarred(discord_id, observed_at):
+                # A newer star event overtook this cycle, so the row has
+                # been queued and the drain hands the role back within the
+                # poll interval. This cycle therefore has nothing true to
+                # say about this member: a farewell to somebody who stars
+                # the repository would stay in the channel long after the
+                # role came back, and counting them as removed would have
+                # /checkstars report a loss to an admin about a member who
+                # holds the role.
+                return None
 
-        await announce_unstarred(channel, discord_id)
+            await announce_unstarred(channel, discord_id)
 
-        return _display_name(entry, member)
+            return _display_name(entry, member)
 
     async def _record_unstarred(self, discord_id: object, observed_at: datetime) -> bool:
         """Persist that ``discord_id`` no longer stars the repository.

@@ -131,7 +131,12 @@ Configuration error: AUTOMATIC_CHECK must be a boolean such as true/false, got '
 ```
 
 With this off, `/checkstars` still works on demand, and the bot's health
-endpoint reports `"star_check": "disabled"` rather than tracking staleness.
+endpoint reports `"star_check": "disabled"` rather than tracking that loop's
+staleness. It still tracks the **other** loop: a webhook-only deployment,
+`AUTOMATIC_CHECK=false` with `ROLE_SYNC_ENABLED=true`, is measured by
+`role_sync` instead, which is the point of reporting both. Only with both
+loops off does the endpoint stop measuring reconciliation altogether and
+report no more than that the bot reached Startup.
 
 ### `AUTOMATIC_CHECK_DELAY`
 
@@ -146,9 +151,12 @@ repository burns through the API rate limit. Useful values: `300` (5 minutes),
 A non-numeric value is fatal:
 `AUTOMATIC_CHECK_DELAY must be a whole number, got '1h'.`
 
-This value also sets the bot health endpoint's staleness threshold: a
-completed check older than `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds makes the
-endpoint report `degraded` and return 503.
+This value also sets the star check's health deadline, one of two the
+endpoint tracks: a completed check older than
+`AUTOMATIC_CHECK_DELAY * 3 + 300` seconds makes `star_check` report `stale`,
+and the whole response `degraded` with 503. The drain has its own deadline
+from [`ROLE_SYNC_INTERVAL`](#role_sync_interval), and either one going stale
+is enough for the 503.
 
 ### `ROLE_SYNC_ENABLED`
 
@@ -181,19 +189,28 @@ Draining queued role changes every 30 seconds
 The role sync drain is disabled (ROLE_SYNC_ENABLED=false)
 ```
 
+With this off, the bot's health endpoint reports `"role_sync": "disabled"`
+rather than tracking staleness. See [Bot health check](#bot-health-check).
+
 ### `ROLE_SYNC_INTERVAL`
 
 **Optional.** Read by the bot. Default: `30` (seconds). Whole number,
 **clamped** to a minimum of `5`.
 
 How often the bot looks for queued role changes when it finds none: the idle
-polling interval, not a deadline. A queued change is normally applied within
-one interval of the webhook recording it, but the drain shares a single lock
-with the star check so that the two cannot move the same member's role at
-once, and a sweep over a large repository holds that lock for as long as it
-takes to walk the stargazer listing, which can be minutes. A change queued
-during a sweep waits for the sweep. Nothing is lost while it waits, because
-the flag stays raised until the bot itself lowers it.
+polling interval. A queued change is normally applied within one interval of
+the webhook recording it, and a sweep running at the same time does not hold
+it up. The sweep, the drain and the **Claim your role** button exclude each
+other one member at a time, for just as long as that member's read, role
+change and write take, so two different members are handled concurrently and
+the only thing a queued change ever waits for is another component acting on
+that same member.
+
+It is still an interval rather than a deadline. A pass that leaves rows
+queued because Discord refused the role change backs off, as below, and a
+burst of stars takes as long as Discord takes to accept them. Nothing is lost
+while any of that happens, because the flag stays raised until the bot itself
+lowers it.
 
 This can be seconds where `AUTOMATIC_CHECK_DELAY` has to be an hour, because
 the two do completely different work. A sweep is one GitHub API request per
@@ -221,6 +238,12 @@ Role sync drain failed (1 in a row); retrying in 33 seconds
 
 That ceiling is far lower than the sweep's half hour, because a queued row is
 somebody holding, or missing, a role right now.
+
+This value also sets the drain's health deadline, at
+`ROLE_SYNC_INTERVAL * 3 + 300` seconds, or 390 with the default. Only a pass
+that actually walked the queue counts: one that returned early for want of a
+database connection or a cached guild did no reconciling, so it does not
+reset the clock and the endpoint eventually reports `"role_sync": "stale"`.
 
 ### `COMMAND_NAME`
 
@@ -262,18 +285,51 @@ Each URL must be a complete address including the scheme, for example
 ## Bot health check
 
 The bot serves `GET /healthz` inside its own container. The `discord-bot`
-healthcheck in both compose files calls it. It returns:
+healthcheck in both compose files calls it.
 
-- **503** with `{"status": "starting", ..., "gateway": "connecting"}` until
-  the Discord gateway connects.
-- **200** with `{"status": "ok", ...}` once connected, plus `"star_check"` set
-  to `disabled`, `pending` or `ok`.
-- **503** with `{"status": "degraded", ..., "star_check": "stale"}` when
-  automatic checks are on but the last completed one is older than
-  `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds.
+Every response carries `status`, `uptime_seconds` and `gateway`. Until the
+Discord gateway connects, that is the whole of it, with **503**:
 
-Every response also carries `uptime_seconds`, and an `ok` one carries
-`last_check_age_seconds`.
+```json
+{"status": "starting", "uptime_seconds": 5.0, "gateway": "connecting"}
+```
+
+Once connected, the payload also names each of the bot's two reconciling
+loops, whether or not that loop is turned on:
+
+| Field | The loop | Turned on by | Its deadline |
+| --- | --- | --- | --- |
+| `star_check` | the periodic star sweep | `AUTOMATIC_CHECK` | `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds |
+| `role_sync` | the role sync drain | `ROLE_SYNC_ENABLED` | `ROLE_SYNC_INTERVAL * 3 + 300` seconds |
+
+Each field is one of four values:
+
+- `disabled`: the loop is off, so nothing can be late.
+- `pending`: on, and no pass has finished yet. Its grace runs from startup
+  rather than from a last pass.
+- `ok`: on, and the last completed pass is inside the deadline.
+- `stale`: on, and it is not. The response is then **503** with
+  `"status": "degraded"`, whichever of the two loops it was. One stale loop
+  is enough; the other keeps reporting its own state beside it.
+
+**The age fields are optional, and a monitor has to treat them that way.** A
+loop reports the age of its last completed pass, in `last_check_age_seconds`
+for `star_check` and `last_role_sync_age_seconds` for `role_sync`, only once
+a pass has actually completed. A `disabled` loop carries no age, a `pending`
+one carries none, and a loop that went `stale` without ever finishing a pass
+carries none either. So `"status": "ok"` does not imply either age field is
+present, and a perfectly healthy bot answers like this for as long as its
+first pass takes:
+
+```json
+{"status": "ok", "uptime_seconds": 60.0, "gateway": "connected", "star_check": "pending", "role_sync": "pending"}
+```
+
+A bot with both loops running and both fresh answers **200** with:
+
+```json
+{"status": "ok", "uptime_seconds": 60.0, "gateway": "connected", "star_check": "ok", "last_check_age_seconds": 10.0, "role_sync": "ok", "last_role_sync_age_seconds": 5.0}
+```
 
 ### `BOT_HEALTH_ENABLED`
 
@@ -686,12 +742,33 @@ above works either way, but the moment anyone appends a database name, as in
 the user in `starguard` and authentication would start failing. Saying
 `authSource` explicitly makes that impossible.
 
-If the password contains any of `: / ? # [ ] @`, percent-encode it, or use a
-password that avoids them.
+**Percent-encode the credentials.** PyMongo parses this value as a URI, so
+anything in the username or password that means something in a URI has to be
+percent-encoded: `@`, `:`, `/`, `?`, `%` and `+`, with `# [ ]` thrown in
+because encoding them costs nothing and saves you having to remember which
+ones the driver happens to tolerate. `@`, `:`, `/` and `%` make the driver
+reject the string outright. `?` is the unpredictable one, because it ends the
+part of the string the driver reads as credentials and host, so what happens
+next depends on what precedes it: usually a rejection, sometimes a fatal one,
+and if the text before it happens to be all digits, a client that is silently
+pointed at the wrong host. `+` is the quiet one, decoded to a space with no
+error anywhere.
 
-Neither process refuses to start when MongoDB is unreachable. Both attempt
-four pieces of startup work, each reported by name when it fails, and keep
-going:
+**Encode it in `MONGO_HOST` and nowhere else.** MongoDB is handed the
+password literally, through `MONGO_INITDB_ROOT_PASSWORD`, and so are the
+`mongosh` healthcheck and Mongo Express in both compose files. Encoding it
+there too creates the nastiest version of this: the `mongodb` container
+reports healthy, because it and its healthcheck agree on a password, while
+the bot and the server authenticate with a different one and fail. Encode an
+existing password with
+
+```sh
+python -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" 'your password'
+```
+
+A database that is simply unreachable, or that refuses the credentials, does
+not stop either process. A client is built, both attempt four pieces of
+startup work, each reported by name when it fails, and both keep going:
 
 ```
 Could not index the users collection: <reason>
@@ -700,13 +777,43 @@ Could not purge credentials written by older versions: <reason>
 Could not upgrade user records: <reason>
 ```
 
-Each database operation then fails as it is attempted. A connection string
-the driver cannot parse at all is different: that one is logged as
-`Error connecting to MongoDB: <reason>` and no client is built. The server's
-`/healthz` answers 503 in **both** cases, because it sends a `ping` to
-MongoDB on every probe rather than assuming a client that exists is a
-database that answers. See
-[MongoDB connection and authentication failures](./troubleshooting.md#mongodb-connection-and-authentication-failures).
+Each database operation then fails as it is attempted, and the server's
+`/healthz` answers 503, because it sends a `ping` to MongoDB on every probe
+rather than assuming that a client which exists is a database that answers.
+
+A value the driver cannot use is a different matter, and **the two processes
+do not treat it alike**.
+
+**The server refuses to start, naming the variable.** It parses `MONGO_HOST`
+with the driver while loading its configuration, so anything the driver
+rejects is reported the way every other bad setting is, and the process exits
+1 rather than serving:
+
+```
+Configuration error: MONGO_HOST is not a usable MongoDB connection string: <reason>
+```
+
+**The bot does not.** It reads `MONGO_HOST` as a plain string, so a value the
+driver cannot use is only discovered when it tries to connect, and what
+happens then depends on how the driver fails. A rejection it reports as a
+MongoDB error, such as an unencoded `@`, `:`, `/` or `%`, is caught: the bot
+logs `Error connecting to MongoDB: <reason>` and runs on with no database,
+granting no roles. A malformed **port** is not caught. `mongodb://mongodb:70000/`,
+`mongodb://mongodb:notaport/` and the parse that an unencoded `?` produces
+when it leaves password text sitting in the port position all raise a plain
+`ValueError`, which is not a MongoDB error, so nothing catches it:
+
+```
+ValueError: Port contains non-digit characters. Hint: username and password must be escaped according to RFC 3986, use urllib.parse.quote_plus
+```
+
+The bot exits with that traceback, `restart: always` brings the container
+back, and it exits again. If the `discord-bot` container is looping while the
+`server` container is up, or if the server exited with the configuration
+error above and the bot did not, this asymmetry is why. See [a malformed
+connection string](./troubleshooting.md#a-malformed-connection-string) and
+[MongoDB connection and authentication
+failures](./troubleshooting.md#mongodb-connection-and-authentication-failures).
 
 ### `MONGO_DATABASE`
 

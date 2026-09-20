@@ -20,16 +20,59 @@ or through Docker: see [docs/installation.md](./docs/installation.md).
 
 ## Running the checks locally
 
-CI runs these on every push and pull request; running them first saves a
-round trip.
+CI runs five jobs on every pull request, and on pushes to `main`. Running
+them first saves a round trip. Each command below is the one `ci.yml` runs,
+so this list is the whole gate rather than the convenient half of it.
+
+**Quality**, the lint, format and type job:
 
 ```sh
 ruff check .
 ruff format --check .
 mypy .
 pylint $(git ls-files '*.py')
+```
+
+**Security**, which is bandit plus an audit of each lockfile. Both audits
+matter: they cover the full transitive closure, which is where most
+advisories land, and neither is implied by the other.
+
+```sh
 bandit -r bot common server
-pytest -q
+pip-audit -r requirements.lock --require-hashes --disable-pip
+pip-audit -r requirements-dev.lock --require-hashes --disable-pip
+```
+
+**Test**, with coverage. This is the one where a plain `pytest -q` misleads
+you: `pyproject.toml` sets `fail_under = 100` on branch coverage of `bot`,
+`common` and `server`, and that gate only runs when coverage does, which
+means passing `--cov`. Warnings are errors as well, so a deprecation counts
+as a failure.
+
+```sh
+pytest -q --cov --cov-report=term-missing
+```
+
+CI also passes `--cov-report=xml`, which only writes a file, and runs the
+job twice, on Python 3.11 and on 3.12. A failure that depends on the Python
+version will not show up locally unless you run both.
+
+**Lockfile drift**, which regenerates both locks and fails if either one
+moved. Run the two `uv pip compile` commands from [The
+lockfiles](#the-lockfiles) below, then:
+
+```sh
+git diff --exit-code -- requirements.lock requirements-dev.lock
+```
+
+**Docker build**, which lints each Dockerfile and then builds it. This is
+the one job that needs tools the checks above do not: hadolint, and a Docker
+daemon you can reach.
+
+```sh
+hadolint --config .hadolint.yaml Dockerfile.bot Dockerfile.server
+docker build -f Dockerfile.bot -t starguard-bot:ci .
+docker build -f Dockerfile.server -t starguard-server:ci .
 ```
 
 ## The lockfiles

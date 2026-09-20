@@ -14,12 +14,15 @@ test_storage, so nothing here reaches GitHub or MongoDB.
 # deliberately mirror signatures they do not use.
 # pylint: disable=missing-function-docstring,unused-argument
 
+import time
 from collections import namedtuple
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from authlib.integrations.flask_client import OAuthError
 from pymongo.errors import PyMongoError
 
+from common.storage import STAR_SOURCE_WEBHOOK, link_account, record_star_event
 from server import messages
 from server.server import ServerContext, connect_users, create_app, main
 from server.webhooks import MAX_REQUEST_BODY_BYTES
@@ -61,7 +64,7 @@ class FakeGitHub:
     exception to raise instead.
     """
 
-    def __init__(self, token=_DEFAULT, responses=None, token_error=None):
+    def __init__(self, token=_DEFAULT, responses=None, token_error=None, delay=0.0, during=None):
         self.token = ACCESS_TOKEN if token is _DEFAULT else token
         self.token_error = token_error
         self.responses = responses or {
@@ -69,6 +72,14 @@ class FakeGitHub:
             STARRED_PATH: FakeApiResponse(status_code=STARRED),
         }
         self.requests = []
+        # ``delay`` puts a measurable gap between the question and the
+        # answer, so a test can tell which side of the call an instant was
+        # taken on. ``answered`` is when each reply came back. ``during``
+        # runs while the call is in flight, which is how a test makes a
+        # webhook land in the middle of the OAuth flow.
+        self.delay = delay
+        self.during = during
+        self.answered = []
 
     def authorize_access_token(self):
         if self.token_error is not None:
@@ -80,6 +91,11 @@ class FakeGitHub:
         result = self.responses[path]
         if isinstance(result, Exception):
             raise result
+        if self.delay:
+            time.sleep(self.delay)
+        self.answered.append(datetime.now(UTC))
+        if self.during is not None:
+            self.during(path)
         return result
 
 
@@ -200,6 +216,87 @@ def test_a_visitor_who_has_not_starred_is_told_which_repository_to_star():
     assert response.status_code == 200
     assert b"you have not starred owner/repo yet" in response.data
     # The link is still recorded, so the claim button knows who they are.
+    assert stored(flow)["starred_repo"] is False
+
+
+def test_the_star_check_instant_predates_the_answer_and_reaches_link_account(monkeypatch):
+    # link_account refuses to write over a star event newer than the
+    # horizon it is given, so the horizon has to be the caller's and it has
+    # to predate the answer: a webhook that lands while GitHub is being
+    # asked should win. Left out, the horizon would be link_account's own
+    # clock, later than the answer by the length of the OAuth exchange.
+    seen = {}
+
+    def spy(collection, **kwargs):
+        seen.update(kwargs)
+        return link_account(collection, **kwargs)
+
+    monkeypatch.setattr("server.server.link_account", spy)
+
+    flow = build(github=FakeGitHub(delay=0.002))
+    before = datetime.now(UTC)
+    assert authorize(flow).status_code == 200
+
+    assert before <= seen["observed_at"] < flow.github.answered[-1]
+
+
+def test_an_unstar_that_lands_during_the_flow_is_not_written_back():
+    # The interleaving the P1 is about, driven rather than simulated. The
+    # visitor re-verifies, GitHub answers that they star the repository,
+    # and while that answer is in flight an un-star webhook records the
+    # opposite and raises the flag for it. The old single write put the
+    # stale True back while deliberately leaving the flag up, so the drain
+    # read the restored value off the row, reconciled the role to it and
+    # lowered the flag, and the un-star was lost until the next sweep.
+    flow = build()
+    assert authorize(flow).status_code == 200
+    assert stored(flow)["starred_repo"] is True
+
+    def unstar_arrives(path):
+        if path != STARRED_PATH:
+            return
+        record_star_event(
+            flow.users,
+            github_id=PROFILE["id"],
+            starred=False,
+            source=STAR_SOURCE_WEBHOOK,
+            occurred_at=datetime.now(UTC),
+        )
+        # The rest of the OAuth request, from GitHub's answer to the write
+        # reaching the database. This is the window link_account's own
+        # clock cannot see, and the whole reason the caller has to hand it
+        # the instant it asked at: without that, the horizon is taken here,
+        # after the webhook, and the stale True is written.
+        time.sleep(0.005)
+
+    flow.github.during = unstar_arrives
+    response = authorize(flow)
+
+    row = stored(flow)
+    assert row["starred_repo"] is False
+    # The flag the webhook raised is still up for the drain to act on.
+    assert row["role_sync_pending"] is True
+    assert b"you have not starred owner/repo yet" in response.data
+
+
+def test_a_star_a_newer_event_contradicts_is_neither_written_nor_announced():
+    # /authorize reads starred, a webhook records the un-star while the
+    # OAuth exchange is still running, and the old single write put the
+    # stale True back while leaving the flag that event raised up, so the
+    # drain handed the role back. link_account now refuses that write and
+    # returns what the row holds; the page has to follow the row, because
+    # sending somebody off to claim a role the database will not give them
+    # is worse than telling them to star.
+    flow = build()
+    assert authorize(flow).status_code == 200
+
+    row = stored(flow)
+    row["starred_repo"] = False
+    row["star_event_at"] = datetime.now(UTC) + timedelta(hours=1)
+
+    response = authorize(flow)
+    assert response.status_code == 200
+    assert b"you have not starred owner/repo yet" in response.data
     assert stored(flow)["starred_repo"] is False
 
 

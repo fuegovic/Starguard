@@ -20,6 +20,7 @@ heartbeat lives on this event loop.
 
 import asyncio
 import logging
+import time
 from collections import Counter
 from dataclasses import asdict, dataclass
 from typing import Final, Literal
@@ -28,6 +29,7 @@ from interactions import TYPE_MESSAGEABLE_CHANNEL, Client, Guild
 from pymongo.errors import PyMongoError
 
 from bot.config import BotConfig
+from bot.memberlock import MemberLocks
 from bot.roles import safe_add_role, safe_remove_role
 from bot.starcheck import announce_unstarred, announcement_channel, error_backoff, next_batch
 from common.storage import (
@@ -89,16 +91,36 @@ class RoleSyncDrainer:
         client: Client,
         config: BotConfig,
         users: UserCollection | None,
-        lock: asyncio.Lock,
+        member_locks: MemberLocks,
     ) -> None:
         self._client = client
         self._config = config
         self._users = users
-        # Not a lock of this drain's own: it is the star check's, handed
-        # over by bot.create_client. See StarChecker.lock for why a second
-        # mutex here would be no exclusion at all.
-        self._lock = lock
+        # The same registry the sweep and the claim button use, handed over
+        # by bot.create_client. A registry of this drain's own would be no
+        # exclusion at all: three sets of mutexes held independently let
+        # all three components into one member at once.
+        #
+        # This used to be the star check's cycle lock instead, which
+        # excluded the sweep but at the sweep's granularity: a queued
+        # webhook about any member waited out a crawl that takes minutes on
+        # a large repository, so the drain interval below described nothing
+        # that happens. See bot.memberlock.
+        self._member_locks = member_locks
         self._consecutive_failures = 0
+        self._last_completed: float | None = None
+
+    @property
+    def last_completed(self) -> float | None:
+        """``time.monotonic()`` of the last pass that ran, or None.
+
+        Read by the health endpoint, and set only by a pass that actually
+        walked the queue. A pass that returned early because there is no
+        database connection or no guild in the cache did no reconciling,
+        and saying otherwise is what let a drain-only deployment report
+        itself healthy while doing nothing at all.
+        """
+        return self._last_completed
 
     async def run_forever(self) -> None:
         """Drain the queue on an interval, forever.
@@ -113,9 +135,10 @@ class RoleSyncDrainer:
         way a pass that raised does. Only the raising kind used to, and a
         Discord refusal is not one: with the role above the bot's in the
         hierarchy, or the permission missing, every row in a burst fails,
-        stays queued and is resent a few seconds later, forever, holding
-        the shared lock against the sweep each time. Nothing about that
-        recovers faster for being retried at the polling interval.
+        stays queued and is resent a few seconds later, forever, taking
+        every one of those members' locks against the sweep each time.
+        Nothing about that recovers faster for being retried at the
+        polling interval.
         """
         while True:
             delay: float
@@ -168,10 +191,8 @@ class RoleSyncDrainer:
             log.warning("Guild %s is not in the cache; skipping.", self._config.guild_id)
             return DrainResult()
 
-        # The lock is taken around the work and nothing else, so an idle
-        # poll does not make /checkstars wait behind it.
-        async with self._lock:
-            result = await self._drain(guild)
+        result = await self._drain(guild)
+        self._last_completed = time.monotonic()
 
         # Silent when the queue was empty, which is almost every pass. A
         # line every thirty seconds saying nothing happened is how a log
@@ -194,7 +215,7 @@ class RoleSyncDrainer:
         )
 
     async def _drain(self, guild: Guild) -> DrainResult:
-        """Walk the pending queue, always under the shared lock."""
+        """Walk the pending queue, one member's lock at a time."""
         channel = announcement_channel(self._client, self._config)
         # drain_once returns before it gets here when there is no
         # collection, so self._users is never None on this path. The ignore
@@ -269,47 +290,70 @@ class RoleSyncDrainer:
             await self._clear_unusable(entry)
             return "unusable"
 
-        member = guild.get_member(discord_id)
-        if member is None:
-            # A member who left the guild, treated the way _check_one
-            # treats one: there is no role to move, so the row is finished
-            # rather than left raised. Leaving it raised would keep an entry
-            # in the partial index for somebody who is not here, and every
-            # poll from now on would read it and look them up again. Discord
-            # does not restore roles to somebody who rejoins anyway, so the
-            # claim button and the next sweep are what cover that case.
-            log.info("Discord ID %s is no longer in the guild; nothing to sync.", discord_id)
-            await self._clear(discord_id, starred)
-            return "settled"
+        # Everything below reads Discord's state, changes it and records
+        # the change, which is the same sequence the sweep and the claim
+        # button run against the same member. Taken here rather than around
+        # the whole pass so a burst of stars is still delivered member by
+        # member while a sweep works through somebody else. See
+        # bot.memberlock.
+        async with self._member_locks.hold(discord_id):
+            member = guild.get_member(discord_id)
+            if member is None:
+                # A member who left the guild, treated the way _check_one
+                # treats one: there is no role to move, so the row is
+                # finished rather than left raised. Leaving it raised would
+                # keep an entry in the partial index for somebody who is
+                # not here, and every poll from now on would read it and
+                # look them up again. Discord does not restore roles to
+                # somebody who rejoins anyway, so the claim button and the
+                # next sweep are what cover that case.
+                log.info("Discord ID %s is no longer in the guild; nothing to sync.", discord_id)
+                await self._clear(discord_id, starred)
+                return "settled"
 
-        if starred == member.has_role(self._config.role_id):
-            # Discord already agrees. Ordinary rather than exceptional: a
-            # webhook GitHub redelivered raises the flag again, and a sweep
-            # can reach the same change first.
-            await self._clear(discord_id, starred)
-            return "settled"
+            if starred == member.has_role(self._config.role_id):
+                # Discord already agrees. Ordinary rather than exceptional:
+                # a webhook GitHub redelivered raises the flag again, and a
+                # sweep can reach the same change first.
+                await self._clear(discord_id, starred)
+                return "settled"
 
-        if starred:
-            if not await safe_add_role(member, self._config.role_id, "star"):
-                # The flag stays up on purpose. Clearing it would drop the
-                # grant entirely, and nothing else would put it back: the
-                # sweep only ever takes roles away.
+            if starred:
+                if not await safe_add_role(member, self._config.role_id, "star"):
+                    # The flag stays up on purpose. Clearing it would drop
+                    # the grant entirely, and nothing else would put it
+                    # back: the sweep only ever takes roles away.
+                    return "failed"
+                await self._clear(discord_id, starred)
+                return "granted"
+
+            if not await safe_remove_role(member, self._config.role_id, "no_star"):
+                # The same reasoning in the other direction, and the more
+                # expensive one to get wrong. A failed removal that cleared
+                # the flag is a role nobody takes back at all. The sweep
+                # repairs deliveries that never arrived, not races, and it
+                # now skips any row a webhook has newer information about,
+                # so a lowered flag is the end of the matter rather than a
+                # day's delay.
                 return "failed"
-            await self._clear(discord_id, starred)
-            return "granted"
 
-        if not await safe_remove_role(member, self._config.role_id, "no_star"):
-            # The same reasoning in the other direction, and the more
-            # expensive one to get wrong. A failed removal that cleared the
-            # flag is a role nobody takes back at all. The sweep repairs
-            # deliveries that never arrived, not races, and it now skips
-            # any row a webhook has newer information about, so a lowered
-            # flag is the end of the matter rather than a day's delay.
-            return "failed"
+            if not await self._clear(discord_id, starred):
+                # A star event landed while the removal was in flight, so
+                # the conditional clear matched nothing and the newer grant
+                # is still queued for the next pass. The role change stands
+                # and is reported, but the farewell does not go out: the
+                # next pass hands the role straight back, and a public
+                # goodbye to somebody who stars the repository would stay
+                # in the channel long after they had it again. The sweep
+                # learned this first; see StarChecker._record_unstarred.
+                log.info(
+                    "A star event overtook the drain for %s; leaving the newer state queued.",
+                    discord_id,
+                )
+                return "removed"
 
-        await self._clear(discord_id, starred)
-        await announce_unstarred(channel, discord_id)
-        return "removed"
+            await announce_unstarred(channel, discord_id)
+            return "removed"
 
     async def _clear_unusable(self, entry: MongoDocument) -> None:
         """Take a row nothing can act on off the queue, and say which.
@@ -348,17 +392,21 @@ class RoleSyncDrainer:
             # clear costs only the same line again on the next poll.
             log.error("Could not clear the unusable pending role sync: %s", exc)
 
-    async def _clear(self, discord_id: object, starred: bool) -> None:
+    async def _clear(self, discord_id: object, starred: bool) -> bool:
         """Take a row off the pending queue, now that Discord matches it.
 
         ``starred`` is passed through because the clear is conditional on
         the row still saying it; see :func:`clear_role_sync_pending` for the
         lost update that guards against.
+
+        Returns whether the clear landed, which is the caller's only way to
+        learn that a webhook overtook it and the row is still queued. The
+        paths that have nothing to say either way ignore the answer.
         """
         try:
             # Reached only from _drain, so self._users is not None here; see
             # the note on the iter_pending_role_syncs call there.
-            await asyncio.to_thread(
+            return await asyncio.to_thread(
                 clear_role_sync_pending,
                 self._users,  # type: ignore[arg-type]
                 discord_id,
@@ -368,4 +416,9 @@ class RoleSyncDrainer:
             # The role is already right and only the bookkeeping failed, so
             # carrying on costs nothing: the next poll reads the row again,
             # finds Discord agrees with it and clears it then.
+            #
+            # Reported as landed on purpose. Nothing was refused, so this
+            # is no evidence that a newer star event exists, and reading a
+            # failed write as one would suppress a farewell that is owed.
             log.error("Could not clear the pending role sync for %s: %s", discord_id, exc)
+            return True

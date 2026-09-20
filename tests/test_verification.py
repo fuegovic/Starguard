@@ -21,6 +21,7 @@ from interactions.client.errors import Forbidden
 from pymongo.errors import PyMongoError
 
 from bot import messages
+from bot.memberlock import MemberLocks
 from bot.verification import (
     CLAIM_BUTTON_ID,
     RELINK_BUTTON_ID,
@@ -140,11 +141,19 @@ class FakeUsers:
         return self.document
 
 
-def register(users=None, **config_overrides):
-    """Register the verification flow and return (client, config)."""
+def register(users=None, member_locks=None, **config_overrides):
+    """Register the verification flow and return (client, config).
+
+    ``member_locks`` is the registry the claim button takes the clicking
+    member's mutex from. The tests that pit a claim against a sweep or a
+    drain pass the registry those share, because a private one here would
+    be a second set of mutexes and no exclusion at all.
+    """
     config = make_config(secret_key=SECRET, **config_overrides)
     client = RecordingClient()
-    register_verification(client, config, users)
+    register_verification(
+        client, config, users, MemberLocks() if member_locks is None else member_locks
+    )
     return client, config
 
 

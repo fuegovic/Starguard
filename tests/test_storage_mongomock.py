@@ -49,6 +49,10 @@ WHEN = datetime(2026, 1, 1, tzinfo=UTC)
 # about that race passes an instant later than any star event it set up.
 SWEPT_AT = datetime(2026, 6, 1, tzinfo=UTC)
 
+# When /authorize's OAuth star check was answered; the horizon link_account
+# orders its star state from.
+OBSERVED_AT = datetime(2026, 3, 1, tzinfo=UTC)
+
 
 @pytest.fixture(name="users")
 def users_fixture():
@@ -64,7 +68,7 @@ def deliveries_fixture(users):
     return collection
 
 
-def link(users, discord_id, github_id, github_username, starred=True):
+def link(users, discord_id, github_id, github_username, starred=True, observed_at=None):
     return link_account(
         users,
         discord_id=discord_id,
@@ -73,6 +77,7 @@ def link(users, discord_id, github_id, github_username, starred=True):
         github_username=github_username,
         linked_repo=REPO,
         starred_repo=starred,
+        observed_at=observed_at,
     )
 
 
@@ -348,8 +353,9 @@ def test_a_queued_row_with_no_discord_id_is_cleared_by_its_mongo_id(users, orpha
     queued = list(iter_pending_role_syncs(users))
     assert not queued[0].get("discord_id")
 
-    # What the drain can reach with the Discord-keyed clear: nothing.
-    clear_role_sync_pending(users, queued[0].get("discord_id"), True)
+    # What the drain can reach with the Discord-keyed clear: nothing, and
+    # the answer says so rather than reading like a clear that landed.
+    assert clear_role_sync_pending(users, queued[0].get("discord_id"), True) is False
     assert len(list(iter_pending_role_syncs(users))) == 1
 
     clear_role_sync_pending_by_id(users, queued[0]["_id"])
@@ -362,7 +368,7 @@ def test_clearing_the_flag_empties_the_queue_but_keeps_the_state(users):
     link(users, "1", 100, "Alice", starred=False)
     record_star_event(users, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
 
-    clear_role_sync_pending(users, "1", True)
+    assert clear_role_sync_pending(users, "1", True) is True
 
     assert not list(iter_pending_role_syncs(users))
     row = find_link(users, "1")
@@ -379,11 +385,12 @@ def test_a_clear_is_refused_once_the_star_state_has_moved_on(users):
     record_star_event(users, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
     record_star_event(users, 100, False, STAR_SOURCE_WEBHOOK, WHEN)
 
-    clear_role_sync_pending(users, "1", True)
+    # Against the real matched_count, which is what the answer is read off.
+    assert clear_role_sync_pending(users, "1", True) is False
 
     assert [row["discord_id"] for row in iter_pending_role_syncs(users)] == ["1"]
     # And the clear that matches the current state does land.
-    clear_role_sync_pending(users, "1", False)
+    assert clear_role_sync_pending(users, "1", False) is True
     assert not list(iter_pending_role_syncs(users))
 
 
@@ -450,6 +457,95 @@ def test_a_star_event_inside_the_listings_millisecond_is_not_written_over(users)
     # newer authority again, so the sweep writes as it always did.
     assert set_starred(users, "1", False, observed_at + timedelta(milliseconds=2)) is True
     assert find_link(users, "1")["starred_repo"] is False
+
+
+def test_a_relink_does_not_write_over_a_star_event_it_did_not_see(users):
+    # The same race as in the stub, against the real filter semantics. The
+    # OAuth star check said this person stars the repository; they un-star
+    # before the answer is written down, and the webhook records it and
+    # queues the role change. The relink must not restore the state the
+    # event replaced, because it leaves the flag raised and the drain then
+    # reconciles the role to whatever the row says.
+    link(users, "1", 100, "Alice", starred=True)
+    unstarred_at = OBSERVED_AT + timedelta(seconds=1)
+    record_star_event(users, 100, False, STAR_SOURCE_WEBHOOK, unstarred_at)
+
+    document = link(users, "1", 100, "Alice-Renamed", starred=True, observed_at=OBSERVED_AT)
+
+    row = find_link(users, "1")
+    assert row["starred_repo"] is False
+    assert row["star_source"] == STAR_SOURCE_WEBHOOK
+    assert [queued["discord_id"] for queued in iter_pending_role_syncs(users)] == ["1"]
+    # The identity the flow did establish is written all the same.
+    assert row["github_username"] == "Alice-Renamed"
+    assert document["starred_repo"] is False
+
+
+def test_a_relink_writes_over_a_star_event_older_than_the_oauth_check(users):
+    # A stale event ages out of the way, so re-verifying still repairs a
+    # row whose webhook was never delivered.
+    link(users, "1", 100, "Alice", starred=True)
+    record_star_event(users, 100, False, STAR_SOURCE_WEBHOOK, OBSERVED_AT - timedelta(days=1))
+
+    document = link(users, "1", 100, "Alice", starred=True, observed_at=OBSERVED_AT)
+
+    assert document["starred_repo"] is True
+    assert find_link(users, "1")["starred_repo"] is True
+
+
+def test_a_star_event_inside_the_oauth_checks_millisecond_is_not_written_over(users):
+    # The precision the stub cannot show, on link_account's side of it. A
+    # BSON datetime is whole milliseconds, so an event stamped four hundred
+    # microseconds after GitHub answered comes back looking earlier than
+    # the answer. Comparing the stored value against the caller's own
+    # microseconds reads the un-star as older and writes the stale star
+    # state over it.
+    link(users, "1", 100, "Alice", starred=True)
+    observed_at = OBSERVED_AT + timedelta(microseconds=500)
+    record_star_event(
+        users, 100, False, STAR_SOURCE_WEBHOOK, observed_at + timedelta(microseconds=400)
+    )
+
+    assert read_datetime(find_link(users, "1"), "star_event_at") < observed_at
+
+    superseded = link(users, "1", 100, "Alice", starred=True, observed_at=observed_at)
+
+    assert superseded["starred_repo"] is False
+    assert find_link(users, "1")["starred_repo"] is False
+
+    # A check answered a whole millisecond later is unambiguously the newer
+    # authority, and writes as it always did.
+    later = observed_at + timedelta(milliseconds=2)
+    written = link(users, "1", 100, "Alice", starred=True, observed_at=later)
+
+    assert written["starred_repo"] is True
+    assert find_link(users, "1")["starred_repo"] is True
+
+
+def test_a_first_link_is_created_however_old_the_observation_is(users):
+    # The upsert is unconditional for a reason: there is no row for an
+    # ordering condition to be satisfied by, so putting one on the insert
+    # would drop a first-time link on the floor. Against the real upsert,
+    # which builds the new document out of the filter.
+    document = link(users, "1", 100, "Alice", observed_at=datetime(2020, 1, 1, tzinfo=UTC))
+
+    row = find_link(users, "1")
+    assert row["starred_repo"] is True
+    assert row["github_id"] == 100
+    assert document["starred_repo"] is True
+
+
+def test_a_relink_leaves_the_queue_to_the_bot_even_when_it_writes(users):
+    # link_account still writes no role_sync_pending of its own, which is
+    # the half of this that was already fixed. The star write lands here,
+    # and the flag the webhook raised is still the bot's to lower.
+    link(users, "1", 100, "Alice", starred=False)
+    record_star_event(users, 100, True, STAR_SOURCE_WEBHOOK, OBSERVED_AT - timedelta(days=1))
+
+    link(users, "1", 100, "Alice", starred=False, observed_at=OBSERVED_AT)
+
+    assert find_link(users, "1")["starred_repo"] is False
+    assert [queued["discord_id"] for queued in iter_pending_role_syncs(users)] == ["1"]
 
 
 def test_a_delivery_that_arrives_behind_a_newer_one_is_not_recorded(users):

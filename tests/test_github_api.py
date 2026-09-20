@@ -480,16 +480,73 @@ def test_the_listing_reports_what_it_cost():
     assert listing.rate_limit_remaining == 4321
 
 
-def test_entries_that_are_not_user_objects_are_ignored():
-    # A page with something unexpected in it should cost the caller the
-    # entries it cannot read, never the whole cycle.
-    session = FakeSession([FakeResponse(payload=["nonsense", None, 17, {}, {"login": "Alice"}])])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "nonsense",
+        None,
+        17,
+        {},
+        {"login": "Alice"},
+        {"login": "Alice", "id": None},
+        {"login": "Alice", "id": "1234"},
+        {"login": "Alice", "id": 12.5},
+        {"login": None, "id": 1234},
+        {"starred_at": "2024-01-01", "user": {"login": "Alice"}},
+    ],
+    ids=[
+        "a string",
+        "null",
+        "a number",
+        "an empty object",
+        "no id",
+        "a null id",
+        "an id as a string",
+        "an id that is not whole",
+        "a null login",
+        "no id inside the envelope",
+    ],
+)
+def test_an_entry_that_cannot_be_read_costs_the_cycle_rather_than_a_role(entry):
+    # This test used to assert the opposite, that a page should cost the
+    # caller the entries it cannot read and never the whole cycle, on the
+    # reasoning that the listing still describes the accounts GitHub
+    # described properly. That reasoning was written when the un-star check
+    # compared logins, and it does not survive the check matching on ids:
+    # an entry dropped here is an account missing from listing.ids, the
+    # check cannot tell that apart from somebody who un-starred, and the
+    # member loses a role while their login sits in the very same response.
+    # Refusing the page costs one cycle, which the next one makes up.
+    session = FakeSession([FakeResponse(payload=[{"login": "Bob", "id": 2}, entry])])
+    with pytest.raises(GitHubError, match="no usable login and account id"):
+        fetch_stargazer_listing("o", "r", session=session)
+
+
+def test_an_id_that_is_a_bool_is_not_read_as_the_account_numbered_one():
+    # True is an int in Python and hashes equal to 1, so an unchecked id
+    # would put the member whose account id is 1 in the listing and leave
+    # whoever this entry is out of it.
+    session = FakeSession([FakeResponse(payload=[{"login": "Alice", "id": True}])])
+    with pytest.raises(GitHubError, match="no usable login and account id"):
+        fetch_stargazer_listing("o", "r", session=session)
+
+
+def test_a_page_whose_entries_all_read_is_accepted_whole():
+    # The other side of the rule: refusing a page must not become refusing
+    # the ordinary ones. The envelope spelling counts as readable too.
+    session = FakeSession(
+        [
+            FakeResponse(
+                payload=[
+                    {"login": "Alice", "id": 1},
+                    {"starred_at": "2024-01-01", "user": {"login": "Bob", "id": 2}},
+                ]
+            )
+        ]
+    )
     listing = fetch_stargazer_listing("o", "r", session=session)
-    assert listing.logins == {"alice"}
-    # An entry carrying a login and no id contributes to one set and not the
-    # other, which is allowed: the two sets describe the same accounts only
-    # as far as GitHub described them.
-    assert listing.ids == frozenset()
+    assert listing.logins == {"alice", "bob"}
+    assert listing.ids == {1, 2}
 
 
 def http_date(seconds_from_now, with_timezone=True):

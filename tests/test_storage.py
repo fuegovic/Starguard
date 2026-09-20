@@ -3,6 +3,15 @@
 # Test names document the behaviour under test, and the fakes below
 # deliberately mirror signatures they do not use.
 # pylint: disable=missing-function-docstring,unused-argument
+#
+# Over pylint's default module length, and deliberately so. This file is
+# where the lost-update class this project keeps rediscovering is pinned
+# down, one interleaving per test with the comment that says which release
+# shipped it, and every one of them is driven through the same fakes at the
+# top. Splitting it would put a race in one module and the collection that
+# reproduces it in another, which is how one of these regressions came back
+# the first time.
+# pylint: disable=too-many-lines
 
 from datetime import UTC, datetime, timedelta
 
@@ -41,6 +50,11 @@ WHEN = datetime(2026, 1, 1, tzinfo=UTC)
 # is conditional on no webhook having spoken since, so a test that is not
 # about that race passes an instant later than any star event it set up.
 SWEPT_AT = datetime(2026, 6, 1, tzinfo=UTC)
+
+# When /authorize's OAuth star check was answered. link_account orders its
+# star state against the webhook from this instant exactly as the sweep does
+# from the one above.
+OBSERVED_AT = datetime(2026, 3, 1, tzinfo=UTC)
 
 
 MISSING = object()
@@ -115,6 +129,10 @@ class FakeCollection:
         if upsert:
             new = dict(query)
             new.update(update.get("$set", {}))
+            # Only on this path, which is the whole point of the operator:
+            # a link that already exists keeps the star state the row
+            # holds rather than the one the caller arrived with.
+            new.update(update.get("$setOnInsert", {}))
             self.documents.append(new)
         # Nothing matched either way: an upsert that inserted still reports
         # a matched_count of zero, which is what pymongo does.
@@ -144,7 +162,7 @@ class FakeCollection:
         return None
 
 
-def link(collection, discord_id, github_id, github_username, starred=True):
+def link(collection, discord_id, github_id, github_username, starred=True, observed_at=None):
     return link_account(
         collection,
         discord_id=discord_id,
@@ -153,6 +171,7 @@ def link(collection, discord_id, github_id, github_username, starred=True):
         github_username=github_username,
         linked_repo=REPO,
         starred_repo=starred,
+        observed_at=observed_at,
     )
 
 
@@ -502,8 +521,10 @@ def test_a_row_with_no_discord_id_is_cleared_by_its_mongo_id(orphan):
     # What the drain can reach with the Discord-keyed clear: nothing. It
     # stringifies what it is handed, so the filter asks for the literal
     # "None" and the row is read and reported again on every poll for as
-    # long as the process runs.
-    clear_role_sync_pending(collection, queued.get("discord_id"), True)
+    # long as the process runs. It says so, at least: the refusal is the
+    # answer, and a caller that reads it knows not to act as though the
+    # row had come off the queue.
+    assert clear_role_sync_pending(collection, queued.get("discord_id"), True) is False
     assert [row["_id"] for row in iter_pending_role_syncs(collection)] == ["row-1"]
 
     clear_role_sync_pending_by_id(collection, queued["_id"])
@@ -521,7 +542,7 @@ def test_an_empty_discord_id_was_never_the_row_that_got_stuck():
         [{"_id": "row-1", "discord_id": "", "starred_repo": True, "role_sync_pending": True}]
     )
 
-    clear_role_sync_pending(collection, "", True)
+    assert clear_role_sync_pending(collection, "", True) is True
 
     assert not list(iter_pending_role_syncs(collection))
 
@@ -543,7 +564,7 @@ def test_clearing_the_flag_takes_the_row_off_the_queue():
     link(collection, "1", 100, "one", starred=False)
     record_star_event(collection, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
 
-    clear_role_sync_pending(collection, 1, True)
+    assert clear_role_sync_pending(collection, 1, True) is True
 
     assert not list(iter_pending_role_syncs(collection))
     # Only the flag moves: the star state and the event it came from stay.
@@ -574,8 +595,10 @@ def test_a_clear_does_not_lower_a_flag_the_bot_has_not_acted_on():
     record_star_event(collection, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
     record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, WHEN)
 
-    # The bot acted on the star it read, which is no longer what the row says.
-    clear_role_sync_pending(collection, "1", True)
+    # The bot acted on the star it read, which is no longer what the row
+    # says. The refusal is reported, because the caller cannot see the
+    # filter and a silent no-op reads exactly like a clear that landed.
+    assert clear_role_sync_pending(collection, "1", True) is False
 
     assert [row["discord_id"] for row in iter_pending_role_syncs(collection)] == ["1"]
     assert find_link(collection, "1")["starred_repo"] is False
@@ -643,6 +666,90 @@ def test_an_ordinary_row_no_webhook_has_touched_is_written_normally():
     assert "star_event_at" not in find_link(collection, "1")
     assert set_starred(collection, "1", False, SWEPT_AT) is True
     assert find_link(collection, "1")["starred_repo"] is False
+
+
+def test_a_relink_does_not_write_over_a_star_event_it_did_not_see():
+    # The interleaving the sixth instance of this bug class hid in, driven
+    # rather than hoped for. /authorize asks GitHub, is told the member
+    # stars the repository, and writes that down; the member un-stars in
+    # between, and the webhook records it and queues the role change. The
+    # relink used to put the stale True back while deliberately leaving
+    # the flag raised, so the drain read the restored value off the row,
+    # reconciled the role to it and lowered the flag, and the un-star was
+    # lost until the next full sweep.
+    collection = InterleavingCollection()
+    link(collection, "1", 100, "Octocat", starred=True)
+    unstarred_at = OBSERVED_AT + timedelta(seconds=1)
+    collection.before_write(
+        1, lambda: record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, unstarred_at)
+    )
+
+    document = link(collection, "1", 100, "Octocat-Renamed", starred=True, observed_at=OBSERVED_AT)
+
+    row = find_link(collection, "1")
+    assert row["starred_repo"] is False
+    assert row["star_event_at"] == unstarred_at
+    # The work stays queued, and the drain now finds the state the webhook
+    # recorded rather than the one the relink used to restore under it.
+    assert [queued["discord_id"] for queued in iter_pending_role_syncs(collection)] == ["1"]
+    # Only the star state is held back. Everything /authorize actually
+    # established about this person is still written.
+    assert row["github_username"] == "Octocat-Renamed"
+    assert row["github_id"] == 100
+    # And the caller is told what the row holds, not what it offered.
+    assert document["starred_repo"] is False
+    assert document["github_username"] == "Octocat-Renamed"
+
+
+def test_a_row_a_relink_creates_carries_its_star_state_from_the_first_instant():
+    # Why the insert sets starred_repo with $setOnInsert rather than
+    # leaving it to the conditional write. The row is visible to the
+    # webhook by its github_id as soon as it exists, and record_star_event
+    # reads a row with no starred_repo as neither state, so an event
+    # landing in between would be recorded without the role change it came
+    # with ever being queued.
+    collection = InterleavingCollection()
+    unstarred_at = OBSERVED_AT + timedelta(seconds=1)
+    collection.before_write(
+        2, lambda: record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, unstarred_at)
+    )
+
+    link(collection, "1", 100, "Octocat", starred=True, observed_at=OBSERVED_AT)
+
+    assert find_link(collection, "1")["starred_repo"] is False
+    assert [queued["discord_id"] for queued in iter_pending_role_syncs(collection)] == ["1"]
+
+
+def test_a_relink_writes_over_a_star_event_older_than_the_oauth_check():
+    # The other side of the guard, and the reason it is a timestamp rather
+    # than "has a webhook ever touched this row". A stale event ages out of
+    # the way, so re-verifying still repairs a row whose webhook was never
+    # delivered instead of deferring to it forever.
+    collection = FakeCollection()
+    link(collection, "1", 100, "Octocat", starred=True)
+    record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, OBSERVED_AT - timedelta(days=1))
+
+    document = link(collection, "1", 100, "Octocat", starred=True, observed_at=OBSERVED_AT)
+
+    assert document["starred_repo"] is True
+    assert find_link(collection, "1")["starred_repo"] is True
+    # The flag is left exactly as it was: only the bot ever lowers it.
+    assert [queued["discord_id"] for queued in iter_pending_role_syncs(collection)] == ["1"]
+
+
+def test_a_first_link_is_created_however_old_the_observation_is():
+    # The ordering condition must not reach the insert. There is no row to
+    # be newer than one, so a condition on the upsert would turn a
+    # first-time link into a silent no-op, or upsert the condition itself
+    # into the document.
+    collection = FakeCollection()
+
+    document = link(collection, "1", 100, "Octocat", observed_at=datetime(2020, 1, 1, tzinfo=UTC))
+
+    row = find_link(collection, "1")
+    assert row["starred_repo"] is True
+    assert document["starred_repo"] is True
+    assert "$or" not in row
 
 
 @pytest.mark.parametrize(
@@ -785,25 +892,45 @@ class RacingCollection(FakeCollection):
 
 
 class InterleavingCollection(FakeCollection):
-    """A collection that lets a second delivery run inside the first.
+    """A collection that lets one writer run inside another.
 
     Two deliveries for the same account racing each other is not a thing
-    to hope a test reproduces. The hook runs once, immediately before the
-    first write statement, which is the point the losing delivery used to
+    to hope a test reproduces. The hook runs once, immediately before a
+    chosen write statement, which is the point the losing writer used to
     have already decided what it was going to write.
+
+    The position is counted from the moment the hook is registered rather
+    than from the start of the test, because setting the row up takes
+    writes of its own. A writer that takes two statements, which
+    ``link_account`` does, is reached by asking for the second one.
     """
 
     def __init__(self, documents=None):
         super().__init__(documents)
         self._hook = None
+        self._at = 1
+        self._writes = 0
 
     def before_first_write(self, hook):
-        self._hook = hook
+        self.before_write(1, hook)
 
-    def find_one_and_update(self, query, update, projection=None, return_document=None):
-        if self._hook is not None:
+    def before_write(self, position, hook):
+        self._at, self._hook, self._writes = position, hook, 0
+
+    def _run_hook(self):
+        # The hook writes too, and those writes count here as well; it is
+        # cleared before it runs, so it cannot fire inside itself.
+        self._writes += 1
+        if self._hook is not None and self._writes == self._at:
             hook, self._hook = self._hook, None
             hook()
+
+    def update_one(self, query, update, upsert=False):
+        self._run_hook()
+        return super().update_one(query, update, upsert)
+
+    def find_one_and_update(self, query, update, projection=None, return_document=None):
+        self._run_hook()
         return super().find_one_and_update(query, update, projection, return_document)
 
 

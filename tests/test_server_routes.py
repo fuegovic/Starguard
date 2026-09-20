@@ -167,6 +167,18 @@ def test_both_ends_of_the_port_range_are_usable(monkeypatch, port):
     assert load_server_config().port == int(port)
 
 
+def test_an_unusable_mongo_host_is_refused_at_startup(monkeypatch):
+    # A port that is not a port makes the driver's constructor raise
+    # ValueError, which is not a PyMongoError, so it went straight past the
+    # guard in connect_users and killed the process. Named here instead.
+    for key, value in ENVIRONMENT.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("MONGO_HOST", "mongodb://mongo:notaport/")
+
+    with pytest.raises(ConfigError, match="MONGO_HOST"):
+        load_server_config()
+
+
 def test_a_deployment_with_no_proxy_can_trust_none(monkeypatch):
     # The floor used to be one, so an operator writing 0 to say "nothing is
     # in front of me" was clamped back up to trusting one hop of a header
