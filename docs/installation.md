@@ -147,9 +147,9 @@ Keep `?authSource=admin`. The bundled image creates its root user in the
 `admin` database, and saying so explicitly keeps the string correct even if
 someone later appends a database name to the path.
 
-`MONGO_HOST` is a URI, so **percent-encode anything in the password that
-means something in a URI**: `@ : / ? % +`, and `# [ ]` for good measure.
-Encode it in `MONGO_HOST` only. `MONGO_INITDB_ROOT_PASSWORD` is the password
+`MONGO_HOST` is a URI, so **percent-encode the reserved characters in the
+password**: `@ : / ? % +`. (`# [ ] ! $` need no encoding.) Encode them in
+`MONGO_HOST` only. `MONGO_INITDB_ROOT_PASSWORD` is the password
 MongoDB is actually created with, and the healthcheck and Mongo Express use
 it literally too, so encoding it in both places gives you a database that
 reports healthy while the bot and the server cannot sign in to it. The
@@ -292,11 +292,13 @@ The first working and the second not is a proxy or DNS problem, not a
 Starguard one.
 
 A healthy server answers `{"status":"ok"}`. It answers 503 with
-`{"database":"unavailable","status":"degraded"}` whenever the database is not
-usable: either `MONGO_HOST` was malformed and no client could be built, or the
-probe sent a `ping` command to MongoDB and did not get an answer. The probe
-really does reach the database, so a 200 here is evidence that the last step
-of verification will work, not just that the process is up.
+`{"database":"unavailable","status":"degraded"}` whenever it sends a `ping`
+command to MongoDB and does not get an answer. The probe really does reach
+the database, so a 200 here is evidence that the last step of verification
+will work, not just that the process is up. A `MONGO_HOST` the driver cannot
+use does not appear here at all: the server checks that value as it loads its
+configuration and exits rather than serving, with `Configuration error:
+MONGO_HOST is not a usable MongoDB connection string`.
 
 Then run `/verify` in Discord and walk the three buttons yourself. If anything
 goes wrong, [troubleshooting.md](./troubleshooting.md) lists each failure by
