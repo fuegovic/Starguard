@@ -53,8 +53,14 @@ class GateClock:
             return 1005.0
         self.first = False
         self.reached.set()
-        # Bounded, because with the clock read under the lock the second
-        # thread never gets this far and nothing would release it.
+        # Bounded, and short, for a reason of its own. In a healthy run
+        # the test always reaches release.set(), so this never fires. It
+        # is here for the run where the assert above fails first and
+        # abandons this thread holding the limiter's lock: unbounded, a
+        # non-daemon thread would then wedge the interpreter at exit long
+        # after the failure was reported. Firing early is harmless, since
+        # both orderings still reach the deque in the order they were
+        # timed, so there is nothing to buy by making it long.
         self.release.wait(timeout=0.5)
         return 1000.0
 
@@ -77,17 +83,26 @@ def test_two_threads_cannot_append_their_timestamps_out_of_order():
 
     slow = threading.Thread(target=limiter.hit, args=("a",))
     slow.start()
-    assert clock.reached.wait(timeout=5)
+    # Long, because this timeout exists only so a broken run fails instead
+    # of hanging, and the length of such a timeout is otherwise just a
+    # false-failure generator on loaded CI hardware. Nothing waits for it
+    # in a healthy run.
+    assert clock.reached.wait(timeout=60)
 
     fast = threading.Thread(target=limiter.hit, args=("a",))
     fast.start()
-    # Under the fix this cannot finish: it is waiting for the lock the slow
-    # thread is holding while it reads its own clock.
+    # This one is the opposite: a deliberate window, not a safety net.
+    # Under the fix it cannot finish, because it is waiting for the lock
+    # the slow thread holds while reading its own clock, so every run pays
+    # this quarter second. Should a loaded machine ever fail to let the
+    # unfixed version through in time, the result is a green run on a
+    # broken limiter rather than a red one on a working limiter, which is
+    # the direction to be wrong in.
     fast.join(timeout=0.25)
     clock.release.set()
 
-    slow.join(timeout=5)
-    fast.join(timeout=5)
+    slow.join(timeout=60)
+    fast.join(timeout=60)
     recorded = list(limiter._hits["a"])  # pylint: disable=protected-access
     assert recorded == sorted(recorded)
 

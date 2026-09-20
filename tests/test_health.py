@@ -205,9 +205,20 @@ def endpoint_fixture():
     server.server_close()
 
 
+# Long, for the same reason as the waits in test_rolesync and test_ratelimit:
+# this bound exists only so a health endpoint that never answers fails the
+# run instead of hanging it, and the length of such a bound is otherwise
+# just a false-failure generator. A loopback request answered by a daemon
+# thread competing for the GIL takes microseconds when it works, so nothing
+# is paid for the headroom; a socket timeout here is not caught below, so a
+# loaded machine would surface as an error against whichever endpoint test
+# happened to be running.
+RESPONSE_GUARD_SECONDS = 60
+
+
 def fetch(url):
     try:
-        with urllib.request.urlopen(url, timeout=10) as response:
+        with urllib.request.urlopen(url, timeout=RESPONSE_GUARD_SECONDS) as response:
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read())
