@@ -2,11 +2,30 @@ name: CI
 
 on:
   push:
+    # Scoped to main only, on purpose, for two reasons. First, a bare push
+    # trigger also matches tag pushes, which would run this workflow
+    # standalone on a v* tag in addition to the run release.yml starts
+    # through workflow_call for that same tag, doubling the matrix; tags
+    # now reach these jobs, once, via release.yml instead. Second, every
+    # other branch already gets these same jobs through pull_request, so
+    # triggering push on them too doubled every PR's CI. The publish job
+    # below needs exactly this: it only runs on a push to main.
+    # Trade-off: a branch with no open pull request no longer gets CI on
+    # push. If you push a branch and see no checks, that is why; open the
+    # PR and pull_request will run them.
+    branches: [main]
   pull_request:
+  workflow_call:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # A run that has already reached the main-branch publish job pushes the
+  # shared :latest tag for one image at a time; cancelling it mid-flight is
+  # what lets a superseding push kill only the remaining matrix leg and
+  # leave the bot and server :latest tags on different commits. Only cancel
+  # in-progress runs outside main (PRs and other branches), where nothing
+  # publishes and losing a superseded run has no lasting effect.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
