@@ -37,6 +37,7 @@ from common.storage import (
     UserCollection,
     clear_role_sync_pending,
     clear_role_sync_pending_by_id,
+    find_link,
     iter_pending_role_syncs,
 )
 
@@ -297,6 +298,29 @@ class RoleSyncDrainer:
         # member while a sweep works through somebody else. See
         # bot.memberlock.
         async with self._member_locks.hold(discord_id):
+            # Read the row again now the lock is held. The value above came
+            # off the queue snapshot, which was taken before the wait, and
+            # whoever held the lock in the meantime may have moved it: a
+            # sweep that removed the role writes starred_repo False, and
+            # granting from the older True would hand back the role it had
+            # just taken. The conditional clear refuses that, so the
+            # database stays right and the row stays queued, but the member
+            # holds a role they should not until a later pass takes it
+            # away. Locking the change without locking the decision that
+            # drives it is what left that gap.
+            #
+            # A row deleted while this waited reads as not starred, which
+            # is the direction that hands out no role, and matches what
+            # link_account does with the same disappearance.
+            # Reached only from _drain, so self._users is not None here;
+            # the same narrowing the clear below relies on.
+            current = await asyncio.to_thread(
+                find_link,
+                self._users,  # type: ignore[arg-type]
+                discord_id,
+            )
+            starred = bool(current is not None and current.get("starred_repo"))
+
             member = guild.get_member(discord_id)
             if member is None:
                 # A member who left the guild, treated the way _check_one

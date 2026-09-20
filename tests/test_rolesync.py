@@ -986,3 +986,74 @@ def test_a_drain_does_not_wait_out_a_sweep_of_other_members(monkeypatch):
     # And the cycle still finishes its own work on the other member.
     assert removed == ["user1"]
     assert members["1"].roles == set()
+
+
+class OvertakenUsers(RecordingUsers):
+    """A collection where somebody else's write lands inside the lock window.
+
+    ``find_one`` is the re-read the drain and the sweep each make once they
+    hold the member lock, so changing the row on the first of those is
+    exactly the write another component gets in while they wait for it.
+    Nothing here choreographs tasks against each other: the window is
+    defined by which read it is rather than by timing, which is what makes
+    these two deterministic where a real second task would not be.
+    """
+
+    def __init__(self, documents, **changes):
+        super().__init__(documents)
+        self.changes = changes
+        self.rereads = 0
+
+    def find_one(self, query, projection=None):
+        # Applied on every read rather than only the first, so that a
+        # version of the code which never re-reads fails these on what the
+        # member ends up with rather than on the bookkeeping below. Each
+        # of these drives one member, so there is only ever one such read.
+        self.rereads += 1
+        for document in self.documents:
+            document.update(self.changes)
+        return super().find_one(query, projection)
+
+
+def test_a_drain_does_not_grant_from_a_snapshot_a_sweep_overtook():
+    # The queue snapshot said starred. While this drain waited for the
+    # member lock, a sweep took the role away and wrote starred_repo
+    # False. Granting from the older snapshot hands straight back the role
+    # the sweep just removed. The conditional clear refuses it, so the row
+    # stays queued and the stored state is never wrong, but the member
+    # holds a role the row does not ask for until a later pass takes it
+    # off them, which is the whole of the damage and the reason the lock
+    # has to cover the decision and not only the change.
+    users = OvertakenUsers([pending(1, True)], starred_repo=False)
+    members = {"1": FakeMember("1", roles=())}
+    client = FakeClient(FakeGuild(members), FakeChannel())
+    drainer = RoleSyncDrainer(client, make_config(), users, MemberLocks())
+
+    asyncio.run(drainer.drain_once())
+
+    assert members["1"].additions == 0
+    assert members["1"].roles == set()
+    assert users.rereads == 1
+
+
+def test_a_sweep_does_not_remove_a_role_a_drain_granted_while_it_waited(monkeypatch):
+    # The mirror of it. The listing says this member has stopped starring,
+    # and that was decided against the row as the cycle read it. While the
+    # cycle waited for the member lock, a drain granted the role from an
+    # event newer than the listing. Removing it now takes back a role the
+    # webhook had just earned; the guarded write refuses the stale state
+    # and requeues a correction, so again the database is right and it is
+    # the member who pays, by losing access until another drain returns it.
+    later = datetime.now(UTC) + timedelta(hours=1)
+    users = OvertakenUsers([link(1, "Gone")], star_event_at=later, starred_repo=True)
+    members = {"1": FakeMember("1", roles=(ROLE_ID,))}
+    client = FakeClient(FakeGuild(members), FakeChannel())
+    monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", lambda *a, **k: listing())
+    checker = StarChecker(client, make_config(), users, MemberLocks())
+
+    removed = asyncio.run(checker.run_once())
+
+    assert removed == []
+    assert members["1"].removals == 0
+    assert members["1"].roles == {ROLE_ID}
+    assert users.rereads == 1
