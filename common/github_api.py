@@ -12,7 +12,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from typing import Final, Protocol, cast
+from typing import Final, Protocol
 
 import requests
 
@@ -178,7 +178,7 @@ def _describe_failure(response: requests.Response) -> str:
     return f"GitHub API returned HTTP {status}."
 
 
-def _extract_identity(entry: object) -> tuple[str | None, int | None]:
+def _extract_identity(entry: object) -> tuple[str, int] | None:
     """Return the ``(login, account id)`` pair from a stargazer entry.
 
     The plain listing returns user objects; the ``star+json`` media type wraps
@@ -188,17 +188,36 @@ def _extract_identity(entry: object) -> tuple[str | None, int | None]:
     The id was already in every response body and used to be thrown away.
     Collecting it is what lets the un-star check match on something GitHub
     does not let people change.
+
+    None means the entry does not carry both halves in a usable shape, and
+    :func:`_absorb_page` then refuses the page rather than dropping the
+    entry out of the listing. This used to hand both values back uncast and
+    unchecked, and the reason written here was that narrowing them would
+    quietly turn a malformed response into a silently shorter listing,
+    which strips roles from people who never un-starred. That danger is
+    real and is still the one being avoided; what has changed is that not
+    narrowing them no longer avoids it. The un-star check matches on the id
+    alone for every row written since ids were recorded, so an id that is
+    absent, null or not an integer already produces exactly that shorter
+    listing: the account is missing from ``ids``, or sits there in a shape
+    that can never equal the integer in the row, and its owner looks as
+    though they had un-starred. Reading the value and refusing the page is
+    the only version of this that does not act on it.
+
+    A bool is turned away with the rest because it is an ``int`` subclass,
+    so ``True`` would otherwise be indistinguishable from the account whose
+    id is 1.
     """
     if not isinstance(entry, dict):
-        return None, None
+        return None
     user: object = entry.get("user")
     if not isinstance(user, dict):
         user = entry
-    # GitHub always sends a string login and an integer id. Neither value is
-    # re-validated, because narrowing it would quietly turn a malformed
-    # response into a silently shorter listing, and a short listing strips
-    # roles from people who never un-starred.
-    return cast("str | None", user.get("login")), cast("int | None", user.get("id"))
+    login = user.get("login")
+    account_id = user.get("id")
+    if isinstance(login, str) and isinstance(account_id, int) and not isinstance(account_id, bool):
+        return login, account_id
+    return None
 
 
 def _rate_limit_remaining(response: requests.Response) -> int | None:
@@ -376,8 +395,19 @@ def _absorb_page(walk: _Walk, url: str, response: requests.Response, caching: bo
 
     walk.pages_fetched += 1
     identities = [_extract_identity(entry) for entry in page]
-    logins = frozenset(login.lower() for login, _ in identities if login)
-    ids = frozenset(account_id for _, account_id in identities if account_id is not None)
+    readable = [identity for identity in identities if identity is not None]
+    if len(readable) != len(identities):
+        # The same rule as the one on the listing as a whole: an incomplete
+        # answer is refused rather than reconciled against. Dropping the
+        # entry would leave a stargazer out of the sets the un-star check
+        # matches on, and the check cannot tell that apart from somebody
+        # who really did un-star.
+        raise GitHubError(
+            "A page of stargazers carried an entry with no usable login and account id, "
+            "so the listing was refused rather than read as un-starred."
+        )
+    logins = frozenset(login.lower() for login, _ in readable)
+    ids = frozenset(account_id for _, account_id in readable)
     walk.logins |= logins
     walk.ids |= ids
 
@@ -409,6 +439,8 @@ def fetch_stargazer_listing(
 
     Raises :class:`GitHubError` rather than returning a partial set: acting on
     an incomplete listing would strip roles from people who never un-starred.
+    A page carrying an entry this cannot read is incomplete in exactly that
+    way, so it is refused here too; see :func:`_extract_identity`.
 
     Passing a :class:`StargazerCache` turns each page request into a
     conditional one. See that class for why a per-page 304 is safe.

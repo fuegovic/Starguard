@@ -25,7 +25,8 @@ from pymongo.errors import PyMongoError
 
 from bot.commands import register_commands
 from bot.config import BotConfig, load_bot_config
-from bot.health import HealthState, serve_health, stale_after_seconds
+from bot.health import HealthState, LoopHealth, serve_health, stale_after_seconds
+from bot.memberlock import MemberLocks
 from bot.rolesync import RoleSyncDrainer
 from bot.starcheck import StarChecker
 from common.config import ConfigError
@@ -55,17 +56,63 @@ def create_client(
         send_command_tracebacks=False,
     )
 
-    checker = StarChecker(client, config, users)
-    # The drain is handed the checker's own lock rather than taking one of
-    # its own, so a sweep and a drain can never act on the same member at
-    # the same time. See StarChecker.lock.
-    drainer = RoleSyncDrainer(client, config, users, checker.lock)
-    register_commands(client, config, checker, users)
+    # One registry for all three things that move this role, which is what
+    # makes it exclusion: the sweep, the drain and the claim button take
+    # the same member's mutex and so can never be inside one member at
+    # once. See bot.memberlock for why it is per member rather than the one
+    # process-wide lock this replaced.
+    member_locks = MemberLocks()
+    checker = StarChecker(client, config, users, member_locks)
+    drainer = RoleSyncDrainer(client, config, users, member_locks)
+    register_commands(client, config, checker, users, member_locks)
     client.add_listener(
         listen("startup")(_startup_listener(client, config, checker, drainer, health))
     )
 
+    if health is not None:
+        _watch_loops(health, config, checker, drainer)
+
     return client, checker
+
+
+def _watch_loops(
+    health: HealthState,
+    config: BotConfig,
+    checker: StarChecker,
+    drainer: RoleSyncDrainer,
+) -> None:
+    """Tell the health endpoint which reconciling loops to report on.
+
+    Both are named whether or not they are turned on, so the payload says
+    "disabled" rather than going quiet about a loop the operator may think
+    is running. A loop that is off carries no deadline and cannot be late.
+
+    The drain belongs here as much as the sweep does. On a deployment
+    running AUTOMATIC_CHECK=false with ROLE_SYNC_ENABLED=true it is the
+    only loop reconciling anything, and leaving it out meant a bot whose
+    drain had never once reached the database still answered /healthz with
+    200 for as long as it ran.
+    """
+    health.watch(
+        LoopHealth(
+            field="star_check",
+            age_field="last_check_age_seconds",
+            stale_after=(
+                stale_after_seconds(config.check_delay) if config.automatic_check else None
+            ),
+            last_completed=lambda: checker.last_completed,
+        )
+    )
+    health.watch(
+        LoopHealth(
+            field="role_sync",
+            age_field="last_role_sync_age_seconds",
+            stale_after=(
+                stale_after_seconds(config.role_sync_interval) if config.role_sync_enabled else None
+            ),
+            last_completed=lambda: drainer.last_completed,
+        )
+    )
 
 
 # The Coroutine's send and throw types are Any because that is how the async
@@ -116,9 +163,10 @@ def _startup_listener(
             log.info("The role sync drain is disabled (ROLE_SYNC_ENABLED=false)")
 
         if health is not None:
-            health.mark_ready(
-                stale_after_seconds(config.check_delay) if config.automatic_check else None
-            )
+            # Only the gateway is news here. Which loops the endpoint
+            # reports on was settled when the client was built; see
+            # _watch_loops.
+            health.mark_ready()
 
     return on_startup
 
@@ -152,15 +200,10 @@ def main() -> None:
         )
 
     health = HealthState()
-    client, checker = create_client(config, connect_users(config), health)
+    client, _ = create_client(config, connect_users(config), health)
 
     if config.health_enabled:
-        serve_health(
-            health,
-            config.health_host,
-            config.health_port,
-            lambda: checker.last_completed,
-        )
+        serve_health(health, config.health_host, config.health_port)
 
     client.start()
 

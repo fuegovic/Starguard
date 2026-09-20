@@ -22,6 +22,7 @@ from bot.commands import (
     register_links_command,
     register_star_commands,
 )
+from bot.memberlock import MemberLocks
 from bot.starcheck import CheckAlreadyRunningError
 from common.github_api import GitHubError
 from tests.test_starcheck import make_config
@@ -270,7 +271,7 @@ def test_the_links_command_sends_the_configured_buttons():
 )
 def test_register_commands_registers_the_whole_surface(overrides, expected):
     client = RecordingClient()
-    register_commands(client, make_config(**overrides), FakeChecker(), None)
+    register_commands(client, make_config(**overrides), FakeChecker(), None, MemberLocks())
 
     assert set(client.commands) == expected
     assert set(client.component_callbacks) == {"claim", "relink"}

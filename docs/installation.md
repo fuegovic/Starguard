@@ -115,6 +115,17 @@ rejected at startup.
 
 ## Step 7: Choose your MongoDB
 
+Both options below put values in `.env`, so create it now if you have not
+already. [Step 8](#step-8-configure-the-env-file) is where you fill in the
+rest of it:
+
+```sh
+cp .env.example .env
+```
+
+`cp` overwrites without asking, so run it once, before you type anything into
+the file.
+
 **Option A: the bundled MongoDB.** Copy the override file so Compose picks it
 up automatically:
 
@@ -134,8 +145,23 @@ MONGO_HOST=mongodb://starguard:<the same password>@mongodb:27017/?authSource=adm
 
 Keep `?authSource=admin`. The bundled image creates its root user in the
 `admin` database, and saying so explicitly keeps the string correct even if
-someone later appends a database name to the path. If your password contains
-any of `: / ? # [ ] @`, percent-encode it or choose one that does not.
+someone later appends a database name to the path.
+
+`MONGO_HOST` is a URI, so **percent-encode anything in the password that
+means something in a URI**: `@ : / ? % +`, and `# [ ]` for good measure.
+Encode it in `MONGO_HOST` only. `MONGO_INITDB_ROOT_PASSWORD` is the password
+MongoDB is actually created with, and the healthcheck and Mongo Express use
+it literally too, so encoding it in both places gives you a database that
+reports healthy while the bot and the server cannot sign in to it. The
+easiest way out is to generate the password rather than invent one, with the
+same command `.env.example` suggests, since its alphabet contains none of
+those characters:
+
+```sh
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+See [`MONGO_HOST`](./env_file.md#mongo_host) for what each character does.
 
 The override also brings up Mongo Express, which needs two credentials of its
 own. Uncomment them in `.env` and fill them in:
@@ -165,11 +191,8 @@ Granting `readWrite` on `MONGO_DATABASE` covers all of it.
 
 ## Step 8: Configure the .env file
 
-```sh
-cp .env.example .env
-```
-
-Fill in every value from the steps above. The full reference, including
+`.env` already exists, from Step 7, with your database values in it. Fill in
+every remaining value from the steps above. The full reference, including
 defaults and what each wrong value does, is in
 [env_file.md](./env_file.md).
 
@@ -504,10 +527,50 @@ docker compose exec mongodb mongosh --quiet \
 
 Zero means the purge has run.
 
-Tokens already handed out stay valid until they are revoked. Revoke them from
-your OAuth app's page under <https://github.com/settings/developers>, and
-reduce the app's requested scope to `read:user`. See
-[SECURITY.md](../SECURITY.md) for the full account of the issue.
+Tokens already handed out stay valid until they are revoked, and **the purge
+does not revoke them**. It deletes your copy; GitHub still honours them.
+
+There is no setting to change on the app itself. An OAuth app has no
+configured scope: the scope is what the code asks for in the authorization
+URL, and the current code asks for `read:user` only.
+
+**Do this before the first start of the new version**, because the purge
+deletes the only copy of the tokens you hold and GitHub's revocation endpoint
+needs the token itself. Write them to a file:
+
+```sh
+docker compose exec mongodb mongosh --quiet \
+  -u starguard -p 'the password you put in .env' \
+  --authenticationDatabase admin \
+  --eval 'db.getSiblingDB("starguard").users.find({github_token:{$exists:true}}, {_id:0, github_token:1}).forEach(d => print(d.github_token))' \
+  > legacy-tokens.txt
+```
+
+Then revoke each one against your own app, with the client id and secret as
+the HTTP basic credentials:
+
+```sh
+while IFS= read -r token; do
+  curl -sS -o /dev/null -w '%{http_code}\n' -X DELETE \
+    -u "$GITHUB_CLIENT_ID:$GITHUB_CLIENT_SECRET" \
+    -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/applications/$GITHUB_CLIENT_ID/grant" \
+    -d "{\"access_token\":\"$token\"}"
+done < legacy-tokens.txt
+```
+
+`204` is a revoked grant, and with it every token that grant had issued to
+that member. `404` means there was nothing left to revoke. Delete the file
+when you are done: `rm legacy-tokens.txt`.
+
+**If the purge has already run**, you no longer hold the tokens, and GitHub
+offers app owners no way to revoke without them. Every affected member then
+has to revoke for themselves, at
+`https://github.com/settings/connections/applications/<your client id>`, and
+you can neither do it for them nor see who has. The only alternative is
+deleting the OAuth app, which costs everyone a re-verification. See
+[SECURITY.md](../SECURITY.md) for the full account of the issue and of the
+pages that look like they would help but do not.
 
 ### 2. Set a real `SECRET_KEY`
 
@@ -785,6 +848,19 @@ The symptom, and what the member sees, is in
   If you set `BOT_HEALTH_ENABLED=false`, nothing answers the probe and the
   container is reported `unhealthy` forever; disable the `healthcheck` block
   too if you turn the endpoint off.
+- **It measures both reconciling loops, so a container that looked healthy
+  before may now report `unhealthy`.** The payload names `star_check` for the
+  periodic sweep and `role_sync` for the webhook drain, each `disabled`,
+  `pending`, `ok` or `stale`, and either one going stale is a 503. The case
+  that changes on upgrade is a webhook-only deployment,
+  `AUTOMATIC_CHECK=false` with `ROLE_SYNC_ENABLED=true`: the drain is then the
+  only thing reconciling anything, and a bot whose drain had never once
+  reached the database still answered 200 for as long as it ran. If a
+  container goes `unhealthy` after this upgrade, read the payload before
+  assuming the healthcheck is at fault: it is more likely to be telling you
+  about a database the bot has never reached. The field meanings are in
+  [env_file.md](./env_file.md#bot-health-check) and the failures in
+  [the troubleshooting guide](./troubleshooting.md#discord-bot).
 - **Eleven variables are new**: `SERVER_BIND_PORT`, `TRUSTED_PROXY_COUNT`,
   `LOGIN_RATE_LIMIT`, `LOGIN_RATE_LIMIT_WINDOW`, `BOT_HEALTH_ENABLED`,
   `BOT_HEALTH_HOST`, `BOT_HEALTH_PORT`, `LOG_FORMAT`, `GITHUB_WEBHOOK_SECRET`,

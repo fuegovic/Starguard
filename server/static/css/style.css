@@ -100,7 +100,15 @@ p {
   font-size: 1.25rem;
   font-weight: 400;
   max-width: 40ch;
-  overflow-wrap: break-word;
+  /* anywhere, not break-word. Both permit a break inside a long token, but
+     only anywhere counts that break when the browser computes min-content,
+     so with break-word a flex item still grows to fit the token and the
+     page scrolls sideways. That is not hypothetical here: the OAuth error
+     message interpolates GitHub's own error_description, which for a
+     refused redirect_uri contains a URL, and a URL is one unbroken token.
+     Measured at 320px it overflowed by 62px, which is a WCAG 1.4.10
+     failure on the error page specifically. */
+  overflow-wrap: anywhere;
 }
 
 .message {

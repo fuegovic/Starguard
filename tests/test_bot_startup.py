@@ -220,13 +220,21 @@ def test_importing_the_entry_point_has_no_side_effects(module):
 
 
 class FakeHealth:
-    """Records what the startup listener reported about readiness."""
+    """Records what create_client watches and what startup marks ready."""
 
     def __init__(self):
-        self.ready = []
+        self.ready = 0
+        self.loops = {}
 
-    def mark_ready(self, stale_after=None):
-        self.ready.append(stale_after)
+    def watch(self, loop):
+        self.loops[loop.field] = loop
+
+    def mark_ready(self):
+        self.ready += 1
+
+    def deadlines(self):
+        """The staleness budget of each watched loop, by payload field."""
+        return {field: loop.stale_after for field, loop in self.loops.items()}
 
 
 class FakeClient:
@@ -261,16 +269,31 @@ def run_startup(client):
 
 
 def test_startup_starts_the_periodic_check_and_marks_the_bot_ready(environment):
-    environment(AUTOMATIC_CHECK_DELAY="600")
+    environment(AUTOMATIC_CHECK_DELAY="600", ROLE_SYNC_INTERVAL="20")
     health = FakeHealth()
-    client, _ = create_client(load_bot_config(), users=None, health=health)
+    client, checker = create_client(load_bot_config(), users=None, health=health)
 
     task = run_startup(client)
 
     # Holding the reference is what keeps asyncio from collecting the task
     # mid-run, so the attribute is part of the contract, not a detail.
     assert task is getattr(client, "starguard_check_task", None)
-    assert health.ready == [stale_after_seconds(600)]
+    assert health.ready == 1
+    # Both reconciling loops are on, so both carry a deadline.
+    assert health.deadlines() == {
+        "star_check": stale_after_seconds(600),
+        "role_sync": stale_after_seconds(20),
+    }
+    # And each field reads its own loop's progress rather than a value
+    # copied at startup. Separately, too: pointing both of them at the
+    # sweep's completion time would have a drain-only deployment report
+    # the sweep's staleness under the drain's name, which is the failure
+    # the pair was added for. The drain is not returned by create_client,
+    # so the sweep's side is the one moved here and the drain's is the one
+    # that must not move with it.
+    checker._last_completed = 4242.0  # pylint: disable=protected-access
+    assert health.loops["star_check"].last_completed() == 4242.0
+    assert health.loops["role_sync"].last_completed() is None
 
 
 def test_startup_with_automatic_checks_off_starts_nothing(environment, caplog):
@@ -284,8 +307,31 @@ def test_startup_with_automatic_checks_off_starts_nothing(environment, caplog):
     assert not hasattr(client, "starguard_check_task")
     # Nothing can be late when nothing is scheduled, so the endpoint is told
     # there is no staleness to report rather than a deadline it will miss.
-    assert health.ready == [None]
+    assert health.deadlines()["star_check"] is None
+    assert health.ready == 1
     assert "disabled" in caplog.text
+
+
+def test_a_drain_only_deployment_still_has_something_to_be_late(environment):
+    # The bug this pairing exists for. On webhooks alone the drain is the
+    # only loop reconciling anything, and the endpoint used to be handed
+    # nothing at all to measure: a bot whose drain never once reached the
+    # database answered /healthz with 200 for as long as it ran.
+    environment(AUTOMATIC_CHECK="false", ROLE_SYNC_ENABLED="true", ROLE_SYNC_INTERVAL="30")
+    health = FakeHealth()
+    create_client(load_bot_config(), users=None, health=health)
+
+    assert health.deadlines() == {
+        "star_check": None,
+        "role_sync": stale_after_seconds(30),
+    }
+
+
+def test_neither_loop_is_watched_without_a_health_endpoint(environment):
+    # create_client is handed no HealthState at all in the tests that only
+    # want a client, and registering against nothing must not be an error.
+    environment()
+    assert create_client(load_bot_config(), users=None)[0] is not None
 
 
 def test_startup_without_a_health_endpoint_still_runs(environment):
@@ -330,6 +376,9 @@ def wire_main(monkeypatch, users="the-users"):
     served = []
     client = FakeClient()
     checker = SimpleNamespace(last_completed=123.0)
+    # main() keeps no reference to either loop now: what the endpoint reads
+    # was wired up inside create_client, which is the only place that holds
+    # the drain at all.
 
     def fake_create_client(config, collection, health):
         built.update(config=config, users=collection, health=health)
@@ -350,12 +399,12 @@ def test_main_builds_the_client_and_connects_to_discord(environment, monkeypatch
 
     assert built["users"] == "the-users"
     assert client.started is True
-    # The health endpoint reads the checker's current value rather than a
-    # copy taken at startup, so it is handed a callable.
-    state, host, port, last_completed = served[0]
+    # The endpoint is handed the state and nothing else: which loops it
+    # reports on is settled by create_client, so main() does not have to
+    # hold either of them to pass a reader in.
+    state, host, port = served[0]
     assert (host, port) == ("127.0.0.1", 9123)
     assert state is built["health"]
-    assert last_completed() == 123.0
 
 
 def test_main_skips_the_health_endpoint_when_it_is_turned_off(environment, monkeypatch):

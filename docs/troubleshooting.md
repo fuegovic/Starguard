@@ -73,6 +73,7 @@ container.
 | `AUTOMATIC_CHECK must be a boolean such as true/false, got '...'.` | Use `true` or `false`. |
 | `AUTOMATIC_CHECK_DELAY must be a whole number, got '1h'.` | Use seconds, as a plain number. |
 | `BOT_HEALTH_PORT must be a TCP port between 1 and 65535, got 70000.` | A mistyped port. Same message for `SERVER_BIND_PORT`. Ports are refused rather than clamped, because a clamped port is a different address. |
+| `MONGO_HOST is not a usable MongoDB connection string: <reason>` | The driver could not parse the value. Usually an unencoded character in the password or a mistyped port; see [a malformed connection string](#a-malformed-connection-string). **From the server only.** The bot does not check this value while loading its configuration, so the same `MONGO_HOST` fails it later and less tidily. |
 
 If the container exits before printing anything at all, Compose could not
 build the environment. Look for `set MONGO_INITDB_ROOT_USERNAME in .env` or a
@@ -100,10 +101,18 @@ Full reference: [env_file.md](./env_file.md).
   the compose files. `docker inspect <container> --format '{{.State.OOMKilled}}'`
   says whether that is what happened. Raise the limit under
   `deploy.resources.limits.memory` in a `docker-compose.override.yml`.
+- **`MONGO_HOST` carries a port the driver cannot read**, and this one hits
+  the bot only. The traceback ends in `ValueError: Port contains non-digit
+  characters`. The bot reads `MONGO_HOST` as a plain string, so an
+  unparseable one is not reported as a configuration error the way the
+  server reports it; see [a malformed connection
+  string](#a-malformed-connection-string).
 
-MongoDB being unreachable is **not** a reason for either process to exit. Both
-start anyway and run degraded; see
+MongoDB being *unreachable* is **not** a reason for either process to exit.
+Both start anyway and run degraded; see
 [MongoDB connection and authentication failures](#mongodb-connection-and-authentication-failures).
+A `MONGO_HOST` the driver cannot parse at all is the exception, and it is the
+case above.
 
 ## The bot is online but has no slash commands
 
@@ -416,11 +425,12 @@ Error connecting to MongoDB: <reason>
 ```
 
 This one is narrower: the driver refused the **connection string itself**, so
-no client was built at all. The server answers `/healthz` with the same 503
-and `{"database":"unavailable","status":"degraded"}` as above, shows visitors
-`The database is unavailable right now. Please try again later.` rather than
-the save failure, and the bot logs `Skipping star check: no database
-connection.` every cycle. The usual cause is an unescaped character in the
+no client was built at all. In practice it comes from the bot, which then
+logs `Skipping star check: no database connection.` every cycle and grants no
+roles for as long as it runs. The server checks `MONGO_HOST` with the driver
+while loading its configuration, so a value this would reject stops it at
+startup with `Configuration error: MONGO_HOST is not a usable MongoDB
+connection string` instead. The usual cause is an unescaped character in the
 password. See [a malformed connection string](#a-malformed-connection-string)
 below.
 
@@ -438,6 +448,11 @@ After the **second** kind there is no client at all, and nothing creates one
 later. That process is degraded for its whole life and a restart is the only
 fix.
 
+A third outcome is neither of these and prints no such line, because the
+process does not get far enough to log one: a `MONGO_HOST` whose port the
+driver cannot read kills the bot with a traceback. See [a malformed
+connection string](#a-malformed-connection-string).
+
 **Read the reason at the end of the line.**
 
 ### `Authentication failed`
@@ -454,8 +469,18 @@ fix.
    second form.
 2. The username and password in `MONGO_HOST` must match
    `MONGO_INITDB_ROOT_USERNAME` and `MONGO_INITDB_ROOT_PASSWORD` exactly.
-3. If the password contains any of `: / ? # [ ] @`, percent-encode it in the
-   connection string, or change it to one without them.
+3. Percent-encode anything in the password that means something in a URI:
+   `@ : / ? % +`, and `# [ ]` for good measure. Encode it in `MONGO_HOST`
+   and **only** there. `MONGO_INITDB_ROOT_PASSWORD` is the literal password
+   MongoDB was created with, and the healthcheck and Mongo Express use it
+   literally too, so a database that reports healthy while the bot and the
+   server cannot sign in is the signature of encoding it in both places.
+   Watch for `+` in particular: it does not break the connection string, it
+   is silently decoded to a space, so the password that reaches MongoDB is
+   simply the wrong one. If the `mongodb` container is reporting healthy
+   while only the bot and the server fail, read [that
+   entry](#the-database-is-healthy-and-only-the-bot-and-the-server-cannot-sign-in)
+   first.
 4. **If you just upgraded from a version whose database ran without
    authentication, the root user was never created.** The official image only
    creates it when the data directory is empty, and yours is not. Do not
@@ -507,25 +532,83 @@ covers all four steps, then restart the process so they run again.
 
 ### A malformed connection string
 
-**Symptom.** Either `Error connecting to MongoDB: Username and password must
-be escaped according to RFC 3986, use urllib.parse.quote_plus`, or the process
-dies outright with a traceback ending in:
+**Symptom.** One of three, and which one tells you which container to look
+at. The **server** refuses to start and names the variable:
+
+```
+Configuration error: MONGO_HOST is not a usable MongoDB connection string: <reason>
+```
+
+The **bot** either logs an `Error connecting to MongoDB` line, usually
+`Username and password must be escaped according to RFC 3986, use
+urllib.parse.quote_plus` and sometimes `Bad database name "..."`, and carries
+on with no database, or dies outright with a traceback ending in:
 
 ```
 ValueError: Port contains non-digit characters. Hint: username and password must be escaped according to RFC 3986, use urllib.parse.quote_plus
 ```
 
 **Cause.** A character in the username or password that has a meaning in a
-URI. An `@` makes the driver read the rest of the password as the host; a `:`
-makes it read the rest as the port, which is the case that ends in the
-traceback rather than a handled error.
+URI, or a port that is not one.
 
-**Fix.** Percent-encode the credentials in `MONGO_HOST`, or change the
-password to one without `: / ? # [ ] @`. To encode an existing one:
+The server parses `MONGO_HOST` with the driver as it loads its configuration,
+so every one of these reaches it as an ordinary named configuration error.
+The bot does not, so it is the container that shows the two messier
+outcomes, and which of them depends on how the driver fails:
+
+- `@`, `:`, `/` or `%` is reported as a MongoDB error. The bot catches it,
+  logs the `Error connecting to MongoDB` line, and runs on granting no roles.
+- **A malformed port is not caught**, and it is the case that ends in the
+  traceback. `mongodb://mongodb:70000/` and `mongodb://mongodb:notaport/`
+  reach it directly. An unencoded `?` reaches it the long way round: it ends
+  the part of the string the driver reads as credentials and host, which can
+  leave what was meant to be password text sitting where the port belongs.
+  Either way the `ValueError` that raises is not a MongoDB error, so nothing
+  catches it. The container exits, `restart: always` brings it back, and it
+  exits again.
+
+There is a third character with no symptom at all here: a `+` neither breaks
+the string nor stops the process, it is silently decoded to a space, so the
+password reaching MongoDB is not the one you set. That one has its own entry,
+[the database is healthy and only the bot and the server cannot sign
+in](#the-database-is-healthy-and-only-the-bot-and-the-server-cannot-sign-in).
+
+**Fix.** Percent-encode the credentials in `MONGO_HOST`, and only there:
+`MONGO_INITDB_ROOT_PASSWORD`, the healthcheck and Mongo Express all take the
+literal password. To encode an existing one:
 
 ```sh
 python -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" 'your password'
 ```
+
+### The database is healthy and only the bot and the server cannot sign in
+
+**Symptom.** The `mongodb` container reports `healthy`, `mongosh` with the
+credentials from `.env` works, Mongo Express signs in, and yet both Python
+processes log `Authentication failed`. No parse error, no traceback: the
+connection string is perfectly valid, it just carries a password that is not
+the one you set.
+
+**Cause.** A `+` in the password. PyMongo decodes the credential part of the
+URI, and in that decoding a literal `+` becomes a space. Nothing else in the
+stack does that: `MONGO_INITDB_ROOT_PASSWORD` reaches MongoDB, the compose
+healthcheck and Mongo Express as a plain string, so all three agree with each
+other and only the two processes that parse a URI disagree. That is why this
+one looks like a database that is fine and an application that is broken.
+
+Ask the driver what it will actually send:
+
+```sh
+python -c "import sys; from pymongo.uri_parser import parse_uri; print(repr(parse_uri(sys.argv[1])['password']))" \
+  'mongodb://user:pa+ss@mongodb:27017/?authSource=admin'
+```
+
+That prints `'pa ss'` where you wrote `pa+ss`. With the `+` encoded as `%2B`
+it prints `'pa+ss'`, which is the password MongoDB is holding.
+
+**Fix.** Percent-encode the `+` as `%2B` in `MONGO_HOST`, and leave
+`MONGO_INITDB_ROOT_PASSWORD` as the literal password. Encoding both is how
+you get here in the first place.
 
 ### The mongodb container is `unhealthy`
 
@@ -557,12 +640,21 @@ what makes those two print their body instead of a traceback; a bare
 `urlopen(...).read()` shows you nothing for exactly the cases you are looking
 at.
 
+The body names two loops, `star_check` for the periodic star sweep and
+`role_sync` for the role sync drain, and each is `disabled`, `pending`, `ok`
+or `stale`. Read the one that is not `ok`:
+
 | Body | Status | Meaning |
 | --- | --- | --- |
 | `{"status": "starting", ..., "gateway": "connecting"}` | 503 | Not connected to the Discord gateway yet. Normal for the first few seconds; the healthcheck allows 60. If it persists, see [restarts in a loop](#without-a-configuration-error). |
-| `{"status": "ok", ..., "star_check": "disabled"}` | 200 | Healthy, with `AUTOMATIC_CHECK=false`. |
-| `{"status": "ok", ..., "star_check": "pending"}` | 200 | Healthy, first automatic check has not finished yet. |
-| `{"status": "degraded", ..., "star_check": "stale"}` | 503 | Automatic checks are on, but the last completed one is older than `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds. Look for `Automatic star check failed` in the log: usually GitHub is rate limiting or the database is unreachable. |
+| `..., "star_check": "disabled"` or `"role_sync": "disabled"` | 200 | Healthy. That loop is off, through `AUTOMATIC_CHECK=false` or `ROLE_SYNC_ENABLED=false`. |
+| `..., "star_check": "pending"` or `"role_sync": "pending"` | 200 | Healthy. That loop is on and its first pass has not finished yet, so it carries no age field. |
+| `{"status": "degraded", ..., "star_check": "stale"}` | 503 | Automatic checks are on, but no pass has completed within `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds, counting from startup if none ever has. Look for `Automatic star check failed` in the log: usually GitHub is rate limiting or the database is unreachable. |
+| `{"status": "degraded", ..., "role_sync": "stale"}` | 503 | The drain is on, but no pass has completed within `ROLE_SYNC_INTERVAL * 3 + 300` seconds, counting from startup if none ever has. Almost always the database: a pass that gives up before walking the queue does not count as completed. Which log line you have decides whether it clears by itself; see [MongoDB connection and authentication failures](#mongodb-connection-and-authentication-failures). `Skipping the role sync drain: no database connection.` every pass means the bot started without a usable `MONGO_HOST` and will never recover, so restart it once the value is right. `Role sync drain failed (N in a row)` means a client exists and the driver keeps trying, so this clears on its own when MongoDB answers again. |
+
+A `degraded` body still reports the healthy loop beside the stale one, and
+`last_check_age_seconds` and `last_role_sync_age_seconds` appear only for a
+loop that has completed at least one pass. Their absence is not a fault.
 
 **The probe fails with a connection error instead of a status.** Two causes:
 
@@ -593,10 +685,11 @@ covered under
 [MongoDB connection and authentication failures](#mongodb-connection-and-authentication-failures).
 
 **The probe reaches the database.** It sends a `ping` command on every
-request, so it answers 503 both when no client could be built from
-`MONGO_HOST` and when the database is simply unreachable or refusing the
-credentials, and it logs `Health probe could not reach MongoDB: <reason>`. A
-200 therefore does mean the database answered a moment ago. What it does not
+request, so it answers 503 whenever the database is unreachable or refusing
+the credentials, and it logs `Health probe could not reach MongoDB:
+<reason>`. A 200 therefore does mean the database answered a moment ago. A
+`MONGO_HOST` the driver cannot use at all does not show up here, because the
+server now rejects that while loading its configuration and never starts. What it does not
 prove is that the startup work succeeded: a user with no right to create an
 index answers a `ping` perfectly well, so if members are failing at the last
 step with a healthy probe, read the four `Could not ...` lines in the server's

@@ -14,6 +14,7 @@ work that did not happen is a role nobody takes back at all.
 
 import asyncio
 import contextlib
+import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -21,6 +22,7 @@ from interactions.client.errors import Forbidden
 from pymongo.errors import PyMongoError
 
 from bot.bot import create_client
+from bot.memberlock import MemberLocks
 from bot.rolesync import DRAIN_ERROR_BACKOFF_MAX_SECONDS, DrainResult, RoleSyncDrainer
 from bot.starcheck import StarChecker
 from common.storage import STAR_SOURCE_WEBHOOK, record_star_event
@@ -39,6 +41,7 @@ from tests.test_starcheck import (
     listing,
     make_config,
 )
+from tests.test_verification import FakeContext, register
 
 
 class RecordingUsers(FakeUsers):
@@ -128,12 +131,18 @@ def unusable(spelling, discord_id=1, starred=False):
     return document
 
 
-def build(documents, holds=(), members=None, guild=None, **config_overrides):
+def build(documents, holds=(), members=None, guild=None, member_locks=None, **config_overrides):
     """Wire a drainer up to fakes. Returns (drainer, members, channel, users).
 
     ``holds`` names the Discord IDs that already have the role, which is
     the other half of every case here: the drain's job is the difference
     between what the row says and what Discord says.
+
+    ``member_locks`` is the registry the drain takes a member's mutex from.
+    A private one is right for a drain on its own; the tests that run a
+    drain against a sweep or a claim pass the registry they share, because
+    three private registries would be three sets of mutexes and no
+    exclusion at all.
     """
     if members is None:
         held = {str(one) for one in holds}
@@ -149,7 +158,12 @@ def build(documents, holds=(), members=None, guild=None, **config_overrides):
     channel = FakeChannel()
     users = RecordingUsers(documents)
     client = FakeClient(FakeGuild(members) if guild is None else guild, channel)
-    drainer = RoleSyncDrainer(client, make_config(**config_overrides), users, asyncio.Lock())
+    drainer = RoleSyncDrainer(
+        client,
+        make_config(**config_overrides),
+        users,
+        MemberLocks() if member_locks is None else member_locks,
+    )
     return drainer, members, channel, users
 
 
@@ -272,7 +286,7 @@ def test_a_webhook_landing_mid_call_is_not_unqueued_by_the_clear():
     members = {"1": InterruptedMember("1", roles=())}
     channel = FakeChannel()
     client = FakeClient(FakeGuild(members), channel)
-    drainer = RoleSyncDrainer(client, make_config(), users, asyncio.Lock())
+    drainer = RoleSyncDrainer(client, make_config(), users, MemberLocks())
 
     async def two_polls():
         return await drainer.drain_once(), await drainer.drain_once()
@@ -288,6 +302,110 @@ def test_a_webhook_landing_mid_call_is_not_unqueued_by_the_clear():
     assert members["1"].roles == set()
     assert users.documents[0]["role_sync_pending"] is False
     assert len(channel.sent) == 1
+
+
+def test_a_re_star_while_the_role_is_being_taken_gets_no_public_farewell():
+    # The sibling of the case above on the other side of the row. The
+    # removal succeeds, and before the clear runs a webhook records the
+    # re-star and raises the flag again, so the conditional clear matches
+    # nothing and the newer grant is still queued. That much already
+    # worked. What did not is that the farewell went out anyway: the next
+    # poll hands the role straight back, and "sorry to see you go" stays
+    # in the channel for somebody who stars the repository.
+    documents = [pending(1, False)]
+    users = RecordingUsers(documents)
+
+    class InterruptedMember(FakeMember):
+        """A member whose row a webhook rewrites while the call is in flight."""
+
+        async def remove_role(self, role_id, reason=None):
+            await super().remove_role(role_id, reason)
+            # What record_star_event writes in that window: the star is
+            # back, and the flag that was already up stays up.
+            users.documents[0].update(starred_repo=True, role_sync_pending=True)
+
+    members = {"1": InterruptedMember("1", roles=(ROLE_ID,))}
+    channel = FakeChannel()
+    client = FakeClient(FakeGuild(members), channel)
+    drainer = RoleSyncDrainer(client, make_config(), users, MemberLocks())
+
+    async def two_polls():
+        return await drainer.drain_once(), await drainer.drain_once()
+
+    first, second = asyncio.run(two_polls())
+
+    # The role really was taken, so the pass reports it. What it does not
+    # do is say so in public, because it is about to be given back.
+    assert first == DrainResult(examined=1, removed=1)
+    assert not channel.sent
+    # The flag stayed up, so the next poll acts on the newer value.
+    assert second == DrainResult(examined=1, granted=1)
+    assert members["1"].roles == {ROLE_ID}
+    assert users.documents[0]["role_sync_pending"] is False
+    # And still nothing was announced, about either half of it.
+    assert not channel.sent
+
+
+def test_a_claim_a_drain_and_a_sweep_never_act_on_one_member_at_once(monkeypatch):
+    # The path nobody had put in the picture. The claim button is the
+    # third thing in this process that moves this role, and until now it
+    # was excluded from neither of the other two. What that costs:
+    #
+    #   1. The row says un-starred, the member holds the role, and they
+    #      press Claim. It reads the row and starts removing the role.
+    #   2. They re-star. The webhook writes starred and raises the flag.
+    #   3. The drain reads the row, sees the role still on the member,
+    #      concludes Discord already agrees and lowers the flag.
+    #   4. The claim's removal lands.
+    #
+    # The row then says the member stars the repository, nothing is
+    # queued, and they hold no role, and the sweep only ever takes roles
+    # away, so nothing would ever put it back. That interleaving cannot be
+    # forced once the fix is in, which is what the fix means, so what is
+    # asserted here is the property that rules it out: no two of the three
+    # are ever inside one member at the same time.
+    #
+    # All three are given the same work on the same member, so each of
+    # them looks at member.has_role and each of them wants to remove the
+    # role. Without exclusion they all see it held and all three call
+    # Discord.
+    depth = {"now": 0, "peak": 0}
+    document = {
+        **pending(1, False),
+        "linked_repo": make_config().repo_url,
+    }
+    users = RecordingUsers([document])
+    member = TrackedMember("1", depth)
+    channel = FakeChannel()
+    client = FakeClient(FakeGuild({"1": member}), channel)
+    config = make_config()
+
+    monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", lambda *a, **k: listing())
+    member_locks = MemberLocks()
+    checker = StarChecker(client, config, users, member_locks)
+    drainer = RoleSyncDrainer(client, config, users, member_locks)
+    buttons, _ = register(users=users, member_locks=member_locks)
+
+    async def all_three():
+        ctx = FakeContext(author=member)
+        return await asyncio.gather(
+            checker.run_once(),
+            drainer.drain_once(),
+            buttons.component_callbacks["claim"].callback(ctx),
+        )
+
+    asyncio.run(all_three())
+
+    assert depth["peak"] == 1
+    # Whichever of the three got there first did the work, and the other
+    # two found the role already gone. One role change, and at most one
+    # farewell: the claim posts none, and neither of the loops announces
+    # a removal it did not make.
+    assert member.removals == 1
+    assert member.roles == set()
+    assert len(channel.sent) <= 1
+    # Nothing is left queued over a role change that has already happened.
+    assert users.documents[0]["role_sync_pending"] is False
 
 
 def test_one_unusable_row_does_not_strand_the_rest_of_the_queue(caplog):
@@ -419,6 +537,12 @@ def test_no_database_connection_is_skipped_rather_than_crashing(caplog):
         assert asyncio.run(drainer.drain_once()) == DrainResult()
 
     assert "no database connection" in caplog.text
+    # And it is not progress. On a deployment with AUTOMATIC_CHECK=false
+    # this loop is the only one reconciling anything, so counting a pass
+    # that never reached the database would be the health endpoint
+    # answering 200 about a bot that does nothing. A connection made at
+    # startup is never remade, so this state lasts until a restart.
+    assert drainer.last_completed is None
 
 
 def test_a_guild_missing_from_the_cache_is_skipped():
@@ -427,6 +551,50 @@ def test_a_guild_missing_from_the_cache_is_skipped():
     assert asyncio.run(drainer.drain_once()) == DrainResult()
     assert members["1"].additions == 0
     assert not users.writes
+    # Nor is this, for the same reason: nothing was reconciled.
+    assert drainer.last_completed is None
+
+
+def test_a_pass_that_walked_the_queue_is_recorded_as_progress():
+    # The other side of the two above, and what the health endpoint reads
+    # off this loop. An empty queue counts: reading the partial index and
+    # finding nothing waiting is the drain working, not the drain stuck.
+    drainer, _, _, _ = build([])
+    assert drainer.last_completed is None
+
+    asyncio.run(drainer.drain_once())
+    idle = drainer.last_completed
+    assert idle is not None
+
+    drainer, members, _, _ = build([pending(1, True)])
+    asyncio.run(drainer.drain_once())
+    assert members["1"].roles == {ROLE_ID}
+    assert drainer.last_completed is not None
+
+
+def test_the_completion_time_is_only_set_once_a_pass_has_walked_the_queue():
+    # The health endpoint reports the age of this value, so a pass that
+    # never reconciled anything must not look like one that just did.
+    drainer, _, _, _ = build([pending(1, True)])
+    assert drainer.last_completed is None
+
+    asyncio.run(drainer.drain_once())
+    assert isinstance(drainer.last_completed, float)
+
+
+@pytest.mark.parametrize("skip", ["no database", "no guild"])
+def test_a_skipped_pass_does_not_count_as_a_completed_one(skip):
+    # Both early returns do no reconciling at all. Recording them as a
+    # completed pass is what let a drain-only deployment report itself
+    # healthy while moving no roles: the endpoint would see a fresh
+    # timestamp every thirty seconds for a loop that was doing nothing.
+    guild_id = GUILD_ID + 1 if skip == "no guild" else GUILD_ID
+    drainer, _, _, _ = build([pending(1, True)], guild_id=guild_id)
+    if skip == "no database":
+        drainer._users = None
+
+    assert asyncio.run(drainer.drain_once()) == DrainResult()
+    assert drainer.last_completed is None
 
 
 def test_the_loop_waits_the_configured_interval_between_drains(monkeypatch):
@@ -533,8 +701,9 @@ def test_a_star_during_the_walk_survives_the_sweep_and_reaches_the_drain(monkeyp
         return listing()
 
     monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", star_during_the_walk)
-    checker = StarChecker(client, config, users)
-    drainer = RoleSyncDrainer(client, config, users, checker.lock)
+    member_locks = MemberLocks()
+    checker = StarChecker(client, config, users, member_locks)
+    drainer = RoleSyncDrainer(client, config, users, member_locks)
 
     async def sweep_then_drain():
         return await checker.run_once(), await drainer.drain_once()
@@ -591,8 +760,9 @@ def test_a_role_taken_on_stale_information_is_queued_and_put_back(monkeypatch):
     members["1"].remove_role = star_between_the_check_and_the_write
 
     monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", lambda *a, **k: listing())
-    checker = StarChecker(client, config, users)
-    drainer = RoleSyncDrainer(client, config, users, checker.lock)
+    member_locks = MemberLocks()
+    checker = StarChecker(client, config, users, member_locks)
+    drainer = RoleSyncDrainer(client, config, users, member_locks)
 
     async def sweep_then_drain():
         return await checker.run_once(), await drainer.drain_once()
@@ -667,49 +837,75 @@ def test_startup_with_the_drain_turned_off_starts_nothing(caplog):
     assert "ROLE_SYNC_ENABLED=false" in caplog.text
 
 
-def test_a_sweep_and_a_drain_never_act_at_the_same_time(monkeypatch):
-    # The two loops reach the same members and the same role. A lock of the
-    # drain's own would be no exclusion at all, which is why it is handed
-    # the checker's: two mutexes held independently let both loops into the
-    # same member at once, and the double role change is exactly what the
-    # checker's lock was added to stop.
+# How long a tracked role change holds the member open for company. Loop
+# turns rather than seconds, so the suite pays microseconds for it: each
+# one is a bare asyncio.sleep(0). The bound is generous because what has
+# to arrive within it is another component's thread hop, and it is a bound
+# rather than a rendezvous because the fixed code never sends anybody,
+# which is the whole point. See TrackedMember.
+COMPANY_TURNS = 500
+
+
+class TrackedMember(FakeMember):
+    """A member counting how many role changes are in flight on them at once.
+
+    The role change is held open until somebody else turns up inside it or
+    the turns run out. Without that the test measures thread scheduling
+    rather than exclusion: every component reaches a member through an
+    asyncio.to_thread hop, and one that resumes early can finish its whole
+    role change before the next one is handed back the event loop, so an
+    unlocked run looked exclusive about half the time.
+    """
+
+    def __init__(self, member_id, depth, roles=(ROLE_ID,)):
+        super().__init__(member_id, roles=roles)
+        self._depth = depth
+
+    async def _tracked(self, call):
+        self._depth["now"] += 1
+        self._depth["peak"] = max(self._depth["peak"], self._depth["now"])
+        try:
+            for _ in range(COMPANY_TURNS):
+                if self._depth["now"] > 1:
+                    # Somebody else is inside this member, which is the
+                    # answer; there is nothing to wait for any longer.
+                    break
+                await asyncio.sleep(0)
+            await call
+        finally:
+            self._depth["now"] -= 1
+
+    async def add_role(self, role_id, reason=None):
+        await self._tracked(super().add_role(role_id, reason))
+
+    async def remove_role(self, role_id, reason=None):
+        await self._tracked(super().remove_role(role_id, reason))
+
+
+def test_a_sweep_and_a_drain_never_act_on_the_same_member_at_once(monkeypatch):
+    # The two loops reach the same members and the same role. Registries of
+    # their own would be no exclusion at all, which is why the sweep, the
+    # drain and the claim button are handed one: two of them inside a
+    # member at once is the double role change and the double farewell the
+    # exclusion exists to stop.
+    #
+    # Both loops have real work on this one member. The listing says the
+    # star is gone, so the sweep strips the role, and a queued un-star says
+    # the drain should strip the same role. Each of them looks at
+    # member.has_role before it acts, so without exclusion both see it held
+    # and both call Discord.
     depth = {"now": 0, "peak": 0}
-
-    class TrackedMember(FakeMember):
-        """Counts how many role changes are in flight at once."""
-
-        async def _tracked(self, call):
-            depth["now"] += 1
-            depth["peak"] = max(depth["peak"], depth["now"])
-            try:
-                # Several yields, so anything free to interleave will.
-                for _ in range(3):
-                    await asyncio.sleep(0)
-                await call
-            finally:
-                depth["now"] -= 1
-
-        async def add_role(self, role_id, reason=None):
-            await self._tracked(super().add_role(role_id, reason))
-
-        async def remove_role(self, role_id, reason=None):
-            await self._tracked(super().remove_role(role_id, reason))
-
-    # One member the sweep must strip, one the drain must grant, so both
-    # loops have real work and neither can finish without touching Discord.
-    documents = [link(1, "Gone"), pending(2, True, username="Kept")]
-    members = {"1": TrackedMember("1", roles=(ROLE_ID,)), "2": TrackedMember("2", roles=())}
+    documents = [pending(1, False)]
+    members = {"1": TrackedMember("1", depth)}
     channel = FakeChannel()
     users = RecordingUsers(documents)
     client = FakeClient(FakeGuild(members), channel)
     config = make_config()
 
-    def fetch(owner, repo, token=None, cache=None):
-        return listing("kept", ids={account_id("Kept")})
-
-    monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", fetch)
-    checker = StarChecker(client, config, users)
-    drainer = RoleSyncDrainer(client, config, users, checker.lock)
+    monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", lambda *a, **k: listing())
+    member_locks = MemberLocks()
+    checker = StarChecker(client, config, users, member_locks)
+    drainer = RoleSyncDrainer(client, config, users, member_locks)
 
     async def both():
         return await asyncio.gather(checker.run_once(), drainer.drain_once())
@@ -717,8 +913,64 @@ def test_a_sweep_and_a_drain_never_act_at_the_same_time(monkeypatch):
     removed, result = asyncio.run(both())
 
     assert depth["peak"] == 1
-    assert removed == ["user1"]
-    assert result == DrainResult(examined=1, granted=1)
+    # Whichever of them got there first did the work; the other found it
+    # already done. One role change, and one goodbye rather than two.
+    assert members["1"].removals == 1
     assert members["1"].roles == set()
+    assert len(channel.sent) == 1
+    assert removed in ([], ["user1"])
+    assert result.examined == 1
+    assert users.documents[0]["role_sync_pending"] is False
+
+
+def test_a_drain_does_not_wait_out_a_sweep_of_other_members(monkeypatch):
+    # The other half of the split, and why one mutex for both jobs was
+    # wrong however well it excluded them. The cycle lock is held across
+    # fetch_stargazer_listing, documented as minutes on a repository with
+    # 45,000 stargazers, and across the whole member sweep after it.
+    # Handing that lock to the drain meant a webhook queued for anybody at
+    # all waited out an entire cycle, so the five to thirty second
+    # ROLE_SYNC_INTERVAL described nothing that happens.
+    crawling = threading.Event()
+    finish_crawl = threading.Event()
+
+    def slow_fetch(owner, repo, token=None, cache=None):
+        crawling.set()
+        # Stands in for the minutes a crawl costs. Waited on rather than
+        # slept through, so the test runs as fast as the code does; the
+        # timeout is there to fail rather than hang if the drain ever goes
+        # back to queueing behind the cycle.
+        assert finish_crawl.wait(timeout=10)
+        return listing("kept", ids={account_id("Kept")})
+
+    documents = [link(1, "Gone"), pending(2, True, username="Kept")]
+    members = {"1": FakeMember("1", roles=(ROLE_ID,)), "2": FakeMember("2", roles=())}
+    channel = FakeChannel()
+    users = RecordingUsers(documents)
+    client = FakeClient(FakeGuild(members), channel)
+    config = make_config()
+
+    monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", slow_fetch)
+    member_locks = MemberLocks()
+    checker = StarChecker(client, config, users, member_locks)
+    drainer = RoleSyncDrainer(client, config, users, member_locks)
+
+    async def scenario():
+        sweep = asyncio.create_task(checker.run_once())
+        assert await asyncio.to_thread(crawling.wait, 10)
+
+        result = await drainer.drain_once()
+        # The crawl has not returned, so the drain really did deliver a
+        # queued role change from inside a cycle rather than after it.
+        assert not sweep.done()
+
+        finish_crawl.set()
+        return result, await sweep
+
+    result, removed = asyncio.run(scenario())
+
+    assert result == DrainResult(examined=1, granted=1)
     assert members["2"].roles == {ROLE_ID}
-    assert users.documents[1]["role_sync_pending"] is False
+    # And the cycle still finishes its own work on the other member.
+    assert removed == ["user1"]
+    assert members["1"].roles == set()

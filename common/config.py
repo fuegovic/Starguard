@@ -9,6 +9,9 @@ import os
 from typing import Final, overload
 from urllib.parse import urlsplit
 
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+
 
 class ConfigError(RuntimeError):
     """Raised when the environment is missing or has an unusable value."""
@@ -171,6 +174,38 @@ def require_https_url(name: str) -> str:
             f"{name} must be a plain URL with no query string or fragment, got {raw!r}."
         )
     return raw.rstrip("/")
+
+
+def require_mongo_host(name: str) -> str:
+    """Return ``name`` as a connection string the driver will accept.
+
+    The driver itself is the check, constructed the way
+    :func:`common.storage.connect` constructs it, rather than a pattern of
+    this module's own. The value can be a bare hostname, a Docker service
+    name, a host list or a full ``mongodb://`` URI carrying options, and
+    only the driver knows the whole of that grammar; a rule written here
+    would refuse something it will happily take, which is the worse
+    mistake of the two.
+
+    Worth checking at all because this is the one setting whose bad values
+    are not reported like every other. A port that is not a number, or one
+    outside 1 to 65535, makes the constructor raise ``ValueError``, which
+    is not a ``PyMongoError`` and so goes straight past the guard the
+    server wraps its connection in: the process dies with a traceback and
+    the container restarts into the same traceback forever. A password
+    with an unescaped character raises ``InvalidURI``, which is caught, and
+    leaves a server that answers every request and can link nobody.
+    Neither outcome names the variable that is wrong.
+
+    Nothing is dialed. ``connect=False`` defers every socket, so this
+    parses the value and throws the client away.
+    """
+    value = require_env(name)
+    try:
+        MongoClient(host=value, connect=False).close()
+    except (ValueError, PyMongoError) as exc:
+        raise ConfigError(f"{name} is not a usable MongoDB connection string: {exc}") from exc
+    return value
 
 
 def require_secret_key() -> str:

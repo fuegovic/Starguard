@@ -27,6 +27,7 @@ from pymongo.errors import PyMongoError
 
 from bot import messages
 from bot.config import BotConfig
+from bot.memberlock import MemberLocks
 from bot.roles import safe_add_role, safe_remove_role
 from common.linktoken import issue_link_token
 from common.storage import UserCollection, find_link
@@ -56,7 +57,12 @@ def relink_button() -> Button:
     )
 
 
-def register_verification(client: Client, config: BotConfig, users: UserCollection | None) -> None:
+def register_verification(
+    client: Client,
+    config: BotConfig,
+    users: UserCollection | None,
+    member_locks: MemberLocks,
+) -> None:
     """Register /verify and the buttons that follow it."""
 
     # Guild-only. The whole point of the flow is to grant a role, and roles
@@ -126,49 +132,71 @@ def register_verification(client: Client, config: BotConfig, users: UserCollecti
             return
 
         member = cast(Member, ctx.author)
-        try:
-            user_entry = await asyncio.to_thread(find_link, users, ctx.author_id)
-        except PyMongoError as exc:
-            log.error("Could not read the link for %s: %s", ctx.author_id, exc)
-            await ctx.send(content=messages.CLAIM_LOOKUP_FAILED, ephemeral=True)
-            return
+        # The button is the third thing in this process that moves this
+        # role, and until now it was the one nothing excluded. It reads the
+        # row, decides from it and then talks to Discord, which is exactly
+        # what the sweep and the drain do, so the same interleavings apply:
+        # a claim that read starred_repo false could still be removing the
+        # role while a re-star queued a grant, the drain saw the role it
+        # was about to lose and settled the row as already correct, and the
+        # removal landed afterwards. That leaves a member the database says
+        # stars the repository holding no role, with nothing queued and
+        # nothing that would ever put it back.
+        #
+        # The read is inside the lock, not before it, because a snapshot
+        # taken outside is the stale information the lock exists to stop
+        # anybody acting on. Waiting costs this member the one role change
+        # ahead of them rather than a whole sweep; see bot.memberlock for
+        # why that distinction is the design.
+        if True:
+            try:
+                user_entry = await asyncio.to_thread(find_link, users, ctx.author_id)
+            except PyMongoError as exc:
+                log.error("Could not read the link for %s: %s", ctx.author_id, exc)
+                await ctx.send(content=messages.CLAIM_LOOKUP_FAILED, ephemeral=True)
+                return
 
-        # The repository is part of the question, not just the row. An
-        # operator who repoints REPO_OWNER or GITHUB_REPO while keeping the
-        # database leaves rows that say starred_repo about the repository
-        # they used to watch, and that is no evidence at all about the new
-        # one. Without this, everybody who had verified before the move
-        # could claim the role for a repository they have never starred.
-        # Every row a Discord ID can find was written by link_account,
-        # which always stores linked_repo, so this cannot lock out a row
-        # that simply predates the field.
-        if not user_entry or user_entry.get("linked_repo") != config.repo_url:
-            await ctx.send(
-                content=messages.CLAIM_NOT_LINKED.format(
-                    relink_label=messages.VERIFY_BUTTON_RELINK
-                ),
-                components=[ActionRow(relink_button())],
-                ephemeral=True,
-            )
-            return
+            # The repository is part of the question, not just the row. An
+            # operator who repoints REPO_OWNER or GITHUB_REPO while keeping
+            # the database leaves rows that say starred_repo about the
+            # repository they used to watch, and that is no evidence at all
+            # about the new one. Without this, everybody who had verified
+            # before the move could claim the role for a repository they
+            # have never starred. Every row a Discord ID can find was
+            # written by link_account, which always stores linked_repo, so
+            # this cannot lock out a row that simply predates the field.
+            if not user_entry or user_entry.get("linked_repo") != config.repo_url:
+                await ctx.send(
+                    content=messages.CLAIM_NOT_LINKED.format(
+                        relink_label=messages.VERIFY_BUTTON_RELINK
+                    ),
+                    components=[ActionRow(relink_button())],
+                    ephemeral=True,
+                )
+                return
 
-        if not user_entry.get("starred_repo", False):
-            # Only touch the role if they actually hold it.
+            if not user_entry.get("starred_repo", False):
+                # Only touch the role if they actually hold it.
+                if member.has_role(config.role_id):
+                    await safe_remove_role(member, config.role_id, "no_star")
+                await ctx.send(content=messages.CLAIM_NOT_STARRED, ephemeral=True)
+                return
+
             if member.has_role(config.role_id):
-                await safe_remove_role(member, config.role_id, "no_star")
-            await ctx.send(content=messages.CLAIM_NOT_STARRED, ephemeral=True)
-            return
+                await ctx.send(content=messages.CLAIM_ALREADY_HELD, ephemeral=True)
+                return
 
-        if member.has_role(config.role_id):
-            await ctx.send(content=messages.CLAIM_ALREADY_HELD, ephemeral=True)
-            return
+            if not await safe_add_role(member, config.role_id, "star"):
+                await ctx.send(content=messages.CLAIM_ROLE_FAILED, ephemeral=True)
+                return
 
-        if not await safe_add_role(member, config.role_id, "star"):
-            await ctx.send(content=messages.CLAIM_ROLE_FAILED, ephemeral=True)
-            return
-
-        # B311: picks a thank-you message, not a secret.
-        await ctx.send(content=random.choice(messages.THANKS).format(ctx.author_id))  # nosec B311
+            # B311: picks a thank-you message, not a secret. The nosec has
+            # to sit on the random.choice line rather than the send, because
+            # bandit matches a suppression to the line it reports the issue
+            # on, and splitting this call across lines moved that.
+            await ctx.send(
+                content=random.choice(messages.THANKS).format(ctx.author_id)  # nosec B311
+            )
 
     client.add_command(verify)
     client.add_component_callback(relink_callback)
