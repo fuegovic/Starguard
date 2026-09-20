@@ -34,7 +34,9 @@ exactly as the default for every consumer: `star_event_at` and `star_source`
 read as None, and the pending index is partial on ``True``, so a row without
 the field is simply not in the queue. `upgrade_documents` bumps an older
 row's version without materialising them, so there is one shape rather than
-two, and only `record_star_event` and `set_starred` ever write them.
+two. `record_star_event` and `set_starred` are their only writers, except
+that `link_account` clears them when a row changes GitHub account, since
+all three describe a row and an account together.
 
 `star_event_at` is load-bearing beyond bookkeeping. It is how the sweep and
 the webhook are ordered against each other, since they observe the same fact
@@ -520,6 +522,20 @@ def link_account(
     document: MongoDocument = {**identity, "starred_repo": starred}
 
     try:
+        # An account change is one statement, because none of the star
+        # fields survives it: all three describe a row and an account
+        # together. $ne also matches a row with no github_id, a legacy one
+        # adopting it. See the relink tests for what two statements cost.
+        changed_account = collection.update_one(
+            {"discord_id": discord_id, "github_id": {"$ne": github_id}},
+            {
+                "$set": {**identity, "starred_repo": starred},
+                "$unset": {"star_event_at": "", "star_source": ""},
+            },
+        )
+        if getattr(changed_account, "matched_count", 0):
+            return document
+
         collection.update_one(
             {"discord_id": discord_id},
             # The star state rides along only on an insert. A row this call
@@ -537,14 +553,10 @@ def link_account(
         raise AccountAlreadyLinkedError(github_id) from exc
 
     wrote_star = collection.update_one(
-        # Named by the identity above as well as the Discord ID, because
-        # this is a second write and the row can change owner between the
-        # two. Two callbacks for one Discord account carrying different
-        # GitHub accounts interleave exactly there: the other one replaces
-        # the identity, and a filter that knows only the Discord ID would
-        # then write this call's star state onto that account, which never
-        # had its star checked. Not matching is the correct outcome, and
-        # the fall-through below already reads the row back for it.
+        # Named by the identity too: this is a second write and the row
+        # can change owner between the two, so a Discord-ID-only filter
+        # would write this call's star state onto an account that never
+        # had its star checked. The fall-through below reads the row back.
         _not_newer_than(horizon, discord_id=discord_id, github_id=github_id),
         {"$set": {"starred_repo": starred}},
     )
@@ -555,14 +567,9 @@ def link_account(
         # the drain. Reading it back is what stops this reporting a star
         # state it has just declined to store; a row deleted in between
         # reads as no star, which is the direction that hands out no role.
-        # Named by the identity for the same reason the write above is.
-        # There are two ways not to match, and they want the same answer:
-        # a star event this call cannot speak for, where the row is still
-        # this identity and its state is the honest one to report, and a
-        # relink that took the row over, where the state belongs to an
-        # account this call never checked. Reading on the Discord ID alone
-        # cannot tell them apart and reports the second as though it were
-        # the first, which is the write's own bug one statement later.
+        # Named by the identity, like the write: a stale star event and a
+        # relink that took the row over both fail to match here, and the
+        # Discord ID alone reports the second as though it were the first.
         superseded = collection.find_one(
             {"discord_id": discord_id, "github_id": github_id}, {"_id": 0}
         )
