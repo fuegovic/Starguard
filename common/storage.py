@@ -555,7 +555,17 @@ def link_account(
         # the drain. Reading it back is what stops this reporting a star
         # state it has just declined to store; a row deleted in between
         # reads as no star, which is the direction that hands out no role.
-        superseded = collection.find_one({"discord_id": discord_id}, {"_id": 0})
+        # Named by the identity for the same reason the write above is.
+        # There are two ways not to match, and they want the same answer:
+        # a star event this call cannot speak for, where the row is still
+        # this identity and its state is the honest one to report, and a
+        # relink that took the row over, where the state belongs to an
+        # account this call never checked. Reading on the Discord ID alone
+        # cannot tell them apart and reports the second as though it were
+        # the first, which is the write's own bug one statement later.
+        superseded = collection.find_one(
+            {"discord_id": discord_id, "github_id": github_id}, {"_id": 0}
+        )
         document["starred_repo"] = bool(superseded and superseded.get("starred_repo"))
 
     return document
