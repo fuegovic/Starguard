@@ -148,7 +148,7 @@ def register_verification(
         # anybody acting on. Waiting costs this member the one role change
         # ahead of them rather than a whole sweep; see bot.memberlock for
         # why that distinction is the design.
-        if True:
+        async with member_locks.hold(ctx.author_id):
             try:
                 user_entry = await asyncio.to_thread(find_link, users, ctx.author_id)
             except PyMongoError as exc:
