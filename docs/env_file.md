@@ -750,8 +750,14 @@ the user in `starguard` and authentication would start failing. Saying
 reserved character in the username or password has to be percent-encoded.
 The ones that matter, and what each does when you leave it unencoded:
 
+Which of them is fatal depends on the process, because the server checks
+this value as it loads its configuration and the bot does not. **On the
+server every case below is caught**, reported as
+`MONGO_HOST is not a usable MongoDB connection string`, and the process
+exits without serving. On the bot they split:
+
 - `@`, `:`, `/` and `%` raise a caught error. Something goes wrong at
-  startup and says so.
+  startup and says so, and the bot runs on granting no roles.
 - `?` raises an **uncaught** error, in the form this file's examples use:
   everything after the `?` is read as the connection string's query part,
   which leaves the rest of the password sitting where the port belongs, and
