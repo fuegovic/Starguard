@@ -60,13 +60,27 @@ OBSERVED_AT = datetime(2026, 3, 1, tzinfo=UTC)
 MISSING = object()
 
 
+# The query operators this stub understands, as a table rather than a chain
+# of branches: the chain outgrew pylint's limit the moment $ne was added,
+# and a table is where operators were always going to accumulate.
+OPERATORS = {
+    "$exists": lambda value, expected: (value is not MISSING) == expected,
+    "$lt": lambda value, expected: value is not MISSING and value < expected,
+    "$lte": lambda value, expected: value is not MISSING and value <= expected,
+    # A missing field is not equal to anything, which is how a legacy row
+    # carrying no github_id matches the account-change statement.
+    "$ne": lambda value, expected: value is MISSING or value != expected,
+}
+
+
 def matches(document, query):
     """Match a document against the query syntax common.storage actually uses.
 
-    Plain equality, plus the ``$or``/``$exists``/``$lt``/``$lte`` that the
-    schema upgrade's query and the sweep's conditional write are built from.
-    Anything else is a query this stub has not been taught, and silently
-    matching everything would make a test pass for the wrong reason.
+    Plain equality, ``$or``, and the operators in OPERATORS above, which
+    are what the schema upgrade's query, the sweep's conditional write and
+    the account-change statement are built from. Anything else is a query
+    this stub has not been taught, and silently matching everything would
+    make a test pass for the wrong reason, so it raises instead.
     """
     for key, condition in query.items():
         if key == "$or":
@@ -77,17 +91,13 @@ def matches(document, query):
         if not isinstance(condition, dict):
             if value != condition:
                 return False
-        elif "$exists" in condition:
-            if (value is not MISSING) != condition["$exists"]:
+            continue
+        for operator, expected in condition.items():
+            compare = OPERATORS.get(operator)
+            if compare is None:
+                raise AssertionError(f"unsupported query: {condition!r}")
+            if not compare(value, expected):
                 return False
-        elif "$lt" in condition:
-            if value is MISSING or not value < condition["$lt"]:
-                return False
-        elif "$lte" in condition:
-            if value is MISSING or not value <= condition["$lte"]:
-                return False
-        else:
-            raise AssertionError(f"unsupported query: {condition!r}")
     return True
 
 
@@ -125,6 +135,8 @@ class FakeCollection:
         for document in self.documents:
             if matches(document, query):
                 document.update(update.get("$set", {}))
+                for field in update.get("$unset", {}):
+                    document.pop(field, None)
                 return UpdateResult(1)
         if upsert:
             new = dict(query)
@@ -710,8 +722,11 @@ def test_a_row_a_relink_creates_carries_its_star_state_from_the_first_instant():
     # with ever being queued.
     collection = InterleavingCollection()
     unstarred_at = OBSERVED_AT + timedelta(seconds=1)
+    # Third, not second: link_account opens with the account-change
+    # statement, which matches nothing here because there is no row yet,
+    # and the insert this test is about is the one after it.
     collection.before_write(
-        2, lambda: record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, unstarred_at)
+        3, lambda: record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, unstarred_at)
     )
 
     link(collection, "1", 100, "Octocat", starred=True, observed_at=OBSERVED_AT)
@@ -901,8 +916,12 @@ class InterleavingCollection(FakeCollection):
 
     The position is counted from the moment the hook is registered rather
     than from the start of the test, because setting the row up takes
-    writes of its own. A writer that takes two statements, which
-    ``link_account`` does, is reached by asking for the second one.
+    writes of its own. ``link_account`` is up to three statements: the
+    account-change write, which matches nothing unless the GitHub account
+    really changed, then the upsert, then the guarded star write. So the
+    statement a test means is worth counting out rather than assuming,
+    and a position that silently slides onto a neighbour is why each of
+    these says which write it is waiting for.
     """
 
     def __init__(self, documents=None):

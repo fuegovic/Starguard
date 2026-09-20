@@ -481,6 +481,39 @@ def test_a_relink_does_not_write_over_a_star_event_it_did_not_see(users):
     assert document["starred_repo"] is False
 
 
+def test_a_relink_to_another_account_does_not_inherit_the_old_ones_star(users):
+    # No exception and no interleaving: one member simply verifies again
+    # with a different GitHub account. The old account's webhook lands in
+    # the window between the new account's star check being answered and
+    # the relink being written, which is the ordinary width of an OAuth
+    # round trip.
+    #
+    # Statement one replaces the identity and leaves starred_repo,
+    # star_event_at and star_source where they are, and statement two then
+    # measures its own horizon against an event belonging to the account
+    # that has just been replaced, finds it newer and correctly declines.
+    # Both statements do exactly as told and the row ends up saying the
+    # new account stars the repository on the old account's evidence.
+    #
+    # That reaches a caller: the claim button reads starred_repo straight
+    # off the row, so until the next sweep it hands the role to an account
+    # that never starred.
+    link(users, "1", 100, "Alice", starred=False, observed_at=OBSERVED_AT)
+    checked_at = OBSERVED_AT + timedelta(minutes=5)
+    record_star_event(users, 100, True, STAR_SOURCE_WEBHOOK, OBSERVED_AT + timedelta(minutes=6))
+
+    document = link(users, "1", 200, "Bob", starred=False, observed_at=checked_at)
+
+    row = find_link(users, "1")
+    assert row["github_id"] == 200
+    # Nothing on this row spoke for account 200, so nothing is carried over.
+    assert row["starred_repo"] is False
+    assert document["starred_repo"] is False
+    # Including the evidence itself, which described the account that left.
+    assert "star_event_at" not in row
+    assert "star_source" not in row
+
+
 def test_a_relink_cannot_write_its_star_state_onto_another_identity(users):
     # Two OAuth callbacks for one Discord account carrying different GitHub
     # accounts, interleaved between link_account's two statements: A writes
