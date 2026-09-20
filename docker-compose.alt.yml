@@ -49,7 +49,19 @@ services:
     ports:
       # Host port only. SERVER_BIND_PORT is the port the application listens
       # on internally (default 5000); this mapping tracks it if you change it.
-      - ${SERVER_PORT:-5000}:${SERVER_BIND_PORT:-5000}
+      # Bound to the loopback interface, so the only thing that can reach
+      # the application is a reverse proxy on this host. That is not a
+      # restriction: DOMAIN has to be an absolute https URL and is checked
+      # at startup, so a proxy terminating TLS is already required, and
+      # nothing legitimate ever arrives on this port from off the machine.
+      # It also makes TRUSTED_PROXY_COUNT=1 mean what it says. Published on
+      # every interface, a client could skip the proxy, reach ProxyFix
+      # directly, and put any address it liked in X-Forwarded-For, taking a
+      # fresh rate-limit bucket per request. If your proxy runs on another
+      # machine, drop the 127.0.0.1 here and set TRUSTED_PROXY_COUNT to
+      # match your real hop count, knowing the origin is then reachable
+      # without TLS by anything that can route to it.
+      - 127.0.0.1:${SERVER_PORT:-5000}:${SERVER_BIND_PORT:-5000}
     build:
       context: .
       dockerfile: Dockerfile.server
