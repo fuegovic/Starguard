@@ -27,7 +27,14 @@ ALREADY_LINKED = (
 
 VERIFIED_AND_STARRED = "Authentication successful! Head back to Discord and claim your role."
 
+# Not "star it, then claim your role": the claim button answers from the
+# star state this flow just recorded, and nothing turns a recorded false back
+# into true on its own. The periodic check only ever records an un-star, and
+# the webhook that would record the star is optional, so for an installation
+# without one that advice fails for precisely the person who follows it.
+# Signing in again is the one step that always works.
 VERIFIED_NOT_STARRED = (
     "Authentication successful, but you have not starred {owner}/{repo} yet. "
-    "Star it, then claim your role in Discord."
+    "Star it, then run /verify in Discord again: the claim button reads what "
+    "was recorded here, so the star has to be recorded before it will work."
 )

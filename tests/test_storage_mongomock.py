@@ -21,6 +21,7 @@ from common.storage import (
     all_links,
     claim_delivery,
     clear_role_sync_pending,
+    clear_role_sync_pending_by_id,
     deliveries_for,
     ensure_delivery_indexes,
     ensure_indexes,
@@ -29,9 +30,12 @@ from common.storage import (
     iter_pending_role_syncs,
     link_account,
     purge_legacy_secrets,
+    read_datetime,
     read_updated_at,
     record_star_event,
+    release_delivery,
     set_starred,
+    star_event_is_newer,
     upgrade_documents,
 )
 
@@ -44,6 +48,10 @@ WHEN = datetime(2026, 1, 1, tzinfo=UTC)
 # is conditional on no webhook having spoken since, so a test that is not
 # about that race passes an instant later than any star event it set up.
 SWEPT_AT = datetime(2026, 6, 1, tzinfo=UTC)
+
+# When /authorize's OAuth star check was answered; the horizon link_account
+# orders its star state from.
+OBSERVED_AT = datetime(2026, 3, 1, tzinfo=UTC)
 
 
 @pytest.fixture(name="users")
@@ -60,7 +68,7 @@ def deliveries_fixture(users):
     return collection
 
 
-def link(users, discord_id, github_id, github_username, starred=True):
+def link(users, discord_id, github_id, github_username, starred=True, observed_at=None):
     return link_account(
         users,
         discord_id=discord_id,
@@ -69,6 +77,7 @@ def link(users, discord_id, github_id, github_username, starred=True):
         github_username=github_username,
         linked_repo=REPO,
         starred_repo=starred,
+        observed_at=observed_at,
     )
 
 
@@ -132,6 +141,62 @@ def test_one_github_account_cannot_serve_two_discord_users(users):
         link(users, "2", 100, "Alice")
     assert users.count_documents({}) == 1
     assert find_link(users, "1") is not None
+
+
+def test_a_legacy_row_without_an_id_reserves_its_github_account(users):
+    # The partial index above lets these rows exist, and a lookup by
+    # github_id cannot see them, so the uniqueness rule has to reach them
+    # by the only handle they carry. Otherwise the same GitHub account
+    # links a second time and one star earns the role twice.
+    users.insert_one(
+        {"discord_id": "1", "github_username": "Alice", "github_username_lower": "alice"}
+    )
+
+    with pytest.raises(AccountAlreadyLinkedError):
+        link(users, "2", 100, "Alice")
+
+    assert users.count_documents({}) == 1
+
+
+def test_the_owner_of_a_legacy_row_re_verifies_into_it(users):
+    users.insert_one(
+        {"discord_id": "1", "github_username": "Alice", "github_username_lower": "alice"}
+    )
+
+    link(users, "1", 100, "Alice")
+
+    assert users.count_documents({}) == 1
+    assert find_link(users, "1")["github_id"] == 100
+
+
+@pytest.mark.parametrize(
+    "orphan",
+    [{}, {"discord_id": None}, {"discord_id": ""}],
+    ids=["missing", "null", "empty"],
+)
+def test_a_legacy_row_that_names_no_discord_user_does_not_block_a_link(users, orphan):
+    # A row nothing can hold a role for is not a competing claim on the
+    # star, so the name match alone must not refuse its rightful owner.
+    # Null is the shape released code actually wrote.
+    users.insert_one({**orphan, "github_username": "Alice", "github_username_lower": "alice"})
+
+    link(users, "1", 100, "Alice")
+
+    assert find_link(users, "1")["github_id"] == 100
+    assert users.count_documents({}) == 2
+
+
+def test_a_login_a_renamed_account_gave_up_can_still_be_linked(users):
+    # The row that records the old spelling has a github_id, so the
+    # immutable field has already ruled it out and the name must not put
+    # it back in. The index on github_username_lower is not unique for
+    # this reason among others.
+    link(users, "1", 999, "Alice")
+
+    link(users, "2", 100, "Alice")
+
+    assert users.count_documents({}) == 2
+    assert find_link(users, "2")["github_id"] == 100
 
 
 def test_set_starred_round_trip(users):
@@ -265,7 +330,7 @@ def test_a_star_event_for_an_unknown_account_writes_nothing(users):
     assert users.count_documents({}) == 0
 
 
-def test_the_pending_queue_returns_only_the_flagged_rows_without_their_id(users):
+def test_the_pending_queue_returns_only_the_flagged_rows_with_their_id(users):
     link(users, "1", 100, "Alice", starred=False)
     link(users, "2", 200, "Bob", starred=False)
     record_star_event(users, 200, True, STAR_SOURCE_WEBHOOK, WHEN)
@@ -273,14 +338,37 @@ def test_the_pending_queue_returns_only_the_flagged_rows_without_their_id(users)
     pending = list(iter_pending_role_syncs(users))
 
     assert [row["discord_id"] for row in pending] == ["2"]
-    assert all("_id" not in row for row in pending)
+    # The one identity every row has, and for some of them the only one.
+    assert all("_id" in row for row in pending)
+
+
+@pytest.mark.parametrize("orphan", [{}, {"discord_id": None}], ids=["missing", "null"])
+def test_a_queued_row_with_no_discord_id_is_cleared_by_its_mongo_id(users, orphan):
+    # Null is the shape production holds: released servers wrote an
+    # unvalidated Discord ID straight through for nearly three years, so
+    # a /login without an id produced one of these. Against the real
+    # filter semantics, because a query for null matches a missing field
+    # too and the stub cannot show that.
+    users.insert_one({**orphan, "starred_repo": True, "role_sync_pending": True})
+    queued = list(iter_pending_role_syncs(users))
+    assert not queued[0].get("discord_id")
+
+    # What the drain can reach with the Discord-keyed clear: nothing, and
+    # the answer says so rather than reading like a clear that landed.
+    assert clear_role_sync_pending(users, queued[0].get("discord_id"), True) is False
+    assert len(list(iter_pending_role_syncs(users))) == 1
+
+    clear_role_sync_pending_by_id(users, queued[0]["_id"])
+
+    assert not list(iter_pending_role_syncs(users))
+    assert users.count_documents({}) == 1
 
 
 def test_clearing_the_flag_empties_the_queue_but_keeps_the_state(users):
     link(users, "1", 100, "Alice", starred=False)
     record_star_event(users, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
 
-    clear_role_sync_pending(users, "1", True)
+    assert clear_role_sync_pending(users, "1", True) is True
 
     assert not list(iter_pending_role_syncs(users))
     row = find_link(users, "1")
@@ -297,11 +385,12 @@ def test_a_clear_is_refused_once_the_star_state_has_moved_on(users):
     record_star_event(users, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
     record_star_event(users, 100, False, STAR_SOURCE_WEBHOOK, WHEN)
 
-    clear_role_sync_pending(users, "1", True)
+    # Against the real matched_count, which is what the answer is read off.
+    assert clear_role_sync_pending(users, "1", True) is False
 
     assert [row["discord_id"] for row in iter_pending_role_syncs(users)] == ["1"]
     # And the clear that matches the current state does land.
-    clear_role_sync_pending(users, "1", False)
+    assert clear_role_sync_pending(users, "1", False) is True
     assert not list(iter_pending_role_syncs(users))
 
 
@@ -341,6 +430,214 @@ def test_a_star_event_older_than_the_listing_is_still_swept(users):
     row = find_link(users, "1")
     assert row["starred_repo"] is False
     assert row["star_source"] == STAR_SOURCE_SWEEP
+
+
+def test_a_star_event_inside_the_listings_millisecond_is_not_written_over(users):
+    # The precision the stub cannot show. A BSON datetime is a whole
+    # number of milliseconds, so a webhook stamped four hundred
+    # microseconds after the listing was taken comes back looking earlier
+    # than it. Comparing that against the sweep's own microseconds read
+    # the event as older, and the sweep then took the role and wrote its
+    # stale state over the newer one, which is the lost update the guard
+    # exists to prevent.
+    link(users, "1", 100, "Alice", starred=False)
+    observed_at = SWEPT_AT + timedelta(microseconds=500)
+    record_star_event(
+        users, 100, True, STAR_SOURCE_WEBHOOK, observed_at + timedelta(microseconds=400)
+    )
+
+    row = find_link(users, "1")
+    # What the database kept of an event that happened after the listing.
+    assert read_datetime(row, "star_event_at") < observed_at
+    assert star_event_is_newer(row, observed_at) is True
+    assert set_starred(users, "1", False, observed_at) is False
+    assert find_link(users, "1")["starred_repo"] is True
+
+    # And a listing taken a whole millisecond later is unambiguously the
+    # newer authority again, so the sweep writes as it always did.
+    assert set_starred(users, "1", False, observed_at + timedelta(milliseconds=2)) is True
+    assert find_link(users, "1")["starred_repo"] is False
+
+
+def test_a_relink_does_not_write_over_a_star_event_it_did_not_see(users):
+    # The same race as in the stub, against the real filter semantics. The
+    # OAuth star check said this person stars the repository; they un-star
+    # before the answer is written down, and the webhook records it and
+    # queues the role change. The relink must not restore the state the
+    # event replaced, because it leaves the flag raised and the drain then
+    # reconciles the role to whatever the row says.
+    link(users, "1", 100, "Alice", starred=True)
+    unstarred_at = OBSERVED_AT + timedelta(seconds=1)
+    record_star_event(users, 100, False, STAR_SOURCE_WEBHOOK, unstarred_at)
+
+    document = link(users, "1", 100, "Alice-Renamed", starred=True, observed_at=OBSERVED_AT)
+
+    row = find_link(users, "1")
+    assert row["starred_repo"] is False
+    assert row["star_source"] == STAR_SOURCE_WEBHOOK
+    assert [queued["discord_id"] for queued in iter_pending_role_syncs(users)] == ["1"]
+    # The identity the flow did establish is written all the same.
+    assert row["github_username"] == "Alice-Renamed"
+    assert document["starred_repo"] is False
+
+
+def test_a_relink_to_another_account_does_not_inherit_the_old_ones_star(users):
+    # No exception and no interleaving: one member simply verifies again
+    # with a different GitHub account. The old account's webhook lands in
+    # the window between the new account's star check being answered and
+    # the relink being written, which is the ordinary width of an OAuth
+    # round trip.
+    #
+    # Statement one replaces the identity and leaves starred_repo,
+    # star_event_at and star_source where they are, and statement two then
+    # measures its own horizon against an event belonging to the account
+    # that has just been replaced, finds it newer and correctly declines.
+    # Both statements do exactly as told and the row ends up saying the
+    # new account stars the repository on the old account's evidence.
+    #
+    # That reaches a caller: the claim button reads starred_repo straight
+    # off the row, so until the next sweep it hands the role to an account
+    # that never starred.
+    link(users, "1", 100, "Alice", starred=False, observed_at=OBSERVED_AT)
+    checked_at = OBSERVED_AT + timedelta(minutes=5)
+    record_star_event(users, 100, True, STAR_SOURCE_WEBHOOK, OBSERVED_AT + timedelta(minutes=6))
+
+    document = link(users, "1", 200, "Bob", starred=False, observed_at=checked_at)
+
+    row = find_link(users, "1")
+    assert row["github_id"] == 200
+    # Nothing on this row spoke for account 200, so nothing is carried over.
+    assert row["starred_repo"] is False
+    assert document["starred_repo"] is False
+    # Including the evidence itself, which described the account that left.
+    assert "star_event_at" not in row
+    assert "star_source" not in row
+
+
+def test_a_relink_cannot_write_its_star_state_onto_another_identity(users):
+    # Two OAuth callbacks for one Discord account carrying different GitHub
+    # accounts, interleaved between link_account's two statements: A writes
+    # its identity, B replaces it wholesale, and A then writes the star
+    # state it observed. The second statement is what makes this reachable,
+    # because it is a separate write from the identity it belongs to.
+    #
+    # Matching on the Discord ID alone is not enough to own that write. The
+    # row still has the Discord ID, so A's answer lands on B's account and
+    # the row ends up claiming that B stars the repository on the strength
+    # of a check that was run against A. Naming the identity it just wrote
+    # is what ties the two statements together.
+    link(users, "1", 100, "Alice", starred=False)
+
+    original = users.update_one
+    interleaved = []
+
+    def update_one(filter_, update, **kwargs):
+        result = original(filter_, update, **kwargs)
+        # Only after A's identity upsert, which is the one carrying
+        # $setOnInsert, and only once, so B's own writes do not recurse.
+        if not interleaved and "$setOnInsert" in update:
+            interleaved.append(True)
+            link(users, "1", 200, "Bob", starred=True, observed_at=OBSERVED_AT)
+        return result
+
+    users.update_one = update_one
+    try:
+        document = link(users, "1", 100, "Alice", starred=False, observed_at=OBSERVED_AT)
+    finally:
+        users.update_one = original
+
+    row = find_link(users, "1")
+    # B got there second, so B owns both halves of the row.
+    assert row["github_id"] == 200
+    assert row["starred_repo"] is True
+    # And A is not handed B's answer. The two accounts disagree on purpose:
+    # with both saying the same thing the read below would coincide with
+    # the safe value and this would pass whether or not it is tied to the
+    # identity.
+    assert document["starred_repo"] is False
+
+
+def test_a_relink_writes_over_a_star_event_older_than_the_oauth_check(users):
+    # A stale event ages out of the way, so re-verifying still repairs a
+    # row whose webhook was never delivered.
+    link(users, "1", 100, "Alice", starred=True)
+    record_star_event(users, 100, False, STAR_SOURCE_WEBHOOK, OBSERVED_AT - timedelta(days=1))
+
+    document = link(users, "1", 100, "Alice", starred=True, observed_at=OBSERVED_AT)
+
+    assert document["starred_repo"] is True
+    assert find_link(users, "1")["starred_repo"] is True
+
+
+def test_a_star_event_inside_the_oauth_checks_millisecond_is_not_written_over(users):
+    # The precision the stub cannot show, on link_account's side of it. A
+    # BSON datetime is whole milliseconds, so an event stamped four hundred
+    # microseconds after GitHub answered comes back looking earlier than
+    # the answer. Comparing the stored value against the caller's own
+    # microseconds reads the un-star as older and writes the stale star
+    # state over it.
+    link(users, "1", 100, "Alice", starred=True)
+    observed_at = OBSERVED_AT + timedelta(microseconds=500)
+    record_star_event(
+        users, 100, False, STAR_SOURCE_WEBHOOK, observed_at + timedelta(microseconds=400)
+    )
+
+    assert read_datetime(find_link(users, "1"), "star_event_at") < observed_at
+
+    superseded = link(users, "1", 100, "Alice", starred=True, observed_at=observed_at)
+
+    assert superseded["starred_repo"] is False
+    assert find_link(users, "1")["starred_repo"] is False
+
+    # A check answered a whole millisecond later is unambiguously the newer
+    # authority, and writes as it always did.
+    later = observed_at + timedelta(milliseconds=2)
+    written = link(users, "1", 100, "Alice", starred=True, observed_at=later)
+
+    assert written["starred_repo"] is True
+    assert find_link(users, "1")["starred_repo"] is True
+
+
+def test_a_first_link_is_created_however_old_the_observation_is(users):
+    # The upsert is unconditional for a reason: there is no row for an
+    # ordering condition to be satisfied by, so putting one on the insert
+    # would drop a first-time link on the floor. Against the real upsert,
+    # which builds the new document out of the filter.
+    document = link(users, "1", 100, "Alice", observed_at=datetime(2020, 1, 1, tzinfo=UTC))
+
+    row = find_link(users, "1")
+    assert row["starred_repo"] is True
+    assert row["github_id"] == 100
+    assert document["starred_repo"] is True
+
+
+def test_a_relink_leaves_the_queue_to_the_bot_even_when_it_writes(users):
+    # link_account still writes no role_sync_pending of its own, which is
+    # the half of this that was already fixed. The star write lands here,
+    # and the flag the webhook raised is still the bot's to lower.
+    link(users, "1", 100, "Alice", starred=False)
+    record_star_event(users, 100, True, STAR_SOURCE_WEBHOOK, OBSERVED_AT - timedelta(days=1))
+
+    link(users, "1", 100, "Alice", starred=False, observed_at=OBSERVED_AT)
+
+    assert find_link(users, "1")["starred_repo"] is False
+    assert [queued["discord_id"] for queued in iter_pending_role_syncs(users)] == ["1"]
+
+
+def test_a_delivery_that_arrives_behind_a_newer_one_is_not_recorded(users):
+    # Against the real filter semantics: the ordering condition is an $or
+    # of $exists and $lte over the same field the write sets, and getting
+    # it wrong lets the older of two racing deliveries win.
+    link(users, "1", 100, "Alice", starred=False)
+    later = WHEN + timedelta(seconds=1)
+    record_star_event(users, 100, False, STAR_SOURCE_WEBHOOK, later)
+
+    outcome = record_star_event(users, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
+
+    assert outcome["starred_repo"] is False
+    assert read_datetime(outcome, "star_event_at") == later
+    assert not list(iter_pending_role_syncs(users))
+    assert find_link(users, "1")["starred_repo"] is False
 
 
 def test_an_ordinary_row_no_webhook_has_touched_is_written_normally(users):
@@ -431,6 +728,26 @@ def test_a_delivery_is_claimed_once_by_the_unique_index(deliveries):
     assert claim_delivery(deliveries, "delivery-1", now()) is True
     assert claim_delivery(deliveries, "delivery-1", now()) is False
     assert deliveries.count_documents({"delivery_id": "delivery-1"}) == 1
+
+
+def test_a_released_delivery_is_claimed_again_by_a_redelivery(deliveries):
+    # The claim is taken before anything is recorded, so a delivery whose
+    # recording failed is claimed and unrecorded at the same time. The row
+    # has to go, or the manual redelivery an operator is told to use is
+    # answered with "already handled" for an event nothing acted on.
+    assert claim_delivery(deliveries, "delivery-1", now()) is True
+
+    release_delivery(deliveries, "delivery-1")
+
+    assert deliveries.count_documents({"delivery_id": "delivery-1"}) == 0
+    assert claim_delivery(deliveries, "delivery-1", now()) is True
+
+
+def test_releasing_a_delivery_nobody_claimed_is_quiet(deliveries):
+    # The caller releases on a failure path and cannot always know which
+    # side of the claim it failed on.
+    release_delivery(deliveries, "never-seen")
+    assert deliveries.count_documents({}) == 0
 
 
 def test_a_different_delivery_is_not_mistaken_for_a_replay(deliveries):

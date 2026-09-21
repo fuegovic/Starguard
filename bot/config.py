@@ -12,6 +12,7 @@ from typing import Final
 from common.config import (
     env_bool,
     env_int,
+    env_port,
     optional_env,
     require_env,
     require_https_url,
@@ -148,5 +149,11 @@ def load_bot_config() -> BotConfig:
         link_buttons=_link_buttons(),
         health_enabled=env_bool("BOT_HEALTH_ENABLED", True),
         health_host=optional_env("BOT_HEALTH_HOST", DEFAULT_HEALTH_HOST),
-        health_port=env_int("BOT_HEALTH_PORT", DEFAULT_HEALTH_PORT, minimum=1),
+        # Validated rather than clamped, and the bot refuses to start on a
+        # bad value. The endpoint is optional, so a port that cannot be
+        # bound is only logged and shrugged off, which for a number above
+        # 65535 would mean a container whose healthcheck fails every probe
+        # for its whole life with nothing but a scrolled-past startup line
+        # to say why. See common.config.env_port.
+        health_port=env_port("BOT_HEALTH_PORT", DEFAULT_HEALTH_PORT),
     )

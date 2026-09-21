@@ -12,10 +12,19 @@ that was not exposed before.
 
 What it can and cannot tell you: ``ready`` flips on the Startup event, and the
 library reconnects to the gateway on its own, so a brief disconnect is not
-reported. The real liveness signal is the age of the last completed star
-check, which only exists when AUTOMATIC_CHECK is on. With automatic checks
-disabled the endpoint degrades to "the event loop reached Startup", which is
-still more than the container had before.
+reported. The real liveness signal is the age of the last completed pass of
+each loop that reconciles roles, and there are two of them: the periodic star
+check and the role-sync drain. Both are optional, and a loop that is turned
+off reports itself disabled rather than late. With both off the endpoint
+degrades to "the event loop reached Startup", which is still more than the
+container had before.
+
+Reporting only the star check was not enough, because the two loops are
+configured independently. A deployment running on webhooks alone, with
+AUTOMATIC_CHECK=false and ROLE_SYNC_ENABLED=true, has the drain as its only
+reconciling loop; if MongoDB was unreachable when the bot started, every
+drain returns without doing anything and never reconnects, and the endpoint
+used to answer 200 for as long as that lasted.
 """
 
 import json
@@ -23,6 +32,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Final
@@ -31,14 +41,39 @@ log = logging.getLogger("starguard.bot")
 
 HEALTH_PATH: Final = "/healthz"
 
-# A cycle is late rather than broken until three intervals have passed, plus
-# a margin for a cycle that is simply slow on a large repository.
+# A pass is late rather than broken until three intervals have passed, plus
+# a margin for a cycle that is simply slow on a large repository. The three
+# intervals are what scales with the loop, so the same arithmetic suits both
+# of them; the flat margin is what a drain left on its default of thirty
+# seconds mostly pays, and being generous there is the right way to be
+# wrong, because the number that matters is that there is a ceiling at all
+# rather than where it falls.
 STALE_CYCLE_MULTIPLIER: Final = 3
 STALE_CYCLE_GRACE_SECONDS: Final = 300
 
 # What /healthz answers with. ``object`` because the payload mixes the status
-# strings with the two rounded ages.
+# strings with the rounded ages.
 HealthPayload = dict[str, object]
+
+
+@dataclass(frozen=True)
+class LoopHealth:
+    """One background loop, as the endpoint reports it.
+
+    ``field`` is what the payload calls the loop and ``age_field`` what it
+    calls the age of its last completed pass. ``stale_after`` is how old
+    that pass may get before the process counts as degraded, or None when
+    the loop is turned off and nothing can be late.
+
+    ``last_completed`` is a callable rather than a value so the endpoint
+    reads what the loop holds now instead of a copy taken at registration,
+    which is also how the HTTP thread gets at state the event loop owns.
+    """
+
+    field: str
+    age_field: str
+    stale_after: float | None
+    last_completed: Callable[[], float | None]
 
 
 class HealthState:
@@ -50,20 +85,25 @@ class HealthState:
         self._lock = threading.Lock()
         self._started_at = clock()
         self._ready = False
-        self._stale_after: float | None = None
+        self._loops: list[LoopHealth] = []
 
-    def mark_ready(self, stale_after: float | None = None) -> None:
+    def watch(self, loop: LoopHealth) -> None:
+        """Report ``loop``'s freshness as part of the bot's health."""
+        with self._lock:
+            self._loops.append(loop)
+
+    def mark_ready(self) -> None:
         """Record that the gateway connected.
 
-        ``stale_after`` is the age at which a missing star check counts as a
-        problem, or None when automatic checks are off and there is nothing
-        to be late.
+        Separate from :meth:`watch` because the two answer different
+        questions and are known at different times: which loops exist is a
+        fact about the configuration, settled when the client is built,
+        while this is the Startup event actually arriving.
         """
         with self._lock:
             self._ready = True
-            self._stale_after = stale_after
 
-    def report(self, last_check_completed: float | None = None) -> tuple[HealthPayload, HTTPStatus]:
+    def report(self) -> tuple[HealthPayload, HTTPStatus]:
         """Return ``(payload, http_status)`` for the current state."""
         with self._lock:
             now = self._clock()
@@ -77,24 +117,41 @@ class HealthState:
                 payload["status"] = "starting"
                 return payload, HTTPStatus.SERVICE_UNAVAILABLE
 
-            if self._stale_after is None:
-                payload["star_check"] = "disabled"
-                return payload, HTTPStatus.OK
-
-            if last_check_completed is None:
-                age = now - self._started_at
-                payload["star_check"] = "pending"
-            else:
-                age = now - last_check_completed
-                payload["star_check"] = "ok"
-                payload["last_check_age_seconds"] = round(age, 1)
-
-            if age > self._stale_after:
+            # Every loop is described, and then the statuses are combined,
+            # rather than returning at the first stale one: an operator
+            # reading the payload wants to know which loop stopped, and
+            # with two of them the first one asked is not always the one
+            # that did.
+            stale = [loop for loop in self._loops if self._describe(payload, loop, now)]
+            if stale:
                 payload["status"] = "degraded"
-                payload["star_check"] = "stale"
                 return payload, HTTPStatus.SERVICE_UNAVAILABLE
 
             return payload, HTTPStatus.OK
+
+    def _describe(self, payload: HealthPayload, loop: LoopHealth, now: float) -> bool:
+        """Write ``loop``'s state into ``payload``. Returns whether it is stale."""
+        if loop.stale_after is None:
+            payload[loop.field] = "disabled"
+            return False
+
+        last_completed = loop.last_completed()
+        if last_completed is None:
+            # A loop that has never finished a pass is given the same
+            # grace from startup that a completed one gets from its last
+            # pass, so a slow first cycle is not reported as a failure.
+            age = now - self._started_at
+            payload[loop.field] = "pending"
+        else:
+            age = now - last_completed
+            payload[loop.field] = "ok"
+            payload[loop.age_field] = round(age, 1)
+
+        if age > loop.stale_after:
+            payload[loop.field] = "stale"
+            return True
+
+        return False
 
 
 def stale_after_seconds(check_delay: int) -> int:
@@ -102,9 +159,7 @@ def stale_after_seconds(check_delay: int) -> int:
     return check_delay * STALE_CYCLE_MULTIPLIER + STALE_CYCLE_GRACE_SECONDS
 
 
-def _handler_class(
-    state: HealthState, last_completed: Callable[[], float | None]
-) -> type[BaseHTTPRequestHandler]:
+def _handler_class(state: HealthState) -> type[BaseHTTPRequestHandler]:
     """Build the request handler bound to ``state``."""
 
     class HealthHandler(BaseHTTPRequestHandler):
@@ -118,7 +173,7 @@ def _handler_class(
             if self.path.split("?", 1)[0] != HEALTH_PATH:
                 self._respond({"status": "not found"}, HTTPStatus.NOT_FOUND)
                 return
-            payload, status = state.report(last_completed())
+            payload, status = state.report()
             self._respond(payload, status)
 
         def _respond(self, payload: Mapping[str, object], status: HTTPStatus) -> None:
@@ -141,22 +196,23 @@ def _handler_class(
     return HealthHandler
 
 
-def serve_health(
-    state: HealthState,
-    host: str,
-    port: int,
-    last_completed: Callable[[], float | None],
-) -> ThreadingHTTPServer | None:
+def serve_health(state: HealthState, host: str, port: int) -> ThreadingHTTPServer | None:
     """Start the health endpoint on a daemon thread. Returns the server.
 
-    ``last_completed`` is a callable so the endpoint reads the checker's
-    current value rather than a copy taken at startup. Returns None when the
-    port cannot be bound: a missing health endpoint must not stop the bot
-    from doing its actual job.
+    What it reports on is whatever has been handed to :meth:`HealthState.watch`
+    by the time a request arrives. Returns None when the port cannot be
+    bound: a missing health endpoint must not stop the bot from doing its
+    actual job.
+
+    OverflowError is caught alongside OSError because it is not one, and
+    bind raises it rather than an OSError for a port above 65535. Nothing
+    validates BOT_HEALTH_PORT against that ceiling, so catching only OSError
+    meant a single mistyped digit killed the whole bot before it reached the
+    gateway, over an endpoint that is documented as optional.
     """
     try:
-        server = ThreadingHTTPServer((host, port), _handler_class(state, last_completed))
-    except OSError as exc:
+        server = ThreadingHTTPServer((host, port), _handler_class(state))
+    except (OSError, OverflowError) as exc:
         log.error("Could not start the health endpoint on %s:%s: %s", host, port, exc)
         return None
 

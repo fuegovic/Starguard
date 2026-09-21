@@ -21,6 +21,7 @@ from interactions.client.errors import Forbidden
 from pymongo.errors import PyMongoError
 
 from bot import messages
+from bot.memberlock import MemberLocks
 from bot.verification import (
     CLAIM_BUTTON_ID,
     RELINK_BUTTON_ID,
@@ -140,11 +141,19 @@ class FakeUsers:
         return self.document
 
 
-def register(users=None, **config_overrides):
-    """Register the verification flow and return (client, config)."""
+def register(users=None, member_locks=None, **config_overrides):
+    """Register the verification flow and return (client, config).
+
+    ``member_locks`` is the registry the claim button takes the clicking
+    member's mutex from. The tests that pit a claim against a sweep or a
+    drain pass the registry those share, because a private one here would
+    be a second set of mutexes and no exclusion at all.
+    """
     config = make_config(secret_key=SECRET, **config_overrides)
     client = RecordingClient()
-    register_verification(client, config, users)
+    register_verification(
+        client, config, users, MemberLocks() if member_locks is None else member_locks
+    )
     return client, config
 
 
@@ -154,10 +163,18 @@ def run(client, custom_id, ctx):
     return ctx
 
 
-def linked(starred=True):
+def linked(starred=True, repo=None):
+    """A link document as ``link_account`` writes one.
+
+    ``linked_repo`` is part of it because the claim path checks it. A row
+    only says somebody starred the repository it was made for, and taking
+    it as evidence about some other repository is the bug behind
+    :func:`test_a_link_to_another_repository_cannot_claim_the_role`.
+    """
     return {
         "discord_id": str(AUTHOR_ID),
         "github_username": "Octocat",
+        "linked_repo": make_config().repo_url if repo is None else repo,
         "starred_repo": starred,
     }
 
@@ -309,6 +326,37 @@ def test_claiming_without_a_link_offers_a_new_one():
     assert messages.VERIFY_BUTTON_RELINK in ctx.last.content
     assert [b.custom_id for b in ctx.last.buttons] == [RELINK_BUTTON_ID]
     assert member.roles == set()
+
+
+def test_a_link_to_another_repository_cannot_claim_the_role():
+    # An operator who repoints REPO_OWNER or GITHUB_REPO and keeps the
+    # database is left with rows that say starred_repo about the previous
+    # repository. Looking the claim up by Discord ID alone accepted every
+    # one of them, so everybody who had verified before the move could take
+    # the role for a repository they had never starred.
+    client, config = register(users=FakeUsers(linked(repo="https://github.com/owner/other/")))
+    member = FakeMember()
+    ctx = run(client, CLAIM_BUTTON_ID, FakeContext(member))
+
+    assert config.repo_url == "https://github.com/owner/repo/"
+    assert member.roles == set()
+    assert member.added == 0
+    # Sent back through the link flow, which rewrites the row for the
+    # repository that is actually configured now.
+    assert messages.VERIFY_BUTTON_RELINK in ctx.last.content
+    assert [b.custom_id for b in ctx.last.buttons] == [RELINK_BUTTON_ID]
+
+
+def test_a_link_to_the_configured_repository_still_claims_the_role():
+    # The other half: the check must be an equality against the configured
+    # repository and not something that turns every claim down.
+    client, config = register(users=FakeUsers(linked(repo="https://github.com/owner/repo/")))
+    member = FakeMember()
+    ctx = run(client, CLAIM_BUTTON_ID, FakeContext(member))
+
+    assert config.repo_url == "https://github.com/owner/repo/"
+    assert member.roles == {ROLE_ID}
+    assert str(AUTHOR_ID) in ctx.last.content
 
 
 def test_claiming_without_a_star_is_refused():

@@ -16,11 +16,13 @@ from pymongo.errors import PyMongoError
 
 from bot import messages
 from bot.commands import (
+    DISCORD_CONTENT_LIMIT,
     register_commands,
     register_info_commands,
     register_links_command,
     register_star_commands,
 )
+from bot.memberlock import MemberLocks
 from bot.starcheck import CheckAlreadyRunningError
 from common.github_api import GitHubError
 from tests.test_starcheck import make_config
@@ -159,6 +161,39 @@ def test_checkstars_reports_who_lost_the_role():
     assert ctx.last.ephemeral is True
 
 
+def test_a_long_list_of_names_is_shortened_rather_than_rejected():
+    # Discord refuses a message over 2,000 characters outright, and by the
+    # time this one is sent the roles are already gone and the rows are
+    # already written. Concatenating every name failed the send and made
+    # the whole command look unsuccessful for work that did happen.
+    removed = [f"member-number-{index:03d}" for index in range(200)]
+    ctx = call(star_client(FakeChecker(removed=removed)), "checkstars")
+
+    content = ctx.last.content
+    assert len(content) <= DISCORD_CONTENT_LIMIT
+    # The count stays exact: only the list of names is cut short.
+    assert content.startswith("Removed the role from 200 member(s)")
+    assert "**member-number-000**" in content
+    # Whole names or nothing. A name cut in half would read as a member who
+    # is not in the guild.
+    shown = content.count("**") // 2
+    assert messages.CHECK_REMOVED_MORE.format(count=200 - shown) in content
+    assert f"**member-number-{shown - 1:03d}**" in content
+    assert f"**member-number-{shown:03d}**" not in content
+
+
+def test_a_list_that_fits_is_not_shortened():
+    # The boundary the test above cannot see: a list one name short of the
+    # limit must still be reported in full, with no "and 0 more" tail.
+    removed = ["x" * 96 for _ in range(19)]
+    ctx = call(star_client(FakeChecker(removed=removed)), "checkstars")
+
+    content = ctx.last.content
+    assert 1900 < len(content) <= DISCORD_CONTENT_LIMIT
+    assert content.count("**") // 2 == 19
+    assert "more" not in content
+
+
 def test_checkstars_says_so_when_nothing_changed():
     ctx = call(star_client(FakeChecker(removed=[])), "checkstars")
     assert ctx.last.content == messages.CHECK_NO_CHANGES
@@ -236,7 +271,7 @@ def test_the_links_command_sends_the_configured_buttons():
 )
 def test_register_commands_registers_the_whole_surface(overrides, expected):
     client = RecordingClient()
-    register_commands(client, make_config(**overrides), FakeChecker(), None)
+    register_commands(client, make_config(**overrides), FakeChecker(), None, MemberLocks())
 
     assert set(client.commands) == expected
     assert set(client.component_callbacks) == {"claim", "relink"}

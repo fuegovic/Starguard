@@ -112,4 +112,7 @@ CHECK_ALREADY_RUNNING = (
 )
 CHECK_NO_CHANGES = "Star status checked, no changes."
 CHECK_REMOVED = "Removed the role from {count} member(s) for un-starring the repo: {names}"
+# Replaces the tail of that list when it would not fit in one Discord
+# message. The count is still exact; only the names are cut short.
+CHECK_REMOVED_MORE = " and {count} more"
 DATABASE_UNREACHABLE = "Could not reach the database right now."

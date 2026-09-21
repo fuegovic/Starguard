@@ -34,7 +34,9 @@ exactly as the default for every consumer: `star_event_at` and `star_source`
 read as None, and the pending index is partial on ``True``, so a row without
 the field is simply not in the queue. `upgrade_documents` bumps an older
 row's version without materialising them, so there is one shape rather than
-two, and only `record_star_event` and `set_starred` ever write them.
+two. `record_star_event` and `set_starred` are their only writers, except
+that `link_account` clears them when a row changes GitHub account, since
+all three describe a row and an account together.
 
 `star_event_at` is load-bearing beyond bookkeeping. It is how the sweep and
 the webhook are ordered against each other, since they observe the same fact
@@ -44,19 +46,36 @@ sweep carries the instant its stargazer listing was taken, and both skips
 and refuses to write over any row a star event reached after that instant.
 See `set_starred` and `star_event_is_newer`.
 
-`link_account` in particular must never write `role_sync_pending`. It stores
-the whole document with one ``$set`` and ``upsert=True``, so every key in it
-overwrites on a re-link. If the flag were in that dict, this would happen: a
-webhook records an un-star and raises the flag, the same person runs /verify
-again and completes OAuth before the bot's next poll, and `link_account`
-resets the flag to false. The bot never sees the queued work and the member
-keeps a role they should have lost until the next full sweep. The field is
-absent there on purpose, not by oversight.
+That ordering is done at millisecond resolution rather than at the
+microsecond resolution the instants are made with, because BSON stores a
+datetime as a whole number of milliseconds. The stored side of every one of
+those comparisons has been truncated and the in-memory side has not, so an
+event inside the listing's own millisecond cannot be placed either side of
+it and is treated as newer. See `_last_millisecond_before`.
+
+`link_account` in particular must never write `role_sync_pending`. It
+upserts with a ``$set``, so every key in that dict overwrites on a re-link.
+If the flag were in it, this would happen: a webhook records an un-star and
+raises the flag, the same person runs /verify again and completes OAuth
+before the bot's next poll, and `link_account` resets the flag to false.
+The bot never sees the queued work and the member keeps a role they should
+have lost until the next full sweep. The field is absent there on purpose,
+not by oversight.
+
+Keeping the flag out of that dict was not enough, and the reason is worth
+recording next to it: `starred_repo` was still in it, and that is the fact
+the flag is about. The same re-link put the stale star state back over the
+un-star, the drain then read the restored value off the row and reconciled
+the role to it, and the queued work was spent confirming what the webhook
+had just contradicted. So the star state is written on its own now, under
+the same ordering condition every other writer of it carries, and
+`link_account` takes the instant its caller asked GitHub. See the two
+writes there.
 """
 
 import logging
 from collections.abc import Callable, Iterator, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal
 
 from pymongo import ASCENDING, MongoClient, ReturnDocument
@@ -124,6 +143,11 @@ DELIVERY_RETENTION_SECONDS: Final = 600
 # which made the collection a set of credentials for every verified user's
 # private repositories.
 LEGACY_SECRET_FIELDS: Final[tuple[str, ...]] = ("github_token", "github_email")
+
+# The smallest interval a stored timestamp can tell apart. BSON holds a
+# datetime as a whole number of milliseconds since the epoch, so the
+# microseconds a Python datetime carries are dropped on the way in.
+BSON_RESOLUTION: Final = timedelta(milliseconds=1)
 
 
 class AccountAlreadyLinkedError(RuntimeError):
@@ -224,6 +248,32 @@ def claim_delivery(
     except DuplicateKeyError:
         return False
     return True
+
+
+def release_delivery(collection: DeliveryCollection, delivery_id: object) -> None:
+    """Forget ``delivery_id``, so a redelivery of it is new work again.
+
+    The inverse of :func:`claim_delivery`, for a caller that claimed a
+    delivery and then could not process it. Without this the claim stands
+    for the whole retention window although nothing was recorded, and an
+    operator following the documented recovery, redelivering the event by
+    hand, is told it has already been handled.
+
+    This makes a claim deliberately non-idempotent, which is the opposite
+    of what the collection is for, so the distinction is worth stating
+    plainly: a row here means "this delivery is being handled", not "this
+    delivery has been handled". A claim that never became a recorded
+    change is not a fact worth keeping, and the only thing keeping it can
+    achieve is swallowing the retry that would have fixed it.
+
+    Errors are left to propagate and the caller swallows them. That is not
+    an oversight to be tidied up later: the database this has to reach is
+    the one that has just refused a write, so failing here is likely in
+    exactly the case this is needed, and a failed release leaves the claim
+    standing, which is the outcome there was anyway. Raising would replace
+    the failure the caller is already reporting with a less useful one.
+    """
+    collection.delete_one({"delivery_id": str(delivery_id)})
 
 
 def purge_legacy_secrets(collection: UserCollection) -> int:
@@ -363,6 +413,7 @@ def link_account(
     github_username: str,
     linked_repo: str,
     starred_repo: object,
+    observed_at: datetime | None = None,
 ) -> MongoDocument:
     """Create or update the link between a Discord user and a GitHub account.
 
@@ -373,15 +424,92 @@ def link_account(
     Raises :class:`AccountAlreadyLinkedError` when the GitHub account is
     already bound to a different Discord user, which stops one star being
     redeemed for the role by several Discord accounts.
+
+    That check has to look twice, because the rows this version upgrades
+    from were written before ``github_id`` was recorded and the lookup by
+    id cannot see them. One of them is still a link, and still holds the
+    role, so without the second lookup the same GitHub account could
+    authenticate for a second Discord ID and be given a row of its own
+    until whenever the original member happened to re-verify.
+
+    The second lookup is by the lower-cased login, which is the only handle
+    those rows carry, and it is restricted to rows with no ``github_id`` at
+    all. A row that has one has already been matched or ruled out on it,
+    and a login is not immutable: a member who renamed their account left
+    their old login free for somebody else to take, and matching that row
+    on its stored name would refuse the new owner a link they are entitled
+    to. Restricting the lookup means re-verifying once puts a row
+    permanently beyond this ambiguity.
+
+    A legacy row that names no Discord user at all blocks nobody; see the
+    comment on that branch.
+
+    ``observed_at`` is when the caller's OAuth star check was answered, and
+    it orders ``starred_repo`` against the webhook exactly as the sweep's
+    listing instant does in :func:`set_starred`. /authorize asks GitHub
+    whether this person stars the repository and then writes the answer
+    down, and in between the webhook can record an un-star and raise the
+    flag for it. Writing unconditionally put the stale ``True`` back while
+    deliberately leaving that flag raised, so the drain read the restored
+    value off the row, reconciled the role to it and lowered the flag, and
+    the un-star was lost until the next full sweep. Keeping
+    ``role_sync_pending`` out of the write protects the flag and not the
+    value the flag is about.
+
+    That ordering is why the row is written in two statements rather than
+    one. The identity fields are upserted unconditionally, because a
+    first-time link has to create the row whatever an ordering condition
+    would have said about a row that does not exist yet, and
+    ``starred_repo`` is then written on its own under the condition
+    :func:`_not_newer_than` builds. ``$setOnInsert`` carries the star state
+    into a row this call creates, so no row this function writes is ever
+    without one, which is the shape :func:`record_star_event` relies on.
+
+    The two statements are not atomic together, and they do not need to
+    be. In between, and after a failure of the second, the row holds the
+    new identity and the star state it already had, which is exactly what
+    it holds when the second is refused as stale; the caller is told the
+    save failed, and the webhook or the next sweep settles the state
+    either way.
+
+    Passing ``observed_at`` is how a caller gets the whole of that
+    ordering. Left out, the horizon is this call's own clock, which is
+    later than the answer it stands for by however long the caller took to
+    get here, so a webhook that landed inside that window is still written
+    over. The default narrows the race to this process; only the caller can
+    close it.
+
+    The returned document is what was written, with ``starred_repo`` as the
+    row actually holds it, so nobody can read back a star state this call
+    declined to store.
     """
     discord_id = str(discord_id)
     github_id = int(github_id)
+    written_at = datetime.now(UTC)
+    horizon = _last_millisecond_before(observed_at if observed_at is not None else written_at)
 
     existing = collection.find_one({"github_id": github_id})
+    if existing is None:
+        legacy = collection.find_one(
+            {
+                "github_username_lower": github_username.lower(),
+                "github_id": {"$exists": False},
+            }
+        )
+        # A row that names no Discord user is not a competing claim on the
+        # star, so it must not block anybody. There are more of these than
+        # the word legacy suggests; see `clear_role_sync_pending_by_id`
+        # for where they come from. Nothing can hold a role for one:
+        # the sweep and the drain both give up on a row with no Discord ID
+        # to act for. Blocking would hold the GitHub account hostage to a
+        # row that redeems nothing, and tell its rightful owner their
+        # account is already linked to Discord ID None.
+        existing = legacy if legacy and legacy.get("discord_id") else None
     if existing and str(existing.get("discord_id")) != discord_id:
         raise AccountAlreadyLinkedError(existing.get("discord_id"))
 
-    document: MongoDocument = {
+    starred = bool(starred_repo)
+    identity: MongoDocument = {
         "schema_version": SCHEMA_VERSION,
         "discord_id": discord_id,
         "discord_username": str(discord_username or ""),
@@ -389,15 +517,63 @@ def link_account(
         "github_username": github_username,
         "github_username_lower": github_username.lower(),
         "linked_repo": linked_repo,
-        "starred_repo": bool(starred_repo),
-        "updated_at": datetime.now(UTC),
+        "updated_at": written_at,
     }
+    document: MongoDocument = {**identity, "starred_repo": starred}
 
     try:
-        collection.update_one({"discord_id": discord_id}, {"$set": document}, upsert=True)
+        # An account change is one statement, because none of the star
+        # fields survives it: all three describe a row and an account
+        # together. $ne also matches a row with no github_id, a legacy one
+        # adopting it. See the relink tests for what two statements cost.
+        changed_account = collection.update_one(
+            {"discord_id": discord_id, "github_id": {"$ne": github_id}},
+            {
+                "$set": {**identity, "starred_repo": starred},
+                "$unset": {"star_event_at": "", "star_source": ""},
+            },
+        )
+        if getattr(changed_account, "matched_count", 0):
+            return document
+
+        collection.update_one(
+            {"discord_id": discord_id},
+            # The star state rides along only on an insert. A row this call
+            # creates is visible to the webhook by its github_id the moment
+            # it exists, and one without ``starred_repo`` is a shape
+            # record_star_event has to treat as neither starred nor
+            # un-starred, so it would record the event without queueing the
+            # role change it came with. On a row that already exists the
+            # write below owns the field instead.
+            {"$set": identity, "$setOnInsert": {"starred_repo": starred}},
+            upsert=True,
+        )
     except DuplicateKeyError as exc:
         # Lost a race against a concurrent link of the same GitHub account.
         raise AccountAlreadyLinkedError(github_id) from exc
+
+    wrote_star = collection.update_one(
+        # Named by the identity too: this is a second write and the row
+        # can change owner between the two, so a Discord-ID-only filter
+        # would write this call's star state onto an account that never
+        # had its star checked. The fall-through below reads the row back.
+        _not_newer_than(horizon, discord_id=discord_id, github_id=github_id),
+        {"$set": {"starred_repo": starred}},
+    )
+    matched: int = getattr(wrote_star, "matched_count", 0)
+    if not matched:
+        # A star event this observation cannot speak for got there first,
+        # so the row keeps it and the flag that event raised stays up for
+        # the drain. Reading it back is what stops this reporting a star
+        # state it has just declined to store; a row deleted in between
+        # reads as no star, which is the direction that hands out no role.
+        # Named by the identity, like the write: a stale star event and a
+        # relink that took the row over both fail to match here, and the
+        # Discord ID alone reports the second as though it were the first.
+        superseded = collection.find_one(
+            {"discord_id": discord_id, "github_id": github_id}, {"_id": 0}
+        )
+        document["starred_repo"] = bool(superseded and superseded.get("starred_repo"))
 
     return document
 
@@ -441,7 +617,7 @@ def set_starred(
     authority again and this write lands as it always did.
     """
     result = collection.update_one(
-        _not_newer_than(observed_at, discord_id=str(discord_id)),
+        _not_newer_than(_last_millisecond_before(observed_at), discord_id=str(discord_id)),
         {
             "$set": {
                 "starred_repo": bool(starred),
@@ -454,21 +630,62 @@ def set_starred(
     return matched > 0
 
 
-def _not_newer_than(observed_at: datetime, **keys: object) -> MongoDocument:
-    """Build a filter for rows no webhook has touched since ``observed_at``.
+def _not_newer_than(horizon: datetime, **keys: object) -> MongoDocument:
+    """Build a filter for rows carrying no star event later than ``horizon``.
 
     The ``$exists`` arm is what keeps every ordinary row matching: a link
     that no star event has ever reached has no ``star_event_at`` at all,
     which is its normal state, and a bare ``$lte`` would exclude all of
     them and stop the sweep writing anything.
+
+    The sweep passes a horizon one millisecond back from its listing and
+    :func:`link_account` one millisecond back from the OAuth star check;
+    the webhook passes the instant it received the event. See
+    :func:`_last_millisecond_before` for why only the readers step back.
+
+    The ``$lte`` here is mirrored in ``server/webhooks.py``, which reads
+    the row back to tell a write that landed from one that was refused as
+    stale. It has to mirror it, because the answer is whether this filter
+    matched and only this filter knows; so changing the comparison means
+    changing it there too, or the receiver starts calling successful
+    writes superseded. It cannot notice on its own.
     """
     return {
         **keys,
         "$or": [
             {"star_event_at": {"$exists": False}},
-            {"star_event_at": {"$lte": observed_at}},
+            {"star_event_at": {"$lte": horizon}},
         ],
     }
+
+
+def _last_millisecond_before(observed_at: datetime) -> datetime:
+    """The newest stored instant that is certainly earlier than ``observed_at``.
+
+    Written in terms of the sweep's listing, because that is where the cost
+    of getting it wrong is highest, but it holds for anything that observed
+    the star state in memory and then compared itself against a stored
+    event: :func:`link_account` reaches it with the instant the OAuth star
+    check was answered, which is the same shape of comparison.
+
+    ``observed_at`` is made by :func:`datetime.now` and never leaves memory,
+    so it keeps its microseconds. Every ``star_event_at`` it is compared
+    against has been through BSON, which holds whole milliseconds, so the
+    stored value has been rounded down and the two cannot be compared as
+    they stand. A webhook that landed four hundred microseconds after the
+    listing was taken comes back looking earlier than it, and the guards
+    built on that comparison then wave through the exact write they exist
+    to refuse: the sweep removes the role and writes its stale state over
+    the newer one.
+
+    Truncating to the millisecond the database can hold and stepping back
+    one puts every event inside the listing's own millisecond on the newer
+    side, where the ambiguity belongs. Being wrong that way costs one sweep
+    cycle skipping a row it could have written; being wrong the other way
+    is the lost update :func:`set_starred` describes.
+    """
+    truncated = observed_at.replace(microsecond=observed_at.microsecond // 1000 * 1000)
+    return truncated - BSON_RESOLUTION
 
 
 def star_event_is_newer(document: Mapping[str, object], observed_at: datetime) -> bool:
@@ -479,9 +696,22 @@ def star_event_is_newer(document: Mapping[str, object], observed_at: datetime) -
     about keeps their role rather than having it taken and then restored;
     the guard on the write closes the microseconds between this check and
     the write landing.
+
+    Both halves are measured from the same horizon, so they agree on which
+    side of the listing an event falls; see :func:`_last_millisecond_before`
+    for why that horizon is not ``observed_at`` itself.
+
+    That stepped-back horizon is what makes this the sweep's predicate and
+    nobody else's, and the name does not say so loudly enough on its own.
+    It is not "has anything happened since my own write", and a writer that
+    reuses it against the instant it just wrote is told yes every single
+    time: the stored value is that instant truncated, which is later than
+    the horizon this steps back to. A caller asking whether its own write
+    landed wants its own unshifted instant and the comparison in
+    :func:`_not_newer_than`, not this one.
     """
     star_event_at = read_datetime(document, "star_event_at")
-    return star_event_at is not None and star_event_at > observed_at
+    return star_event_at is not None and star_event_at > _last_millisecond_before(observed_at)
 
 
 def record_star_event(
@@ -505,39 +735,72 @@ def record_star_event(
     that reports what the row already says is not work for the bot, and
     queueing it would have the bot re-apply a role it has already applied.
 
-    The read and the write are two operations rather than one, so two
-    deliveries racing here can both conclude the state moved. That is the
-    harmless direction: the flag is raised once too often and the bot
-    reconciles a role that is already correct. It cannot go the other way,
-    because the flag is only ever lowered by the bot after it has acted.
-    """
-    key = {"github_id": int(github_id)}
-    document = collection.find_one(key)
-    if document is None:
-        return None
+    Whether the state moved is decided by the filter rather than by a read
+    taken a moment earlier, and the write is refused outright once the row
+    carries a star event newer than this one. Both are needed, and the
+    interleaving they close starts from a row that says un-starred:
 
+    1. A ``created`` delivery reads the row and sees un-starred.
+    2. A ``deleted`` delivery reads it, sees un-starred as well, concludes
+       nothing moved, and writes un-starred with no flag.
+    3. The ``created`` delivery writes starred, and raises the flag.
+
+    The row is left saying starred with work queued, on the older of the
+    two events, and the bot hands out a role for a star that was taken
+    back. The compare-and-swap alone does not close it, because the two
+    statements then simply swap places; the ordering condition is what
+    stops step 3 landing at all.
+
+    Two deliveries stamped inside the same millisecond are the one case
+    left, since a stored timestamp cannot tell them apart and there is no
+    other clock they share. The sweep corrects that row on its next cycle.
+    """
+    github_id = int(github_id)
     changes: MongoDocument = {
         "starred_repo": starred,
         "star_event_at": occurred_at,
         "star_source": source,
         "updated_at": datetime.now(UTC),
     }
-    if bool(document.get("starred_repo")) != starred:
-        changes["role_sync_pending"] = True
 
-    # Keyed on the unique github_id again, which is the same single index
-    # hit as the read above and keeps the two statements talking about the
-    # same row in the same terms.
-    return collection.find_one_and_update(
-        key,
+    # The state moved. "The row does not already say this" is the filter
+    # rather than something concluded from an earlier read, so the test and
+    # the write are one statement. Keyed on the unique github_id, which is
+    # the single index hit the separate read used to cost.
+    moved = collection.find_one_and_update(
+        _not_newer_than(occurred_at, github_id=github_id, starred_repo=not starred),
+        {"$set": {**changes, "role_sync_pending": True}},
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+    if moved is not None:
+        return moved
+
+    # The state did not move, so the delivery is recorded and the bot is
+    # left alone. This filter is the one above without the state condition,
+    # so between them they match every row the first could have and no
+    # delivery falls through both over what the row happens to say. A row
+    # with no ``starred_repo`` at all is not a shape link_account can
+    # write, and it lands here rather than being read as un-starred.
+    unchanged = collection.find_one_and_update(
+        _not_newer_than(occurred_at, github_id=github_id),
         {"$set": changes},
         projection={"_id": 0},
         return_document=ReturnDocument.AFTER,
     )
+    if unchanged is not None:
+        return unchanged
+
+    # Neither matched, so either nothing is linked to this account or a
+    # newer event reached the row first. Reading it tells the two apart and
+    # keeps None meaning "not a verified member", which is the only thing
+    # the caller reads off this. A delivery that arrived late reports the
+    # row as it now stands, which is the state the bot will act on.
+    return collection.find_one({"github_id": github_id}, {"_id": 0})
 
 
 def iter_pending_role_syncs(collection: UserCollection) -> Iterator[MongoDocument]:
-    """Yield the links waiting for the bot to move a role, without ``_id``.
+    """Yield the links waiting for the bot to move a role, ``_id`` included.
 
     Streamed off the cursor for the same reason as :func:`iter_links`: the
     bot awaits Discord between documents, so a burst of stars must not
@@ -556,8 +819,16 @@ def iter_pending_role_syncs(collection: UserCollection) -> Iterator[MongoDocumen
     correct: the row is picked up in this pass or in the next one, because
     the flag stays raised until the bot itself lowers it. The queue is
     eventually consistent by design, and the poll runs every thirty seconds.
+
+    The Mongo ``_id`` is kept here where :func:`iter_links` drops it,
+    because for some of these rows it is the only identity there is. A
+    row can carry no usable ``discord_id`` at all, and the drain then has
+    no way to lower the flag: the
+    filter :func:`clear_role_sync_pending` builds matches nothing, so the
+    row is read again, reported again and left queued on every poll for
+    the life of the process. See :func:`clear_role_sync_pending_by_id`.
     """
-    yield from collection.find({"role_sync_pending": True}, {"_id": 0})
+    yield from collection.find({"role_sync_pending": True})
 
 
 def queue_role_sync(collection: UserCollection, discord_id: object) -> None:
@@ -586,6 +857,18 @@ def queue_role_sync(collection: UserCollection, discord_id: object) -> None:
     ``updated_at`` is left alone for the same reason as in
     :func:`clear_role_sync_pending`: this is bookkeeping about the role,
     not news about the star.
+
+    The only writer here with no ordering condition, and it is right that
+    it has none, because raising is monotone and lowering is the dangerous
+    direction. This can add work and cannot drop any: a needless raise
+    costs one poll, since the drain reads ``starred_repo`` off the row
+    when it gets there rather than trusting anything the sweep believed,
+    and there is no upsert, so a row deleted in between is a no-op. A
+    condition would also be self-defeating, because the only one available
+    is the one :func:`set_starred` has just refused, so it would skip
+    exactly the rows this exists for. It becomes an instance of the
+    lost-update class the moment it writes star state, lowers the flag, or
+    the drain starts trusting a value handed to it instead of the row.
     """
     collection.update_one(
         {"discord_id": str(discord_id)},
@@ -597,8 +880,13 @@ def clear_role_sync_pending(
     collection: UserCollection,
     discord_id: object,
     starred: bool,
-) -> None:
+) -> bool:
     """Take ``discord_id`` off the pending queue, once the bot has acted.
+
+    True when the clear landed, which is the caller's only way to learn
+    that the row moved under it and is still queued; the answer is the
+    filter's, exactly as in :func:`set_starred`, because only the filter
+    knows whether it matched.
 
     ``starred`` is the star state the bot just acted on, and the clear only
     lands while the row still says that. Without it this is a lost update: a
@@ -618,10 +906,48 @@ def clear_role_sync_pending(
     last changed, and lowering this flag is bookkeeping about the role, not
     news about the star.
     """
-    collection.update_one(
+    result = collection.update_one(
         {"discord_id": str(discord_id), "starred_repo": starred},
         {"$set": {"role_sync_pending": False}},
     )
+    matched: int = getattr(result, "matched_count", 0)
+    return matched > 0
+
+
+def clear_role_sync_pending_by_id(collection: UserCollection, document_id: object) -> None:
+    """Lower the flag on one row by its Mongo ``_id``, unconditionally.
+
+    For the rows :func:`clear_role_sync_pending` cannot reach at all. A
+    queued row with no ``discord_id`` has no member to move a role for
+    and no Discord ID to name it by. Lowering the flag is the whole of
+    the work; leaving it raised is the same line logged every thirty
+    seconds until the process is restarted.
+
+    These are not as rare as the word legacy suggests, and guessing at
+    where they come from has already produced one wrong fix, so it is
+    worth recording. Every released server from 2023-10-28 until the
+    rebuild read the Discord ID straight off the query string, put it in
+    the session and wrote it into the document without validating it
+    anywhere on the path. An unauthenticated GET to ``/login`` with no
+    ``id``, followed by a completed OAuth, therefore stored a row whose
+    ``discord_id`` is null, and that held for nearly three years of
+    releases. Null is the shape to expect; the field being absent
+    entirely is the one-day schema from before it existed. Nothing has
+    ever backfilled either, because no Discord ID can be recovered from
+    what the row holds.
+
+    An empty string is a third shape and the odd one out: it round-trips
+    through ``str()``, so :func:`clear_role_sync_pending` reaches it and
+    it was never among the rows that got stuck. A regression test built
+    on that shape asserts nothing about this function.
+
+    Unconditional on purpose, where the call above guards on the star
+    state it acted on. That guard protects against a webhook moving the
+    row while the bot was talking to Discord, and nothing here talked to
+    Discord about a member that does not exist, so on these rows it would
+    only be a second way to match nothing.
+    """
+    collection.update_one({"_id": document_id}, {"$set": {"role_sync_pending": False}})
 
 
 def connect(
@@ -639,17 +965,36 @@ def connect(
     a replica that is briefly unavailable should not stop the process from
     starting. A document that was not upgraded is still readable, because
     every reader accepts version 1.
+
+    Each one is attempted on its own, and it is worth saying why rather
+    than leaving the loop looking like decoration. Sharing one ``try``
+    made them look independent when they are not, and the pairing was the
+    worst available: a collection carrying rows from the version that keyed
+    on the GitHub email holds several rows per Discord account, so the
+    unique ``discord_id`` index raises on exactly the upgrade that also has
+    to delete that version's stored OAuth tokens. The first failure took
+    the purge with it, and the tokens SECURITY.md tells operators are
+    removed at startup stayed in the database, with only a line about
+    indexes to say so. Anything added here gets the same isolation without
+    anyone having to notice the coupling again.
     """
     client = client_factory(host=mongo_host)
     database = client.get_database(mongo_database)
     collection = get_collection(database)
 
-    try:
-        ensure_indexes(collection)
-        ensure_delivery_indexes(get_delivery_collection(database))
-        purge_legacy_secrets(collection)
-        upgrade_documents(collection)
-    except PyMongoError as exc:
-        log.warning("Could not prepare the users collection: %s", exc)
+    preparations: tuple[tuple[str, Callable[[], object]], ...] = (
+        ("index the users collection", lambda: ensure_indexes(collection)),
+        (
+            "index the deliveries collection",
+            lambda: ensure_delivery_indexes(get_delivery_collection(database)),
+        ),
+        ("purge credentials written by older versions", lambda: purge_legacy_secrets(collection)),
+        ("upgrade user records", lambda: upgrade_documents(collection)),
+    )
+    for description, prepare in preparations:
+        try:
+            prepare()
+        except PyMongoError as exc:
+            log.warning("Could not %s: %s", description, exc)
 
     return client, collection

@@ -12,6 +12,7 @@ from interactions.client.errors import Forbidden, HTTPException
 from pymongo.errors import PyMongoError
 
 from bot.config import BotConfig
+from bot.memberlock import MemberLocks
 from bot.starcheck import CheckAlreadyRunningError, StarChecker
 from common.github_api import GitHubError, StargazerListing
 from common.storage import STAR_SOURCE_SWEEP, STAR_SOURCE_WEBHOOK, record_star_event
@@ -228,9 +229,26 @@ def listing(*logins, ids=None):
     )
 
 
-def build(monkeypatch, documents, stargazers, fetch=None, ids=None, **config_overrides):
-    """Wire a checker up to fakes. Returns (checker, members, channel, users)."""
-    members = {document["discord_id"]: FakeMember(document["discord_id"]) for document in documents}
+def build(
+    monkeypatch, documents, stargazers, fetch=None, ids=None, member_locks=None, **config_overrides
+):
+    """Wire a checker up to fakes. Returns (checker, members, channel, users).
+
+    ``member_locks`` is the registry the sweep takes a member's mutex from.
+    A private one is right for a checker on its own; the tests that run a
+    sweep against a drain or a claim pass the registry they share, because
+    three private registries would be three sets of mutexes and no
+    exclusion at all.
+    """
+    # Rows with no usable Discord ID name no member, the same way the
+    # drain's build does. Indexing them unconditionally raised KeyError on
+    # the shape the sweep most needs to be handed: a document whose
+    # `discord_id` key is absent entirely.
+    members = {
+        document["discord_id"]: FakeMember(document["discord_id"])
+        for document in documents
+        if document.get("discord_id")
+    }
     channel = FakeChannel()
     users = FakeUsers(documents)
     client = FakeClient(FakeGuild(members), channel)
@@ -239,7 +257,12 @@ def build(monkeypatch, documents, stargazers, fetch=None, ids=None, **config_ove
         return listing(*stargazers, ids=ids)
 
     monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", fetch or default_fetch)
-    checker = StarChecker(client, make_config(**config_overrides), users)
+    checker = StarChecker(
+        client,
+        make_config(**config_overrides),
+        users,
+        MemberLocks() if member_locks is None else member_locks,
+    )
     return checker, members, channel, users
 
 
@@ -375,27 +398,64 @@ def test_a_waiting_caller_runs_after_the_first_finishes(monkeypatch):
 
 
 def test_checkstars_is_told_a_cycle_is_already_running(monkeypatch):
-    checker, _, _, _ = build(monkeypatch, [], set())
-    release = None
+    # A real cycle, held where a long one spends its time, rather than the
+    # lock taken by hand: the lock is shared with the role-sync drain, so
+    # holding it proves nothing about a check being in progress.
+    checker, members, _, _ = build(monkeypatch, [link(1, "Gone")], set())
 
     async def scenario():
-        nonlocal release
+        entered = asyncio.Event()
         release = asyncio.Event()
+        original = members["1"].remove_role
 
-        async def blocked():
-            async with checker._lock:
-                await release.wait()
+        async def hold(role_id, reason=None):
+            entered.set()
+            await release.wait()
+            await original(role_id, reason)
 
-        holder = asyncio.create_task(blocked())
-        await asyncio.sleep(0)
+        members["1"].remove_role = hold
+        cycle = asyncio.create_task(checker.run_once())
+        await entered.wait()
 
         assert checker.running is True
         with pytest.raises(CheckAlreadyRunningError):
             await checker.run_once(wait=False)
 
         release.set()
-        await holder
+        assert await cycle == ["user1"]
         assert checker.running is False
+
+    asyncio.run(scenario())
+
+
+def test_a_drain_in_progress_is_neither_a_running_check_nor_something_to_wait_for(monkeypatch):
+    # The drain used to be handed this very lock, so /checkstars answered
+    # "a star check is already running" whenever a non-empty drain happened
+    # to be in progress. That is a sentence an administrator can do nothing
+    # with: no check was running, no results were coming, and pressing it
+    # again a second later said the same thing. The cycle lock holds cycles
+    # now, and the drain holds one member's mutex at a time.
+    member_locks = MemberLocks()
+    checker, _, _, _ = build(monkeypatch, [], set(), member_locks=member_locks)
+
+    async def scenario():
+        release = asyncio.Event()
+
+        async def drain():
+            async with member_locks.hold("1"):
+                await release.wait()
+
+        holder = asyncio.create_task(drain())
+        await asyncio.sleep(0)
+
+        assert checker.running is False
+        # Nor does the check queue behind it. The sweep takes each
+        # member's mutex as it reaches them, and it reaches nobody here.
+        assert await checker.run_once(wait=False) == []
+        assert checker.running is False
+
+        release.set()
+        await holder
 
     asyncio.run(scenario())
 
@@ -519,13 +579,16 @@ def test_a_star_event_that_lands_mid_row_does_not_get_written_over(monkeypatch):
     assert not channel.sent
 
 
-def build_with_one_overtaken(monkeypatch):
+def build_with_one_overtaken(monkeypatch, queue_error=None):
     """One cycle over two un-stars, the second of which a star overtakes.
 
     Both members are in the same cycle on purpose. Every assertion about
     the overtaken one is that the check says nothing, and an assertion
     that nothing happened proves little without a member beside it for
     whom everything did.
+
+    ``queue_error`` is raised by the write that raises the pending flag,
+    which is the one failure the cycle cannot shrug off.
 
     Returns ``(checker, members, channel, users, queued)``, where
     ``queued`` collects the Discord IDs any write puts on the drain's
@@ -541,6 +604,8 @@ def build_with_one_overtaken(monkeypatch):
     def note_the_flag(query, update, upsert=False):
         if update.get("$set", {}).get("role_sync_pending") is True:
             queued.append(query["discord_id"])
+            if queue_error is not None:
+                raise queue_error
         return original_update(query, update, upsert)
 
     users.update_one = note_the_flag
@@ -608,6 +673,38 @@ def test_an_overtaken_removal_is_neither_announced_nor_reported(monkeypatch, cap
     summaries = [r for r in caplog.records if r.message.startswith("Star check complete")]
     assert summaries[0].examined == 2
     assert summaries[0].roles_removed == 1
+
+
+def test_a_refusal_that_cannot_be_queued_is_still_not_reported(monkeypatch, caplog):
+    # The two failures stacked. The refusal already proved the role was
+    # taken on stale information, and now the reconciliation cannot be
+    # queued either, so nothing will hand the role back: a sweep only ever
+    # takes roles away. Both writes went through one try block, so the
+    # second failure was read as "only the bookkeeping failed" and the
+    # cycle announced a farewell and reported a loss, about a member the
+    # database says stars the repository.
+    checker, members, channel, users, queued = build_with_one_overtaken(
+        monkeypatch, queue_error=PyMongoError("no primary available")
+    )
+
+    with caplog.at_level("ERROR", logger="starguard.bot"):
+        removed = asyncio.run(checker.run_once())
+
+    # The queue write was attempted and really did fail.
+    assert queued == ["2"]
+    assert "role_sync_pending" not in users.documents[1]
+    # The member beside them is unaffected, so this is the overtaken row
+    # and not a cycle that gave up.
+    assert removed == ["user1"]
+    assert len(channel.sent) == 1
+    assert "<@1>" in channel.sent[0]
+    # Nothing is claimed about the member whose state nobody can now fix,
+    # and the operator gets the one line that says the role is stuck.
+    assert members["2"].roles == set()
+    assert "user2" not in removed
+    assert not any("<@2>" in sent for sent in channel.sent)
+    assert "Could not queue the role sync for 2" in caplog.text
+    assert "no primary available" in caplog.text
 
 
 def test_every_link_is_examined_across_batches(monkeypatch):
@@ -764,10 +861,19 @@ def test_the_backoff_is_forgotten_once_a_cycle_succeeds(monkeypatch):
     assert checker._consecutive_failures == 0
 
 
-def test_a_link_with_no_discord_id_is_skipped(monkeypatch):
-    # Rows written by the oldest version were keyed on the GitHub email and
-    # some have no Discord ID at all; there is nobody to take a role from.
-    document = {**link(1, "Gone"), "discord_id": ""}
+@pytest.mark.parametrize("spelling", ["null", "missing", "empty"])
+def test_a_link_with_no_discord_id_is_skipped(monkeypatch, spelling):
+    # The sweep meets the same rows the drain does, so it is parametrised
+    # over the same three shapes. Null is the one that exists in numbers:
+    # from b715c73 (October 2023) until the rebuild, /login read the
+    # Discord ID from an unvalidated query parameter and stored whatever
+    # came back, so an unauthenticated GET with no id, followed by OAuth,
+    # wrote `discord_id: None`. There is nobody to take a role from.
+    document = {**link(1, "Gone")}
+    if spelling == "missing":
+        del document["discord_id"]
+    else:
+        document["discord_id"] = None if spelling == "null" else ""
     checker, _, channel, _ = build(monkeypatch, [document], set())
 
     assert asyncio.run(checker.run_once()) == []

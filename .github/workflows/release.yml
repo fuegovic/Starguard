@@ -25,9 +25,14 @@ jobs:
         # release-identity meaning under SemVer, so rejecting rather than
         # mangling it into the tag keeps the container tag, the git tag and
         # the CHANGELOG.md heading this workflow reads all in agreement.
+        # The regex components are each unbounded, so a long enough
+        # prerelease identifier (e.g. v1.2.3- followed by 122 characters)
+        # would still match it while exceeding the grammar's own 128
+        # character cap; the length check catches what the regex cannot
+        # bound on its own, for the same fail-fast reason.
         run: |
-          if ! [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
-            echo "::error::Tag '$REF_NAME' is not a supported release tag. Expected vMAJOR.MINOR.PATCH with an optional -prerelease suffix; SemVer build metadata (e.g. +build) is not valid in a container tag and is rejected." >&2
+          if ! [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]] || [ "${#REF_NAME}" -gt 128 ]; then
+            echo "::error::Tag '$REF_NAME' is not a supported release tag. Expected vMAJOR.MINOR.PATCH with an optional -prerelease suffix, at most 128 characters total; SemVer build metadata (e.g. +build) is not valid in a container tag and is rejected." >&2
             exit 1
           fi
 
@@ -102,3 +107,8 @@ jobs:
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           body_path: release_notes.md
+          # validate-tag only accepts a prerelease suffix introduced by a
+          # hyphen (vMAJOR.MINOR.PATCH-suffix); this input defaults to false,
+          # which would otherwise publish an rc/beta tag as a normal release
+          # and let it be picked up as latest.
+          prerelease: ${{ contains(github.ref_name, '-') }}

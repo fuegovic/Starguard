@@ -12,6 +12,7 @@ import requests
 
 from common.github_api import (
     MAX_ATTEMPTS_PER_PAGE,
+    PER_PAGE,
     GitHubError,
     StargazerCache,
     fetch_stargazer_listing,
@@ -199,6 +200,42 @@ def test_the_primary_rate_limit_is_not_retried():
     assert len(session.calls) == 1
 
 
+def test_a_429_at_the_primary_limit_is_reported_rather_than_retried():
+    # GitHub spells the primary limit 429 as often as 403, and the status on
+    # its own cannot tell it apart from the secondary limit the retries exist
+    # for; the remaining count at zero can. Retrying this one sleeps out the
+    # Retry-After three times over and reports the same exhaustion at the
+    # end, so a check would sit on a worker for three minutes for nothing.
+    slept = []
+    session = FakeSession(
+        [
+            FakeResponse(
+                status_code=429,
+                headers={"Retry-After": "60", "X-RateLimit-Remaining": "0"},
+            )
+        ]
+    )
+
+    with pytest.raises(GitHubError, match="rate limit"):
+        fetch(session, sleep=slept.append)
+    assert len(session.calls) == 1
+    assert not slept
+
+
+def test_a_429_with_budget_left_is_still_the_secondary_limit_and_is_retried():
+    # The other side of the test above: the secondary limit clears in
+    # seconds and leaves the hourly budget alone, so it must keep its retry.
+    session = FakeSession(
+        [
+            FakeResponse(status_code=429, headers={"X-RateLimit-Remaining": "4999"}),
+            FakeResponse(payload=user_page("alice")),
+        ]
+    )
+
+    assert fetch(session) == {"alice"}
+    assert len(session.calls) == 2
+
+
 def test_partial_results_are_never_returned():
     # The second page fails. Returning page one alone would look like everyone
     # on later pages had un-starred, and strip their roles.
@@ -338,6 +375,91 @@ def test_an_untagged_page_is_simply_not_cached():
     assert not cache.pages
 
 
+FIRST_PAGE_URL = "https://api.github.com/repos/o/r/stargazers"
+SECOND_PAGE_URL = "https://api.github.com/page2"
+
+
+def full_page_logins():
+    """Exactly enough distinct logins to fill a page to its boundary."""
+    return [f"user{index}" for index in range(PER_PAGE)]
+
+
+class EtagAwareSession:
+    """Serves pages by URL and honours If-None-Match the way GitHub does.
+
+    FakeSession answers from a queue whatever the request headers say, which
+    cannot tell a re-validated page from a freshly fetched one. That
+    difference is the whole of the bug the tests below are about.
+    """
+
+    def __init__(self, pages):
+        self._pages = pages
+        self.calls = []
+
+    def get(self, url, headers=None, params=None, timeout=None):
+        self.calls.append({"url": url, "headers": headers, "params": params})
+        response = self._pages[url]
+        etag = response.headers.get("ETag")
+        if etag and (headers or {}).get("If-None-Match") == etag:
+            return FakeResponse(status_code=304)
+        return response
+
+
+def test_a_full_last_page_cannot_hide_the_page_the_next_star_opens():
+    # The listing is ordered oldest first, so the star after a page boundary
+    # opens a page of its own and leaves the page before it byte for byte
+    # what it was. Its ETag still matches, so a cached entry would answer
+    # 304 with next_url=None and end the walk before the newcomer, who would
+    # then look un-starred and lose the role.
+    logins = full_page_logins()
+    cache = StargazerCache()
+    assert fetch(
+        EtagAwareSession({FIRST_PAGE_URL: page(*logins, etag='W/"full"')}), cache=cache
+    ) == set(logins)
+
+    session = EtagAwareSession(
+        {
+            FIRST_PAGE_URL: page(*logins, etag='W/"full"', next_url=SECOND_PAGE_URL),
+            SECOND_PAGE_URL: page("newcomer", etag='W/"p2"'),
+        }
+    )
+    listing = fetch_stargazer_listing("o", "r", session=session, cache=cache, sleep=no_sleep)
+
+    assert listing.logins == {*logins, "newcomer"}
+    assert account_id("newcomer") in listing.ids
+    # No conditional request was sent for the page at risk, which is what
+    # makes the 304 above impossible rather than merely unlikely.
+    assert "If-None-Match" not in session.calls[0]["headers"]
+
+
+def test_a_full_page_that_already_leads_somewhere_keeps_its_304_saving():
+    # The exclusion is deliberately narrow. Only the last page can grow a
+    # new page behind it, so a full page that already has a next link, which
+    # is every page of a long listing but one, stays cached and stays free.
+    logins = full_page_logins()
+    cache = StargazerCache()
+    first = EtagAwareSession(
+        {
+            FIRST_PAGE_URL: page(*logins, etag='W/"p1"', next_url=SECOND_PAGE_URL),
+            SECOND_PAGE_URL: page("tail", etag='W/"p2"'),
+        }
+    )
+    assert fetch(first, cache=cache) == {*logins, "tail"}
+    assert set(cache.pages) == {FIRST_PAGE_URL, SECOND_PAGE_URL}
+
+    second = EtagAwareSession(
+        {
+            FIRST_PAGE_URL: page(*logins, etag='W/"p1"', next_url=SECOND_PAGE_URL),
+            SECOND_PAGE_URL: page("tail", etag='W/"p2"'),
+        }
+    )
+    listing = fetch_stargazer_listing("o", "r", session=second, cache=cache, sleep=no_sleep)
+
+    assert listing.logins == {*logins, "tail"}
+    assert listing.pages_unchanged == 2
+    assert listing.pages_fetched == 0
+
+
 def test_the_listing_reports_what_it_cost():
     listing = fetch_stargazer_listing(
         "o",
@@ -358,16 +480,73 @@ def test_the_listing_reports_what_it_cost():
     assert listing.rate_limit_remaining == 4321
 
 
-def test_entries_that_are_not_user_objects_are_ignored():
-    # A page with something unexpected in it should cost the caller the
-    # entries it cannot read, never the whole cycle.
-    session = FakeSession([FakeResponse(payload=["nonsense", None, 17, {}, {"login": "Alice"}])])
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "nonsense",
+        None,
+        17,
+        {},
+        {"login": "Alice"},
+        {"login": "Alice", "id": None},
+        {"login": "Alice", "id": "1234"},
+        {"login": "Alice", "id": 12.5},
+        {"login": None, "id": 1234},
+        {"starred_at": "2024-01-01", "user": {"login": "Alice"}},
+    ],
+    ids=[
+        "a string",
+        "null",
+        "a number",
+        "an empty object",
+        "no id",
+        "a null id",
+        "an id as a string",
+        "an id that is not whole",
+        "a null login",
+        "no id inside the envelope",
+    ],
+)
+def test_an_entry_that_cannot_be_read_costs_the_cycle_rather_than_a_role(entry):
+    # This test used to assert the opposite, that a page should cost the
+    # caller the entries it cannot read and never the whole cycle, on the
+    # reasoning that the listing still describes the accounts GitHub
+    # described properly. That reasoning was written when the un-star check
+    # compared logins, and it does not survive the check matching on ids:
+    # an entry dropped here is an account missing from listing.ids, the
+    # check cannot tell that apart from somebody who un-starred, and the
+    # member loses a role while their login sits in the very same response.
+    # Refusing the page costs one cycle, which the next one makes up.
+    session = FakeSession([FakeResponse(payload=[{"login": "Bob", "id": 2}, entry])])
+    with pytest.raises(GitHubError, match="no usable login and account id"):
+        fetch_stargazer_listing("o", "r", session=session)
+
+
+def test_an_id_that_is_a_bool_is_not_read_as_the_account_numbered_one():
+    # True is an int in Python and hashes equal to 1, so an unchecked id
+    # would put the member whose account id is 1 in the listing and leave
+    # whoever this entry is out of it.
+    session = FakeSession([FakeResponse(payload=[{"login": "Alice", "id": True}])])
+    with pytest.raises(GitHubError, match="no usable login and account id"):
+        fetch_stargazer_listing("o", "r", session=session)
+
+
+def test_a_page_whose_entries_all_read_is_accepted_whole():
+    # The other side of the rule: refusing a page must not become refusing
+    # the ordinary ones. The envelope spelling counts as readable too.
+    session = FakeSession(
+        [
+            FakeResponse(
+                payload=[
+                    {"login": "Alice", "id": 1},
+                    {"starred_at": "2024-01-01", "user": {"login": "Bob", "id": 2}},
+                ]
+            )
+        ]
+    )
     listing = fetch_stargazer_listing("o", "r", session=session)
-    assert listing.logins == {"alice"}
-    # An entry carrying a login and no id contributes to one set and not the
-    # other, which is allowed: the two sets describe the same accounts only
-    # as far as GitHub described them.
-    assert listing.ids == frozenset()
+    assert listing.logins == {"alice", "bob"}
+    assert listing.ids == {1, 2}
 
 
 def http_date(seconds_from_now, with_timezone=True):

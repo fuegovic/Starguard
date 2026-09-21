@@ -26,3 +26,14 @@ pytest-cov==7.1.0
 # pyproject.toml.
 types-requests==2.33.0.20260906
 types-waitress==3.0.1.20260724
+
+# The browser-driven suite under e2e/, which is not part of the default
+# pytest run. Playwright is pinned to the release whose bundled Chromium
+# revision is the one already in the local browser cache: `playwright
+# install` reaches a CDN that is not always available, and a version that
+# wants a different revision turns the whole suite into skips. Check
+# packages/playwright-core/browsers.json for the tag before moving this pin.
+playwright==1.62.0
+# Carries axe-core itself, so the accessibility rules do not come off a CDN
+# at test time either.
+axe-playwright-python==0.1.8
