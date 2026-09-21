@@ -36,7 +36,7 @@ from common.storage import (
     set_starred,
     star_event_is_newer,
 )
-from common.storage_errors import StorageError
+from common.storage_errors import StorageError, StorageUnavailableError
 
 log = logging.getLogger("starguard.bot")
 
@@ -329,6 +329,22 @@ class StarChecker:
                 # same walk and reached the same row again. Nobody after it
                 # in the listing was ever checked again, and the only signal
                 # was a repeating traceback in the log.
+                # An unreachable database is not one bad row, and treating
+                # it as one is worse than the crash this guard replaced. Every
+                # remaining entry would raise the same way, the cycle would
+                # still report success, _last_completed would be stamped and
+                # the health socket would keep saying the loop is fresh, all
+                # while nobody had been checked. Let it out: run_forever logs
+                # it, backs off and retries, which is the behaviour that
+                # matches what actually happened.
+                except StorageUnavailableError:
+                    log.error(
+                        "The database became unreachable %s link(s) into the walk; "
+                        "abandoning this cycle rather than reporting it complete.",
+                        examined,
+                    )
+                    raise
+                # The rule the drain already follows, for everything else.
                 except Exception:  # pylint: disable=broad-except
                     log.exception(
                         "Could not check the star for Discord ID %s",

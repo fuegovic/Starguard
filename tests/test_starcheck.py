@@ -16,6 +16,7 @@ from bot.memberlock import MemberLocks
 from bot.starcheck import CheckAlreadyRunningError, StarChecker
 from common.github_api import StargazerListing
 from common.storage import STAR_SOURCE_SWEEP, STAR_SOURCE_WEBHOOK, record_star_event
+from common.storage_errors import StorageError, StorageUnavailableError
 from tests.test_roles import discord_error
 
 ROLE_ID = 111
@@ -560,6 +561,52 @@ def test_a_member_who_stars_during_the_walk_keeps_the_role(monkeypatch):
     assert users.documents[0]["starred_repo"] is True
     assert users.documents[0]["star_source"] == STAR_SOURCE_WEBHOOK
     assert users.documents[0]["role_sync_pending"] is True
+
+
+def test_a_database_outage_mid_walk_abandons_the_cycle(monkeypatch, caplog):
+    # The per-entry guard exists so one unusable row cannot strand the rest
+    # of the walk, but an unreachable database is every remaining row. Swallowed
+    # per entry, the cycle reports success, stamps _last_completed and leaves
+    # the health socket saying the loop is fresh, having checked nobody.
+    checker, _, _, _ = build(monkeypatch, [link(1, "Gone"), link(2, "Also")], set())
+
+    def gone(collection, discord_id):
+        raise StorageUnavailableError("no replica set members available")
+
+    monkeypatch.setattr("bot.starcheck.find_link", gone)
+
+    with caplog.at_level("ERROR", logger="starguard.bot"), pytest.raises(StorageUnavailableError):
+        asyncio.run(checker.run_once())
+
+    # Not stamped, so the health check sees a loop that has not completed
+    # rather than one that completed having done nothing.
+    assert checker.last_completed is None
+    assert "abandoning this cycle" in caplog.text
+
+
+def test_one_unusable_row_still_does_not_strand_the_walk(monkeypatch, caplog):
+    # The other half, so the outage case cannot be satisfied by simply
+    # letting everything out again: a StorageError the database answered
+    # with is still this row's problem and the walk carries on.
+    checker, members, _, users = build(monkeypatch, [link(1, "Gone"), link(2, "Also")], set())
+    real = users.find_one
+    calls = []
+
+    def refuse_the_first(query, projection=None):
+        calls.append(query)
+        if len(calls) == 1:
+            raise StorageError("index not found")
+        return real(query, projection)
+
+    users.find_one = refuse_the_first
+
+    with caplog.at_level("ERROR", logger="starguard.bot"):
+        removed = asyncio.run(checker.run_once())
+
+    # The second member was still reached and still lost the role.
+    assert removed == ["user2"]
+    assert members["2"].removals == 1
+    assert checker.last_completed is not None
 
 
 def test_a_member_who_relinks_while_the_cycle_waits_keeps_the_role(monkeypatch):

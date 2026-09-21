@@ -179,8 +179,16 @@ jobs:
           echo "Changed files:" >> "$GITHUB_STEP_SUMMARY"
           printf '%s\n' "$changed" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
 
-          if printf '%s\n' "$changed" \
-            | grep -qvE '(^docs/|\.md$|^\.github/ISSUE_TEMPLATE/|^LICENSE$|\.png$)'
+          # A here-string rather than a pipe, and the difference is not
+          # cosmetic. GitHub runs this with `-eo pipefail`. Piping into
+          # `grep -q` means grep exits the moment it finds its first match
+          # and stops reading, printf then takes SIGPIPE once the list is
+          # larger than the pipe buffer, and pipefail reports that 141 as
+          # the status of the whole pipeline. The `if` reads the failure as
+          # "no relevant files" and skips the image build and the Trivy
+          # scan, on exactly the large changes that most need them. A
+          # here-string has no second process to signal.
+          if grep -qvE '(^docs/|\.md$|^\.github/ISSUE_TEMPLATE/|^LICENSE$|\.png$)' <<< "$changed"
           then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
             echo "" >> "$GITHUB_STEP_SUMMARY"
