@@ -5,10 +5,23 @@ name: Release
 #   1. the CI gate runs (ci.yml, called below);
 #   2. release-please opens or updates a "chore(main): release X.Y.Z" pull
 #      request describing what has accumulated since the last release, and,
-#      when that pull request is itself merged, tags the commit and publishes
-#      the GitHub release;
+#      when that pull request is itself merged, drafts the GitHub release;
 #   3. the images are built and pushed, always as :main and the commit sha,
-#      and additionally as the version tags when step 2 cut a release.
+#      and additionally as the version tags when step 2 cut a release;
+#   4. the drafted release is published, which is also what creates the git
+#      tag, because GitHub holds the tag back until a draft goes public.
+#
+# Step 4 is a separate job rather than part of step 2 so that the release a
+# person can see is never ahead of the images it documents. A release names
+# ghcr.io tags in its notes and the compose files pull them, so publishing it
+# before the registry has them advertises artifacts that do not exist; if the
+# build or the signature fails, the release stays a draft, no tag is created,
+# and the previous release is still the newest thing anybody can find.
+#
+# The recovery when step 3 fails is to re-run this workflow's failed jobs.
+# The draft is already there and release-please will not cut a second one for
+# a version its manifest already records, so a successful re-run promotes the
+# same draft. A draft that is abandoned instead has to be deleted by hand.
 #
 # main has no separate push trigger in ci.yml precisely so that this is the
 # only pipeline running on it. A release is therefore never published from a
@@ -49,7 +62,15 @@ jobs:
       # Empty on an ordinary push to main. Set to the released version, with
       # no leading "v", on the push that merged the release pull request.
       # This is what tells the publish job below whether to move :latest.
+      #
+      # The manifest keys this repository's only package on ".", and the
+      # action writes a root package's outputs unprefixed, so these are the
+      # plain names rather than ".--version".
       version: ${{ steps.release.outputs.version }}
+      # The numeric id of the drafted release, which is how the announce job
+      # addresses it. Addressing it by tag would not work: GitHub creates no
+      # tag for a draft, so there is nothing yet for a tag lookup to find.
+      release_id: ${{ steps.release.outputs.id }}
     steps:
       - name: Open, update or land the release pull request
         id: release
@@ -68,3 +89,45 @@ jobs:
     uses: ./.github/workflows/publish.yml
     with:
       version: ${{ needs.release-please.outputs.version }}
+
+  announce:
+    name: Publish the drafted release
+    # Both, and in this order: the version comes from release-please and the
+    # images have to be in the registry before the release that names them
+    # is visible. needs on the publish job covers its promote stage too, so
+    # this cannot run while a tag is still pointing at the previous digest.
+    needs: [release-please, publish]
+    # Only the push that merged a release pull request has a version, and
+    # only that push has a draft to publish.
+    if: needs.release-please.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      # Flip the release from draft to published, which also creates the tag.
+      contents: write
+    steps:
+      - name: Take the release out of draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.release-please.outputs.release_id }}
+          VERSION: ${{ needs.release-please.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::release-please reported version ${VERSION} but no release id, so there is no draft to publish." >&2
+            exit 1
+          fi
+
+          # -F rather than -f, so draft is sent as the JSON boolean false
+          # rather than the string "false", which GitHub reads as truthy and
+          # would leave the release drafted while reporting success.
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false >/dev/null
+
+          published="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" --jq '.draft')"
+          if [ "$published" != "false" ]; then
+            echo "::error::Release ${RELEASE_ID} is still a draft after the update." >&2
+            exit 1
+          fi
+          echo "Published release ${RELEASE_ID} for v${VERSION}."

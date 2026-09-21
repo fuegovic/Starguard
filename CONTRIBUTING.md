@@ -163,8 +163,24 @@ and nobody pushes a tag by hand.
 3. The images for that commit are published as `:main` and as the commit
    sha, so `main` is always runnable.
 4. When you want the release, you merge that pull request. release-please
-   tags the commit `vX.Y.Z` and publishes the GitHub release, and the images
-   are published again as `vX.Y.Z`, `vX.Y` and `latest`.
+   drafts the GitHub release, the images are built, signed and published as
+   `vX.Y.Z`, `vX.Y` and `latest`, and the release is taken out of draft
+   last. Publishing the draft is also what creates the `vX.Y.Z` tag, since
+   GitHub holds the tag back while a release is a draft.
+
+That order is deliberate. A release names image tags that an operator is
+about to pull, so it must not exist before they do. If a build or a
+signature fails, the release stays a draft, no tag is created, and the
+previous release is still the newest thing anybody can find; re-running the
+failed jobs promotes the same draft once the images are there. A draft you
+decide to abandon has to be deleted by hand.
+
+Tags move only after every image has been built and signed. Each image is
+pushed by digest first, which publishes the layers under no tag at all,
+then signed, and only then do `:main`, `:latest` and the version tags move
+onto that digest. So a failed build, a failed signature, or a bot image
+that built while the server image did not all leave every tag pointing at
+the last release that completed, rather than at something half-published.
 
 Reviewing the release pull request is the whole point of the mechanism: the
 version it proposes is derived from the commit types, so a `feat:` that
