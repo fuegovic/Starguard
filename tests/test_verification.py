@@ -329,7 +329,10 @@ def test_the_public_thank_you_is_the_second_message_and_not_the_first():
     assert ctx.deferred_ephemeral is True
     assert len(ctx.sent) == 2
 
-    confirmation, thanks = ctx.sent
+    # Indexed rather than unpacked, because FakeContext.sent starts empty and
+    # pylint reads the unpacking against that initial value.
+    confirmation = ctx.sent[0]
+    thanks = ctx.sent[1]
     assert confirmation.content == messages.CLAIM_GRANTED
     assert confirmation.ephemeral is True
     assert thanks.ephemeral is False

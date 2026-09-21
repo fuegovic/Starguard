@@ -133,6 +133,6 @@ def test_wrapping_an_iterator_does_not_start_it():
         yield {"discord_id": "1"}
 
     links = iter_links()
-    assert started == []
+    assert not started
     assert next(links) == {"discord_id": "1"}
     assert started == [True]
