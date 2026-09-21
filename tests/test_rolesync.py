@@ -34,11 +34,11 @@ from tests.test_starcheck import (
     FakeGuild,
     FakeMember,
     FakeUsers,
-    drive_loop,
     link,
     listing,
     make_config,
 )
+from tests.test_starcheck_loop import drive_loop
 
 
 class RecordingUsers(FakeUsers):
