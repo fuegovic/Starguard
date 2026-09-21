@@ -21,6 +21,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from authlib.integrations.flask_client import OAuthError
 from pymongo.errors import PyMongoError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ConnectTimeout, ReadTimeout
 
 from common.storage import STAR_SOURCE_WEBHOOK, link_account, record_star_event
 from common.storage_errors import StorageError
@@ -399,6 +401,17 @@ def test_an_empty_token_is_a_failed_sign_in(token):
             "user": FakeApiResponse(payload=dict(PROFILE)),
             STARRED_PATH: OAuthError(error="server_error", description="502"),
         },
+        # GitHub did not answer in time. Only reachable since client_kwargs
+        # began passing default_timeout: without it the call hung rather
+        # than raising, so this escaped as a 500 the first time a request
+        # actually timed out.
+        {"user": ReadTimeout("read timed out")},
+        # And the star check on the far side of a connection that dropped
+        # between the two calls.
+        {
+            "user": FakeApiResponse(payload=dict(PROFILE)),
+            STARRED_PATH: RequestsConnectionError("connection aborted"),
+        },
     ],
 )
 def test_an_unreadable_profile_is_a_bad_gateway(responses):
@@ -407,6 +420,20 @@ def test_an_unreadable_profile_is_a_bad_gateway(responses):
 
     assert response.status_code == 502
     assert messages.PROFILE_UNREADABLE.encode() in response.data
+    assert flow.users.documents == []
+
+
+def test_a_token_exchange_that_times_out_is_a_bad_gateway():
+    # The exchange reaches GitHub over the same session as the reads above
+    # and can time out the same way, but it sits in its own try that only
+    # knew about OAuthError. A timeout there is not a refused sign-in: the
+    # member did nothing wrong, so they are not told their sign-in failed.
+    flow = build(github=FakeGitHub(token_error=ConnectTimeout("connect timed out")))
+    response = authorize(flow)
+
+    assert response.status_code == 502
+    assert messages.PROFILE_UNREADABLE.encode() in response.data
+    assert messages.SIGN_IN_FAILED.encode() not in response.data
     assert flow.users.documents == []
 
 

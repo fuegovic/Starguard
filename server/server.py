@@ -26,6 +26,7 @@ from authlib.integrations.flask_client import OAuth, OAuthError
 from dotenv import load_dotenv
 from flask import Flask, Response, current_app, render_template, request, session, url_for
 from pymongo import MongoClient
+from requests.exceptions import RequestException
 from waitress import serve
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.wrappers import Response as WerkzeugResponse
@@ -204,6 +205,13 @@ def authorize() -> Response:
     except OAuthError as exc:
         log.info("OAuth error for Discord ID %s: %s", discord_id, exc.description)
         return render_result(messages.SIGN_IN_FAILED_REASON.format(reason=exc.description), 400)
+    except RequestException as exc:
+        # The token exchange reaches GitHub over the same session as the
+        # calls below and can time out the same way. Reported as a bad
+        # gateway rather than a refused sign-in, because nothing was
+        # refused: the member did nothing wrong and retrying may work.
+        log.warning("Could not exchange the OAuth code for Discord ID %s: %s", discord_id, exc)
+        return render_result(messages.PROFILE_UNREADABLE, 502)
 
     if not token:
         return render_result(messages.SIGN_IN_FAILED, 400)
@@ -225,7 +233,13 @@ def authorize() -> Response:
             token=token,
         )
         starred = _read_star_check(starred_response.status_code)
-    except (OAuthError, KeyError, ValueError) as exc:
+    # RequestException covers the transport failures that only became
+    # reachable once client_kwargs started passing default_timeout: before
+    # that a stalled GitHub call hung the worker instead of raising, so
+    # there was nothing here to catch. A timeout, a reset connection and a
+    # DNS failure are all "GitHub did not answer", which is the same 502
+    # this already reported for an answer it could not read.
+    except (OAuthError, KeyError, ValueError, RequestException) as exc:
         log.warning("Could not read the GitHub profile: %s", exc)
         return render_result(messages.PROFILE_UNREADABLE, 502)
 
