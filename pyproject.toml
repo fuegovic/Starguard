@@ -43,7 +43,14 @@ ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+# The lowest Python the test matrix runs, not the highest. These have to be
+# the same number: told py312, ruff proposes syntax that only parses there,
+# and UP047 asking for PEP 695 type parameters (`def f[**P, R](...)`) is a
+# SyntaxError on 3.11, so taking the suggestion would have passed lint and
+# then failed the 3.11 leg of the test job. If the floor ever moves, move it
+# here, in the CI matrix and in the two `uv pip compile --python-version`
+# lines together.
+target-version = "py311"
 
 [tool.ruff.lint]
 select = [
