@@ -13,10 +13,15 @@ either class and callers that used to catch the other one.
 # pylint: disable=missing-function-docstring,unused-argument
 
 import pytest
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import (
+    DuplicateKeyError,
+    PyMongoError,
+    ServerSelectionTimeoutError,
+)
 
 from common.storage_errors import (
     StorageError,
+    StorageUnavailableError,
     translates_driver_errors,
     translates_driver_errors_while_iterating,
 )
@@ -136,3 +141,56 @@ def test_wrapping_an_iterator_does_not_start_it():
     assert not started
     assert next(links) == {"discord_id": "1"}
     assert started == [True]
+
+
+def test_a_database_that_cannot_be_reached_is_told_apart():
+    # connect() attempts four preparations in a row and has to know which
+    # failures make the next attempt pointless. A wholly unreachable
+    # database raises this one, after the full server-selection deadline.
+    @translates_driver_errors
+    def read():
+        raise ServerSelectionTimeoutError("no replica set members available")
+
+    with pytest.raises(StorageUnavailableError) as caught:
+        read()
+
+    assert "no replica set members available" in str(caught.value)
+
+
+def test_the_unreachable_case_is_still_a_storage_error():
+    # Every existing caller catches StorageError and none of them should
+    # have to learn about the subclass to keep working.
+    @translates_driver_errors
+    def read():
+        raise ServerSelectionTimeoutError("no primary available")
+
+    with pytest.raises(StorageError):
+        read()
+
+    assert issubclass(StorageUnavailableError, StorageError)
+
+
+def test_a_failure_the_database_answered_with_is_not_the_unreachable_one():
+    # The half that makes the distinction worth having: a store that
+    # refused one operation says nothing about the next, so this must not
+    # be mistaken for the database being gone.
+    @translates_driver_errors
+    def write():
+        raise DuplicateKeyError("discord_id_unique")
+
+    with pytest.raises(StorageError) as caught:
+        write()
+
+    assert not isinstance(caught.value, StorageUnavailableError)
+
+
+def test_an_iterator_reports_an_unreachable_database_as_such_too():
+    # The cursor behind iter_links can lose the server mid-page, and the
+    # second decorator has to make the same distinction as the first.
+    @translates_driver_errors_while_iterating
+    def iter_links():
+        yield {"discord_id": "1"}
+        raise ServerSelectionTimeoutError("connection pool paused")
+
+    with pytest.raises(StorageUnavailableError):
+        list(iter_links())

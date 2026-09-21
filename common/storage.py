@@ -86,6 +86,7 @@ from pymongo.errors import DuplicateKeyError
 from common.deliveries import ensure_delivery_indexes, get_delivery_collection
 from common.storage_errors import (
     StorageError,
+    StorageUnavailableError,
     translates_driver_errors,
     translates_driver_errors_while_iterating,
 )
@@ -929,7 +930,28 @@ def connect(
     for description, prepare in preparations:
         try:
             prepare()
+        except StorageUnavailableError as exc:
+            # Isolation is worth a wait per preparation only while the
+            # waits are independent, and against an unreachable database
+            # they are not: each one blocks for the driver's whole
+            # server-selection deadline, thirty seconds by default, and
+            # then the next one starts another. Four of them is two
+            # minutes of a process that is not listening yet, which
+            # outlasts the bot's sixty-second Compose start period, so the
+            # health check fails a container that is only waiting. The
+            # first refusal has already established the answer for the
+            # rest, so stop asking.
+            log.warning(
+                "Could not %s: %s. Skipping the remaining startup preparations "
+                "because the database is unreachable.",
+                description,
+                exc,
+            )
+            break
         except StorageError as exc:
+            # A failure the database answered with says nothing about the
+            # next preparation, which is the whole reason these are
+            # attempted one at a time; see the docstring.
             log.warning("Could not %s: %s", description, exc)
 
     return client, collection

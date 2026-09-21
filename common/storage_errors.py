@@ -20,6 +20,13 @@ while the generator object was being constructed, which is never: the body
 does not run until the first ``next``, so every error from the cursor behind
 it would sail straight past a wrapper that looked correct.
 
+The seam also carries one distinction, because the alternative is for
+callers to reach back through ``__cause__`` and name the driver's classes
+again, which is the leak this module exists to stop.
+:class:`StorageUnavailableError` is a ``StorageError`` raised when the
+driver could not reach a server at all, as opposed to one the store
+answered. Only :func:`common.storage.connect` acts on it today.
+
 Two things are deliberately left alone.
 
 :class:`common.storage.AccountAlreadyLinkedError` is a rule declining a write,
@@ -37,7 +44,7 @@ import functools
 from collections.abc import Callable, Iterator
 from typing import ParamSpec, TypeVar
 
-from pymongo.errors import PyMongoError
+from pymongo.errors import ConnectionFailure, PyMongoError
 
 _P = ParamSpec("_P")
 _R = TypeVar("_R")
@@ -53,6 +60,33 @@ class StorageError(RuntimeError):
     """
 
 
+class StorageUnavailableError(StorageError):
+    """Raised when the database could not be reached at all.
+
+    A :class:`StorageError`, so every existing caller keeps catching it
+    without knowing it exists. The distinction is for the one caller that
+    has several operations to attempt and should stop after the first: a
+    failure to reach the store says the next operation will fail the same
+    way, and pay the same wait to find out, whereas a failure the store
+    answered with says nothing about the next one. See
+    :func:`common.storage.connect`.
+    """
+
+
+def _translate(exc: PyMongoError) -> StorageError:
+    """Pick the exception that says what kind of failure this was.
+
+    ``ConnectionFailure`` is the driver's own base class for "no usable
+    server", and ``ServerSelectionTimeoutError`` (the one a wholly
+    unreachable database raises, after the full server-selection deadline)
+    is a subclass of it. Anything else is the store declining or failing an
+    operation it actually received.
+    """
+    if isinstance(exc, ConnectionFailure):
+        return StorageUnavailableError(str(exc))
+    return StorageError(str(exc))
+
+
 def translates_driver_errors(func: Callable[_P, _R]) -> Callable[_P, _R]:
     """Re-raise whatever the driver raises inside ``func`` as a StorageError.
 
@@ -65,7 +99,7 @@ def translates_driver_errors(func: Callable[_P, _R]) -> Callable[_P, _R]:
         try:
             return func(*args, **kwargs)
         except PyMongoError as exc:
-            raise StorageError(str(exc)) from exc
+            raise _translate(exc) from exc
 
     return wrapper
 
@@ -85,6 +119,6 @@ def translates_driver_errors_while_iterating(
         try:
             yield from func(*args, **kwargs)
         except PyMongoError as exc:
-            raise StorageError(str(exc)) from exc
+            raise _translate(exc) from exc
 
     return wrapper

@@ -16,7 +16,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import DuplicateKeyError, PyMongoError, ServerSelectionTimeoutError
 
 from common.deliveries import (
     DELIVERY_COLLECTION_NAME,
@@ -1106,6 +1106,35 @@ def test_a_delivery_index_that_cannot_be_created_does_not_skip_the_purge(caplog)
     assert "github_token" not in collection.documents[0]
     assert collection.documents[0]["schema_version"] == SCHEMA_VERSION
     assert "index the deliveries collection" in caplog.text
+
+
+def test_an_unreachable_database_stops_after_the_first_preparation(caplog):
+    # The limit on the isolation above. Each preparation waits for the
+    # driver's whole server-selection deadline before it gives up, so
+    # attempting all four against a database that is not there costs four
+    # of those waits, in a process that is not listening yet. The bot's
+    # Compose health check allows sixty seconds for startup and the default
+    # deadline is thirty, so carrying on turns a database that is briefly
+    # away into a container the health check kills.
+    collection = RecordingCollection(
+        [legacy_row_holding_a_token()],
+        index_error=ServerSelectionTimeoutError("no replica set members available"),
+    )
+
+    with caplog.at_level("WARNING", logger="common.storage"):
+        _, users = connect("mongodb://db/", "starguard", mongo_factory(collection))
+
+    # Still a usable collection: an unreachable database at startup is not
+    # a reason to refuse to start, only a reason to stop asking.
+    assert users is collection
+    # Nothing after the first preparation was attempted, so the row is
+    # untouched rather than half-prepared.
+    assert "github_token" in collection.documents[0]
+    assert "schema_version" not in collection.documents[0]
+    assert "database is unreachable" in caplog.text
+    # And the log names the step that established it, not just the failure.
+    assert "index the users collection" in caplog.text
+    assert "purge credentials written by older versions" not in caplog.text
 
 
 def test_a_purge_that_cannot_run_does_not_skip_the_upgrade(caplog):
