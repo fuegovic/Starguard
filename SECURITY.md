@@ -2,11 +2,40 @@
 
 ## Supported Versions
 
-Starguard does not yet publish tagged releases. Security fixes land on
-`main` and ship in the images built from it, so running the latest `main` (or
-the latest `:latest` / commit-SHA tagged image) is what stays supported. Once
-tagged releases begin, this section will list which of them still receive
-fixes.
+Only the newest release receives security fixes. It is what the `:latest`
+image tag points at, and what `docker compose pull && docker compose up -d`
+gives you.
+
+Fixes land on `main` first and are published there immediately as the `:main`
+tag and the commit sha, so an urgent fix can be run before the release that
+contains it is cut. There is no long-term support branch: an older `vX.Y`
+tag keeps working and keeps its images, but it does not get patched.
+
+## Verifying what you are running
+
+Both images are signed at build time with
+[cosign](https://docs.sigstore.dev/), keyless, and carry an SBOM and a build
+provenance attestation. There is no signing key held in this repository: the
+signature is bound to the identity of the workflow that produced the image
+and is recorded in the public Rekor transparency log.
+
+```sh
+cosign verify ghcr.io/fuegovic/starguard-bot:latest \
+  --certificate-identity-regexp \
+    '^https://github.com/fuegovic/Starguard/.github/workflows/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+A successful verification establishes that the image came from a workflow in
+this repository and names the commit it was built from. It says nothing about
+whether that commit is free of defects; it rules out substitution between the
+build and your pull, and nothing else.
+
+The dependency chain underneath is pinned rather than trusted: both images
+install from `requirements.lock` with `pip --require-hashes`, so a tampered
+wheel or a compromised index fails the build, and both base images are pinned
+by digest. CI additionally audits both lockfiles against the advisory
+database and scans each built image with Trivy on every pull request.
 
 ## Reporting a Vulnerability
 

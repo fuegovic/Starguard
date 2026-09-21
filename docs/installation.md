@@ -31,6 +31,17 @@ git clone https://github.com/fuegovic/Starguard.git
 cd Starguard
 ```
 
+You are cloning for the compose files and `.env.example`, not for the
+source. The two containers are pulled ready-built from the GitHub
+Packages registry, as `ghcr.io/fuegovic/starguard-bot` and
+`ghcr.io/fuegovic/starguard-server`, so nothing here is compiled on your
+machine and the install does not depend on your having a working build
+environment. Images are published for `linux/amd64` and `linux/arm64`;
+Docker picks the right one.
+
+If you would rather build from this checkout, see
+[Building from source](#building-from-source) at the end.
+
 ## Step 2: Create the Discord application
 
 - Go to the [Discord Developer Portal](https://discord.com/developers/applications)
@@ -226,8 +237,13 @@ with a message naming it. Read it with `docker compose logs`.
 For the bot and the server, with a database from Step 7:
 
 ```sh
-docker compose up -d --build
+docker compose up -d
 ```
+
+That pulls the two published images and starts them. There is no build
+step. Which images it pulls is decided by `STARGUARD_IMAGE_OWNER` and
+`STARGUARD_IMAGE_TAG` in your `.env`, which default to the official
+builds at their newest stable release.
 
 **The server's port is published on loopback only**, as
 `127.0.0.1:${SERVER_PORT}:${SERVER_BIND_PORT}`, so after this command the
@@ -243,7 +259,7 @@ instead. It contains the bot, the server, MongoDB, Mongo Express and NPM, and
 it is a **replacement** for `docker-compose.yml`, not an addition to it:
 
 ```sh
-docker compose -f docker-compose.alt.yml up -d --build
+docker compose -f docker-compose.alt.yml up -d
 ```
 
 Before you expose ports 80 and 443, set `NPM_INITIAL_ADMIN_EMAIL` and
@@ -499,12 +515,42 @@ Both processes read the same `.env` through `python-dotenv`. The server binds
 behind something that terminates TLS, because the session cookie it sets is
 marked `Secure`.
 
-## Upgrading from an older version
+## Upgrading
 
-Four changes need your attention when upgrading an existing deployment. Work
-through them **before** starting the new containers. A fifth costs you nothing
-today but changes what happens the next time you point the bot at a different
-repository, so read it and remember it.
+Moving from one release to the next is two commands:
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
+`pull` is the one that fetches the newer image. Without it, `up -d` sees a
+container whose image tag has not changed and restarts what you were already
+running, which is the usual reason an upgrade appears to have done nothing.
+
+If you pin `STARGUARD_IMAGE_TAG` to an exact version, change it in `.env`
+first; `pull` then fetches that version instead. Check what you ended up with:
+
+```sh
+docker compose images
+```
+
+Release notes for each version are on the [releases
+page](https://github.com/fuegovic/Starguard/releases), and `CHANGELOG.md`
+carries the same text. Read them before upgrading: an occasional release
+adds or renames a variable in `.env`, and compose will tell you only if the
+variable was required.
+
+Pull the repository as well (`git pull`) when the release notes say the
+compose files changed. Your `.env` and `docker-compose.override.yml` are
+ignored by git, so neither is touched by that.
+
+## Upgrading from a version older than 1.0.0
+
+Four changes need your attention when upgrading an existing deployment from
+before the security hardening. Work through them **before** starting the new
+containers. A fifth costs you nothing today but changes what happens the next
+time you point the bot at a different repository, so read it and remember it.
 
 ### 1. Revoke the OAuth tokens the old version stored
 
@@ -786,9 +832,15 @@ container is exactly such a connection.
 8. **Start the rest:**
 
    ```sh
-   docker compose up -d --build
+   docker compose pull
+   docker compose up -d
    docker compose ps
    ```
+
+   `docker compose pull` is the step that actually fetches a newer
+   image. Without it `up -d` sees containers whose image tag has not
+   changed and starts exactly what you were already running, which is
+   the usual reason an upgrade appears to have done nothing.
 
    `mongodb` should now become `healthy`, and the bot and the server should
    stop logging connection errors.
@@ -890,6 +942,56 @@ The symptom, and what the member sees, is in
   role at the next check even though their star was still there. Rows written
   by much older versions have no id stored and still fall back to the login,
   so they keep that behaviour until the member verifies once more.
+
+## Building from source
+
+The compose files pull the published images, which is what you want unless you
+are changing Starguard itself or running a patch you have not published
+anywhere. To build the two images from this checkout instead, add
+`docker-compose.build.yml` to the command:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+It layers onto the all-in-one file the same way:
+
+```sh
+docker compose -f docker-compose.alt.yml -f docker-compose.build.yml up -d --build
+```
+
+Adding a `build:` section to a service that already has an `image:` makes
+compose tag what it builds with that name rather than pull it, so the rest of
+the file is unchanged and `docker-compose.override.yml` still applies. Note
+`--build`: without it compose reuses whatever it built last, which is the
+usual reason a source change appears to do nothing.
+
+## Verifying what you pulled
+
+Every published image is signed with [cosign](https://docs.sigstore.dev/) at
+the moment it is built, without a private key: the signature is bound to the
+workflow's own identity and recorded in the public Rekor transparency log.
+Verifying is optional, and worth doing once on the machine that will run this:
+
+```sh
+cosign verify ghcr.io/fuegovic/starguard-bot:latest \
+  --certificate-identity-regexp \
+    '^https://github.com/fuegovic/Starguard/.github/workflows/' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+A successful verification tells you the image was built by a workflow in this
+repository, and prints the commit it was built from. It does **not** tell you
+that commit is trustworthy, only that nothing replaced the image between the
+build and your pull.
+
+The images also carry an SBOM and a build provenance attestation, which list
+what is inside them and how they were produced:
+
+```sh
+docker buildx imagetools inspect ghcr.io/fuegovic/starguard-bot:latest \
+  --format '{{ json .SBOM }}'
+```
 
 ## Development and tests
 

@@ -57,6 +57,57 @@ Four kinds of validation appear below:
 Anything else that cannot be parsed, such as a non-numeric value where a
 number is expected, is a fatal error.
 
+## Images
+
+Which prebuilt images the compose files run. Both are read by Docker Compose
+when it expands the `image:` lines, and by nothing else; the containers
+receive them through `env_file:` but no Starguard code looks at them.
+
+The images are published by this repository's Release workflow for
+`linux/amd64` and `linux/arm64`, signed with cosign, and carry an SBOM and a
+build provenance attestation. See [Verifying what you
+pulled](./installation.md#verifying-what-you-pulled).
+
+### `STARGUARD_IMAGE_OWNER`
+
+**Optional. Compose only.** Default: `fuegovic`.
+
+The GitHub account the images were published under, which is the first path
+segment of the registry reference. Leave it alone to run the official builds.
+Set it to your own account if you run a fork whose Release workflow publishes
+to your own namespace.
+
+**It must be lowercase.** A container reference has no uppercase in its path,
+so an account spelled `My-Org` is written here as `my-org`. The workflow
+lowercases the name when it publishes, and Docker will reject the reference
+rather than fall back if you do not do the same here.
+
+### `STARGUARD_IMAGE_TAG`
+
+**Optional. Compose only.** Default: `latest`.
+
+Which version to run:
+
+| Value | What it points at |
+| --- | --- |
+| `latest` | The newest stable release. Moves when a release is cut. |
+| `v1.2.0` | Exactly that release. Never moves. |
+| `v1.2` | The newest patch of the 1.2 series. Moves on a patch release. |
+| `main` | The tip of the `main` branch, which no release has been cut from. |
+| `sha-<commit>` | One exact commit on `main`. Never moves. |
+
+A prerelease such as `v1.2.0-rc.1` is published under its own version tag and
+deliberately does **not** move `latest`, so pinning to `latest` never puts you
+on a release candidate.
+
+`main` is gated by the same CI as everything else and is how you run a fix
+before the release containing it is cut. It is not a release: nobody has
+decided it is ready, and it can move several times a day.
+
+Changing this takes effect on the next `docker compose pull && docker compose
+up -d`. `up -d` alone restarts what you already have, because the tag it
+resolves has not changed.
+
 ## Discord
 
 ### `TOKEN`

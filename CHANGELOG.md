@@ -5,10 +5,24 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0] - 2026-09-21
 
 ### Added
 
+- **Prebuilt container images**, published to the GitHub Packages registry
+  as `ghcr.io/fuegovic/starguard-bot` and `ghcr.io/fuegovic/starguard-server`.
+  They are built for `linux/amd64` and `linux/arm64`, carry an SBOM and a
+  `mode=max` provenance attestation, and are signed with cosign keyless, so a
+  pulled image can be traced back to the workflow run and the commit that
+  produced it. The compose files pull them by default; installing no longer
+  means building from source. `docker-compose.build.yml` is the opt-in for
+  building from a checkout.
+- **Automated releases.** A merge to `main` opens or updates a release pull
+  request describing what has accumulated; merging that pull request tags the
+  commit, publishes the GitHub release, and publishes the version-tagged
+  images. See [CONTRIBUTING.md](./CONTRIBUTING.md#releases).
+- A Trivy scan of both images in CI, failing on a fixable HIGH or CRITICAL
+  vulnerability and staying quiet about one with no fix available.
 - A shared `common` package for configuration, storage, the GitHub API client
   and signed link tokens, so the bot and the server no longer duplicate this
   logic and the risky parts can be tested directly.
@@ -39,6 +53,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The compose files run the published images instead of building them, so
+  `docker compose up -d` no longer needs a compiler, a checkout of the source
+  or ten minutes. `STARGUARD_IMAGE_OWNER` and `STARGUARD_IMAGE_TAG` in `.env`
+  choose which images and which version; `:latest` follows the newest stable
+  release rather than the tip of `main`, which is published as `:main`.
+- The database's own exception type no longer reaches the rest of the code.
+  Eight modules used to catch `PyMongoError`, the driver's base class, so the
+  data access was behind named functions but the failures were not.
+  `common/storage_errors.py` now defines one `StorageError` and the decorators
+  that translate into it, and nothing under `bot/` or `server/` names pymongo
+  in its error handling. The health probe goes through a `ping` function for
+  the same reason: it was the last route calling the driver directly.
+- The webhook delivery functions moved to `common/deliveries.py`.
+  `common/storage.py` had reached the thousand lines pylint allows a module,
+  so the next change to it failed the build whatever the change was. The
+  deliveries collection shares nothing with the users collection but the
+  database handle, which makes it the seam that costs least.
+- `ruff`'s `target-version` is `py311`, matching the lowest Python the test
+  matrix runs. Told `py312` it proposed PEP 695 type parameters, which are a
+  syntax error on 3.11, so following its advice would have passed lint and
+  then failed the 3.11 test job.
+- Image publishing lives in one reusable workflow (`publish.yml`) called from
+  both paths, rather than a copy in `ci.yml` and another in `release.yml`
+  that had already drifted apart on their tag lists.
+- `ci.yml` no longer triggers on a push to `main`. `release.yml` owns `main`
+  and calls `ci.yml` as its gate, so the branch runs one pipeline instead of
+  two overlapping ones and a release can only be cut from a commit whose
+  tests passed.
 - The GitHub OAuth flow now verifies a signed, expiring link token in
   `/login` instead of trusting the Discord ID and name from the query
   string.
@@ -87,6 +129,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Every GitHub call the OAuth server makes now has a deadline. The token
+  exchange, the profile read and the starred check inherited requests' default
+  of no timeout at all, so a connection GitHub never closed held a waitress
+  worker for the life of the process; waitress serves the whole application
+  from four threads, and `/login`, `/authorize` and the webhook receiver draw
+  on the same four. The bot's GitHub client already had this and the server
+  now uses the same 30 seconds.
+- **Claim your role** now acknowledges the interaction before it does any
+  work. Discord drops the interaction token unless something answers within
+  three seconds, and the answer was the handler's final message, behind a
+  member lock, a database read and a role change. A lock held by the periodic
+  check working on the same member, or a role call retried through a rate
+  limit, put that answer past the window: the member was told the interaction
+  failed while the role had in fact been granted and recorded. The thank-you
+  is still posted publicly, now as a follow-up message, with a private
+  confirmation to whoever pressed the button.
+- A page of stargazers whose body is not JSON is now refused as a
+  `GitHubError` rather than escaping as requests' own `JSONDecodeError`. A
+  200 carrying a truncated body or a proxy interstitial took the whole check
+  cycle down with a traceback, because every caller catches `GitHubError` and
+  nothing else.
+- One unusable link no longer strands every link behind it. The un-star sweep
+  walks the collection from the beginning on each cycle, so an entry that
+  raised aborted the cycle and the retry reached the same entry again: nobody
+  positioned after it was checked again for as long as the bot ran. It is now
+  reported and stepped over, the way the role sync drain already did.
+- The published image reference is lowercased before it is used. It was built
+  from `github.repository_owner`, which preserves the account's capitals, so
+  every push from a fork under an owner with an uppercase letter in its name
+  failed with `invalid reference format` after the whole build had already
+  run.
 - **A GitHub outage no longer records that a member has not starred the
   repository.** The callback read any answer other than 204 from the starred
   check as "not starred", so a 401, a 403, a 429 or a 5xx during an outage
@@ -258,4 +331,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `.env.example` is no longer baked into the Docker images, which previously
   shipped a publicly known `SECRET_KEY` as the runtime default.
 
-[Unreleased]: https://github.com/fuegovic/Starguard/compare/main...HEAD
+[1.0.0]: https://github.com/fuegovic/Starguard/releases/tag/v1.0.0

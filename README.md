@@ -132,7 +132,11 @@ Both processes expose a health endpoint, and the compose files probe them.
 - **[detailed env configuration guide](./docs/env_file.md)**
 - **[troubleshooting](./docs/troubleshooting.md)**
 
-1. 🧑‍🤝‍🧑 Clone the repository.
+1. 🧑‍🤝‍🧑 Clone the repository, for the compose files and
+   `.env.example`. The two containers are pulled ready-built from
+   `ghcr.io/fuegovic/starguard-bot` and
+   `ghcr.io/fuegovic/starguard-server`, for `linux/amd64` and
+   `linux/arm64`, so nothing is built on your machine.
 2. ✏️ Copy `.env.example` to `.env` and configure it, including a real
    `SECRET_KEY`:
    ```sh
@@ -148,13 +152,20 @@ Both processes expose a health endpoint, and the compose files probe them.
    a value` or the equivalent for whichever is missing. The two Mongo Express
    lines are commented out in `.env.example`, so uncomment them and fill them
    in.
-4. 🐳 Run `docker compose up -d --build`.
+4. 🐳 Run `docker compose up -d`.
 
-> **Upgrading from an older version?** See
-> [Upgrading](./docs/installation.md#upgrading-from-an-older-version). The
+To upgrade later, `docker compose pull && docker compose up -d`. To run a
+specific release rather than the newest one, set `STARGUARD_IMAGE_TAG` in
+`.env`. To build from source instead, add
+`-f docker-compose.build.yml` and `--build` to the command.
+
+> **Upgrading from a version older than 1.0.0?** See [Upgrading from a
+> version older than
+> 1.0.0](./docs/installation.md#upgrading-from-a-version-older-than-100). The
 > bundled MongoDB now requires authentication, which needs a manual step on an
 > existing database, and earlier releases stored GitHub OAuth tokens that you
-> should revoke.
+> should revoke. A routine upgrade between releases is just
+> [`docker compose pull`](./docs/installation.md#upgrading).
 
 ## Requirements
 
