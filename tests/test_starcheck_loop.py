@@ -1,4 +1,4 @@
-"""Tests for the un-star check's retry loop and its error backoff.
+"""Tests for the un-star check's retry loop, its backoff, and what ends a cycle.
 
 Split from test_starcheck.py, which carries the sweep itself and the fakes
 both files run against. The seam is the one that file's own docstring named:
@@ -21,7 +21,8 @@ import asyncio
 import pytest
 
 from common.github_api import GitHubError
-from tests.test_starcheck import build, link, listing
+from common.storage_errors import StorageError, StorageUnavailableError
+from tests.test_starcheck import build, build_with_one_overtaken, link, listing
 
 
 def test_the_error_backoff_grows_and_is_capped(monkeypatch):
@@ -138,3 +139,106 @@ def test_the_backoff_is_forgotten_once_a_cycle_succeeds(monkeypatch):
     assert 45 <= delays[0] <= 75
     assert delays[1] == 1200
     assert checker._consecutive_failures == 0
+
+
+def test_a_database_outage_mid_walk_abandons_the_cycle(monkeypatch, caplog):
+    # The per-entry guard exists so one unusable row cannot strand the rest
+    # of the walk, but an unreachable database is every remaining row. Swallowed
+    # per entry, the cycle reports success, stamps _last_completed and leaves
+    # the health socket saying the loop is fresh, having checked nobody.
+    checker, _, _, _ = build(monkeypatch, [link(1, "Gone"), link(2, "Also")], set())
+
+    def gone(collection, discord_id):
+        raise StorageUnavailableError("no replica set members available")
+
+    monkeypatch.setattr("bot.starcheck.find_link", gone)
+
+    with caplog.at_level("ERROR", logger="starguard.bot"), pytest.raises(StorageUnavailableError):
+        asyncio.run(checker.run_once())
+
+    # Not stamped, so the health check sees a loop that has not completed
+    # rather than one that completed having done nothing.
+    assert checker.last_completed is None
+    assert "abandoning this cycle" in caplog.text
+
+
+def test_one_unusable_row_still_does_not_strand_the_walk(monkeypatch, caplog):
+    # The other half, so the outage case cannot be satisfied by simply
+    # letting everything out again: a StorageError the database answered
+    # with is still this row's problem and the walk carries on.
+    checker, members, _, users = build(monkeypatch, [link(1, "Gone"), link(2, "Also")], set())
+    real = users.find_one
+    calls = []
+
+    def refuse_the_first(query, projection=None):
+        calls.append(query)
+        if len(calls) == 1:
+            raise StorageError("index not found")
+        return real(query, projection)
+
+    users.find_one = refuse_the_first
+
+    with caplog.at_level("ERROR", logger="starguard.bot"):
+        removed = asyncio.run(checker.run_once())
+
+    # The second member was still reached and still lost the role.
+    assert removed == ["user2"]
+    assert members["2"].removals == 1
+    assert checker.last_completed is not None
+
+
+def test_an_outage_during_the_bookkeeping_write_abandons_the_cycle(monkeypatch, caplog):
+    # The other door into the same problem, and the one the first test
+    # cannot reach: StorageUnavailableError is a StorageError, so the catch
+    # around set_starred consumed it before the walk's guard could see it.
+    # The cycle then went on removing roles it could not record and
+    # announcing farewells for them.
+    checker, members, channel, _ = build(monkeypatch, [link(1, "Gone"), link(2, "Also")], set())
+
+    def gone(*args, **kwargs):
+        raise StorageUnavailableError("connection pool paused")
+
+    monkeypatch.setattr("bot.starcheck.set_starred", gone)
+
+    with caplog.at_level("ERROR", logger="starguard.bot"), pytest.raises(StorageUnavailableError):
+        asyncio.run(checker.run_once())
+
+    assert checker.last_completed is None
+    # No farewell for a removal the database never recorded.
+    assert not channel.sent
+    # And the second member was never reached, because the walk stopped.
+    assert members["2"].removals == 0
+
+
+def test_a_write_the_database_refused_is_still_only_that_row(monkeypatch):
+    # The pair, so the fix above cannot be satisfied by letting every
+    # StorageError out: a failure the database answered with still counts
+    # as the removal this cycle really made.
+    checker, members, _, _ = build(monkeypatch, [link(1, "Gone")], set())
+
+    def refuse(*args, **kwargs):
+        raise StorageError("not authorized on starguard")
+
+    monkeypatch.setattr("bot.starcheck.set_starred", refuse)
+
+    assert asyncio.run(checker.run_once()) == ["user1"]
+    assert members["1"].removals == 1
+    assert checker.last_completed is not None
+
+
+def test_an_outage_while_queuing_the_reconciliation_abandons_the_cycle(monkeypatch, caplog):
+    # The third door into the same problem. This write is the last thing a
+    # refused cycle does, and its catch is the other one that named
+    # StorageError and so swallowed an outage. Swallowed here, the cycle
+    # goes on to the next member with the database gone.
+    checker, members, _, _, _ = build_with_one_overtaken(
+        monkeypatch, queue_error=StorageUnavailableError("no primary available")
+    )
+
+    with caplog.at_level("ERROR", logger="starguard.bot"), pytest.raises(StorageUnavailableError):
+        asyncio.run(checker.run_once())
+
+    assert checker.last_completed is None
+    # The first member's removal still happened; it is the cycle's report
+    # of itself that is refused, not the work it had already done.
+    assert members["1"].removals == 1

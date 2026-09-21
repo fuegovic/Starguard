@@ -504,6 +504,12 @@ class StarChecker:
                 observed_at,
                 github_id,
             )
+        # Ahead of the StorageError below, which it is a subclass of, or the
+        # outage is consumed here and the cycle carries on reporting
+        # removals it cannot record. _sweep's guard never sees it, because
+        # this is where the walk actually touches the database on most rows.
+        except StorageUnavailableError:
+            raise
         except StorageError as exc:
             log.error("Could not update star state for %s: %s", discord_id, exc)
             # Only the bookkeeping failed. The role really is gone and
@@ -532,6 +538,10 @@ class StarChecker:
                 self._users,  # type: ignore[arg-type]
                 discord_id,
             )
+        # Same reason as above: an unreachable database is the cycle's
+        # problem, not this row's.
+        except StorageUnavailableError:
+            raise
         except StorageError as exc:
             # Caught apart from the write above, and deliberately not read
             # as "the removal stands". This failure leaves the role removed
