@@ -511,6 +511,7 @@ def set_starred(
     discord_id: object,
     starred: object,
     observed_at: datetime,
+    github_id: object,
 ) -> bool:
     """Record the star state the sweep observed. True when the write landed.
 
@@ -543,9 +544,25 @@ def set_starred(
     deployment most needs sweeping. A timestamp ages instead: once an
     observation is older than the current listing, the sweep is the newer
     authority again and this write lands as it always did.
+
+    ``github_id`` is the account the caller judged, and naming it is the
+    other half of the same guard. The timestamp alone does not cover a
+    re-link, because :func:`link_account` clears ``star_event_at`` when a
+    row changes account, so the ``$exists`` arm matches and a sweep that
+    decided minutes ago about the old account writes its answer onto the
+    new one. That is the lost update above reached by the other door, and
+    it ends the same way. :func:`link_account` names the identity in its
+    own conditional write for exactly this reason.
     """
     result = collection.update_one(
-        _not_newer_than(_last_millisecond_before(observed_at), discord_id=str(discord_id)),
+        _not_newer_than(
+            _last_millisecond_before(observed_at),
+            discord_id=str(discord_id),
+            # $exists: False rather than a missing key, so a legacy row that
+            # adopted an account during the crawl is refused too. Omitting
+            # the key would match it whatever it now holds.
+            github_id=github_id if github_id is not None else {"$exists": False},
+        ),
         {
             "$set": {
                 "starred_repo": bool(starred),

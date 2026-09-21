@@ -322,7 +322,7 @@ def test_discord_ids_are_normalised_to_strings():
 def test_set_starred_updates_the_flag():
     collection = FakeCollection()
     link(collection, "1", 100, "one", starred=True)
-    set_starred(collection, "1", False, SWEPT_AT)
+    set_starred(collection, "1", False, SWEPT_AT, 100)
     assert find_link(collection, "1")["starred_repo"] is False
 
 
@@ -379,7 +379,7 @@ def test_updated_at_is_stored_as_a_real_date():
 def test_set_starred_stores_a_real_date_too():
     collection = FakeCollection()
     link(collection, "1", 100, "one")
-    set_starred(collection, "1", False, SWEPT_AT)
+    set_starred(collection, "1", False, SWEPT_AT, 100)
     assert isinstance(find_link(collection, "1")["updated_at"], datetime)
 
 
@@ -624,7 +624,7 @@ def test_a_clear_does_not_lower_a_flag_the_bot_has_not_acted_on():
 def test_the_sweep_stamps_itself_as_the_source():
     collection = FakeCollection()
     link(collection, "1", 100, "one")
-    set_starred(collection, "1", False, SWEPT_AT)
+    set_starred(collection, "1", False, SWEPT_AT, 100)
     assert find_link(collection, "1")["star_source"] == STAR_SOURCE_SWEEP
 
 
@@ -639,7 +639,7 @@ def test_the_sweep_does_not_write_over_a_star_event_it_did_not_see():
     later = SWEPT_AT + timedelta(seconds=30)
     record_star_event(collection, 100, True, STAR_SOURCE_WEBHOOK, later)
 
-    assert set_starred(collection, "1", False, SWEPT_AT) is False
+    assert set_starred(collection, "1", False, SWEPT_AT, 100) is False
 
     row = find_link(collection, "1")
     assert row["starred_repo"] is True
@@ -665,13 +665,31 @@ def test_a_star_event_older_than_the_listing_is_still_swept():
     assert find_link(collection, "1")["starred_repo"] is True
     assert [queued["discord_id"] for queued in iter_pending_role_syncs(collection)] == ["1"]
 
-    assert set_starred(collection, "1", False, SWEPT_AT) is True
+    assert set_starred(collection, "1", False, SWEPT_AT, 100) is True
 
     row = find_link(collection, "1")
     assert row["starred_repo"] is False
     assert row["star_source"] == STAR_SOURCE_SWEEP
     # The flag is untouched, because only the bot ever lowers it.
     assert [queued["discord_id"] for queued in iter_pending_role_syncs(collection)] == ["1"]
+
+
+def test_a_relink_during_the_sweep_does_not_write_onto_the_new_account():
+    # The lost update the timestamp guard does not reach. The sweep walks
+    # 45,000 stargazers against one listing; a member who re-links partway
+    # through is a different GitHub account by the time the sweep gets to
+    # their row, and link_account clears star_event_at when the account
+    # changes, so the $exists arm matches and the timestamp has nothing to
+    # say. The sweep's answer is about the account they left.
+    collection = FakeCollection()
+    link(collection, "1", 100, "one", starred=True)
+    link(collection, "1", 200, "two", starred=True)
+
+    assert set_starred(collection, "1", False, SWEPT_AT, 100) is False
+
+    # Otherwise: they star through the new account, the sweep has already
+    # taken the role, and the row agrees they never starred.
+    assert find_link(collection, "1")["starred_repo"] is True
 
 
 def test_an_ordinary_row_no_webhook_has_touched_is_written_normally():
@@ -681,7 +699,7 @@ def test_an_ordinary_row_no_webhook_has_touched_is_written_normally():
     link(collection, "1", 100, "one", starred=True)
 
     assert "star_event_at" not in find_link(collection, "1")
-    assert set_starred(collection, "1", False, SWEPT_AT) is True
+    assert set_starred(collection, "1", False, SWEPT_AT, 100) is True
     assert find_link(collection, "1")["starred_repo"] is False
 
 
@@ -812,7 +830,7 @@ def test_the_sweep_does_not_queue_a_role_sync():
     # The sweep has already moved the role itself by the time it writes.
     collection = FakeCollection()
     link(collection, "1", 100, "one")
-    set_starred(collection, "1", False, SWEPT_AT)
+    set_starred(collection, "1", False, SWEPT_AT, 100)
     assert not list(iter_pending_role_syncs(collection))
 
 

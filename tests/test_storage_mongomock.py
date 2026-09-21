@@ -203,7 +203,7 @@ def test_a_login_a_renamed_account_gave_up_can_still_be_linked(users):
 
 def test_set_starred_round_trip(users):
     link(users, "1", 100, "Alice", starred=True)
-    set_starred(users, "1", False, SWEPT_AT)
+    set_starred(users, "1", False, SWEPT_AT, 100)
     assert find_link(users, "1")["starred_repo"] is False
 
 
@@ -398,7 +398,7 @@ def test_a_clear_is_refused_once_the_star_state_has_moved_on(users):
 
 def test_the_sweep_records_its_own_source(users):
     link(users, "1", 100, "Alice")
-    set_starred(users, "1", False, SWEPT_AT)
+    set_starred(users, "1", False, SWEPT_AT, 100)
     row = find_link(users, "1")
     assert row["star_source"] == STAR_SOURCE_SWEEP
     # The sweep moved the role itself, so there is nothing to queue.
@@ -412,7 +412,7 @@ def test_the_sweep_does_not_write_over_a_star_event_it_did_not_see(users):
     link(users, "1", 100, "Alice", starred=False)
     record_star_event(users, 100, True, STAR_SOURCE_WEBHOOK, SWEPT_AT + timedelta(seconds=30))
 
-    assert set_starred(users, "1", False, SWEPT_AT) is False
+    assert set_starred(users, "1", False, SWEPT_AT, 100) is False
 
     row = find_link(users, "1")
     assert row["starred_repo"] is True
@@ -427,7 +427,7 @@ def test_a_star_event_older_than_the_listing_is_still_swept(users):
     link(users, "1", 100, "Alice", starred=False)
     record_star_event(users, 100, True, STAR_SOURCE_WEBHOOK, SWEPT_AT - timedelta(days=1))
 
-    assert set_starred(users, "1", False, SWEPT_AT) is True
+    assert set_starred(users, "1", False, SWEPT_AT, 100) is True
 
     row = find_link(users, "1")
     assert row["starred_repo"] is False
@@ -452,12 +452,12 @@ def test_a_star_event_inside_the_listings_millisecond_is_not_written_over(users)
     # What the database kept of an event that happened after the listing.
     assert read_datetime(row, "star_event_at") < observed_at
     assert star_event_is_newer(row, observed_at) is True
-    assert set_starred(users, "1", False, observed_at) is False
+    assert set_starred(users, "1", False, observed_at, 100) is False
     assert find_link(users, "1")["starred_repo"] is True
 
     # And a listing taken a whole millisecond later is unambiguously the
     # newer authority again, so the sweep writes as it always did.
-    assert set_starred(users, "1", False, observed_at + timedelta(milliseconds=2)) is True
+    assert set_starred(users, "1", False, observed_at + timedelta(milliseconds=2), 100) is True
     assert find_link(users, "1")["starred_repo"] is False
 
 
@@ -642,6 +642,37 @@ def test_a_delivery_that_arrives_behind_a_newer_one_is_not_recorded(users):
     assert find_link(users, "1")["starred_repo"] is False
 
 
+def test_a_relink_during_the_sweep_does_not_write_onto_the_new_account(users):
+    # The same guard as in the stub, against the real filter semantics.
+    link(users, "1", 100, "Alice", starred=True)
+    link(users, "1", 200, "Bob", starred=True)
+
+    assert set_starred(users, "1", False, SWEPT_AT, 100) is False
+    assert find_link(users, "1")["starred_repo"] is True
+
+
+def test_a_legacy_row_is_swept_while_it_still_has_no_account(users):
+    # The $exists arm of the account guard. Rows from before github_id was
+    # recorded carry no account at all, and refusing to sweep them would
+    # strand exactly the rows most likely to be stale.
+    users.insert_one({"discord_id": "1", "github_username": "Alice", "starred_repo": True})
+
+    assert set_starred(users, "1", False, SWEPT_AT, None) is True
+    assert find_link(users, "1")["starred_repo"] is False
+
+
+def test_a_legacy_row_that_adopts_an_account_mid_sweep_is_refused(users):
+    # And the other half: $exists: False rather than simply leaving the key
+    # out, so a row that gained an account while the sweep walked is
+    # refused like any other re-link. Leaving the key out would match it
+    # whatever it now holds.
+    users.insert_one({"discord_id": "1", "github_username": "Alice", "starred_repo": True})
+    link(users, "1", 100, "Alice", starred=True)
+
+    assert set_starred(users, "1", False, SWEPT_AT, None) is False
+    assert find_link(users, "1")["starred_repo"] is True
+
+
 def test_an_ordinary_row_no_webhook_has_touched_is_written_normally(users):
     # The $exists arm. Absent is the normal state of star_event_at, and a
     # bare $lte would exclude every one of these rows and stop the sweep
@@ -649,7 +680,7 @@ def test_an_ordinary_row_no_webhook_has_touched_is_written_normally(users):
     link(users, "1", 100, "Alice", starred=True)
     assert "star_event_at" not in find_link(users, "1")
 
-    assert set_starred(users, "1", False, SWEPT_AT) is True
+    assert set_starred(users, "1", False, SWEPT_AT, 100) is True
     assert find_link(users, "1")["starred_repo"] is False
 
 

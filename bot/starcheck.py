@@ -366,6 +366,13 @@ class StarChecker:
         if not discord_id:
             return None
 
+        # The account _still_stars just ruled on, kept from the row as this
+        # cycle read it. Everything below can wait on a lock, and the row
+        # can change account while it waits, so the write has to say which
+        # account this answer was about rather than trusting the row to
+        # still name it.
+        judged_account = entry.get("github_id")
+
         # Everything below reads Discord's state, changes it and records
         # the change, which is the same sequence the drain and the claim
         # button run against the same member. Held for one member rather
@@ -407,17 +414,17 @@ class StarChecker:
                     "Discord ID %s is no longer in the guild; marking un-starred.",
                     discord_id,
                 )
-                await self._record_unstarred(discord_id, observed_at)
+                await self._record_unstarred(discord_id, observed_at, judged_account)
                 return None
 
             if not member.has_role(self._config.role_id):
-                await self._record_unstarred(discord_id, observed_at)
+                await self._record_unstarred(discord_id, observed_at, judged_account)
                 return None
 
             if not await safe_remove_role(member, self._config.role_id, "no_star"):
                 return None
 
-            if not await self._record_unstarred(discord_id, observed_at):
+            if not await self._record_unstarred(discord_id, observed_at, judged_account):
                 # A newer star event overtook this cycle, so the row has
                 # been queued and the drain hands the role back within the
                 # poll interval. This cycle therefore has nothing true to
@@ -432,11 +439,18 @@ class StarChecker:
 
             return _display_name(entry, member)
 
-    async def _record_unstarred(self, discord_id: object, observed_at: datetime) -> bool:
+    async def _record_unstarred(
+        self, discord_id: object, observed_at: datetime, github_id: object
+    ) -> bool:
         """Persist that ``discord_id`` no longer stars the repository.
 
         Returns False when a star event overtook this cycle, which is the
         caller's signal that the un-star is not this cycle's to report.
+
+        ``github_id`` is the account this cycle actually judged, taken from
+        the row as it was read rather than from the row as it stands now.
+        The write is refused if the member has re-linked since, because the
+        answer being recorded is about the account they left.
         """
         try:
             # Reached only from _sweep, so self._users is not None here; see
@@ -447,6 +461,7 @@ class StarChecker:
                 discord_id,
                 False,
                 observed_at,
+                github_id,
             )
         except StorageError as exc:
             log.error("Could not update star state for %s: %s", discord_id, exc)
