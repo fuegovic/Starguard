@@ -5,12 +5,12 @@
 services:
   discord-bot:
     container_name: Bot
-    image: starguard-bot
-    build:
-      context: .
-      # This used to name Dockerfile_bot, which does not exist in this repo,
-      # so the alternative stack could never be built.
-      dockerfile: Dockerfile.bot
+    # Pulled from the GitHub Packages registry, built and signed by this
+    # repository's Release workflow. :latest follows the newest stable
+    # release; pin STARGUARD_IMAGE_TAG to a version (v1.2.0) if you would
+    # rather decide when to move. To build from this checkout instead, add
+    # -f docker-compose.build.yml to the command (see that file).
+    image: ghcr.io/${STARGUARD_IMAGE_OWNER:-fuegovic}/starguard-bot:${STARGUARD_IMAGE_TAG:-latest}
     restart: always
     env_file:
       - .env
@@ -45,7 +45,12 @@ services:
 
   server:
     container_name: Server
-    image: starguard-server
+    # Pulled from the GitHub Packages registry, built and signed by this
+    # repository's Release workflow. :latest follows the newest stable
+    # release; pin STARGUARD_IMAGE_TAG to a version (v1.2.0) if you would
+    # rather decide when to move. To build from this checkout instead, add
+    # -f docker-compose.build.yml to the command (see that file).
+    image: ghcr.io/${STARGUARD_IMAGE_OWNER:-fuegovic}/starguard-server:${STARGUARD_IMAGE_TAG:-latest}
     ports:
       # Host port only. SERVER_BIND_PORT is the port the application listens
       # on internally (default 5000); this mapping tracks it if you change it.
@@ -62,9 +67,6 @@ services:
       # match your real hop count, knowing the origin is then reachable
       # without TLS by anything that can route to it.
       - 127.0.0.1:${SERVER_PORT:-5000}:${SERVER_BIND_PORT:-5000}
-    build:
-      context: .
-      dockerfile: Dockerfile.server
     restart: always
     env_file:
       - .env
