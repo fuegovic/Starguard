@@ -332,7 +332,8 @@ docker compose logs -n 50 server
 You are looking for `<botname> connected to Discord` and
 `Starguard OAuth server listening on port 5000`.
 
-Check the server on the host, where the port is published:
+Check the server on the host, where the port is published. `5000` here is
+`SERVER_PORT`, the host side of the mapping, so use whatever you set it to:
 
 ```sh
 curl -fsS http://127.0.0.1:5000/healthz
@@ -642,12 +643,23 @@ deletes the only copy of the tokens you hold and GitHub's revocation endpoint
 needs the token itself. Write them to a file:
 
 ```sh
-docker compose exec mongodb mongosh --quiet \
+docker compose exec mongodb mongo --quiet \
   -u starguard -p 'the password you put in .env' \
   --authenticationDatabase admin \
-  --eval 'db.getSiblingDB("starguard").users.find({github_token:{$exists:true}}, {_id:0, github_token:1}).forEach(d => print(d.github_token))' \
+  --eval 'db.getSiblingDB("starguard").users.find({"github_token.access_token":{$exists:true}}, {_id:0, "github_token.access_token":1}).forEach(d => print(d.github_token.access_token))' \
   > legacy-tokens.txt
 ```
+
+Two details in that command are easy to get wrong and both fail quietly.
+It says `mongo`, not `mongosh`, because this runs **before** the upgrade,
+against the MongoDB you are still running, and the `mongo:4.4.x` image the
+old compose file pinned ships only the legacy shell; `mongosh` there reports
+`executable file not found`. If you have already moved to `mongo:7`, use
+`mongosh` and change nothing else. And it prints
+`d.github_token.access_token` rather than `d.github_token`, because the
+stored value is a document holding the token beside its scope: printing the
+document writes something the revocation loop below cannot use, and you find
+that out only when every request comes back `422`.
 
 Then revoke each one against your own app, with the client id and secret as
 the HTTP basic credentials:
@@ -1015,8 +1027,12 @@ docker compose -f docker-compose.yml -f docker-compose.override.yml \
   -f docker-compose.build.yml up -d --build
 ```
 
-Setting `COMPOSE_FILE` in `.env`, as described in
-[Step 9](#step-9-start-the-stack), saves repeating that on every command.
+Setting `COMPOSE_FILE` in `.env` saves repeating that on every command, as
+long as the list names every file including this one, for example
+`docker-compose.yml:docker-compose.override.yml:docker-compose.build.yml`.
+The value shown in [Step 9](#step-9-start-the-stack) is for running published
+images, so it does not include `docker-compose.build.yml`; a bare
+`docker compose` under that value pulls rather than builds.
 
 Adding a `build:` section to a service that already has an `image:` makes
 compose tag what it builds with that name rather than pull it, so the rest of
