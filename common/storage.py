@@ -91,6 +91,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Final, Literal
 
 from pymongo import ASCENDING, MongoClient, ReturnDocument
+from pymongo import timeout as operation_timeout
 from pymongo.collection import Collection
 from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
@@ -106,6 +107,9 @@ from common.storage_errors import (
 log = logging.getLogger(__name__)
 
 COLLECTION_NAME: Final = "users"
+
+# How long :func:`ping` waits for the database before calling it unreachable.
+PING_TIMEOUT_SECONDS: Final = 2.0
 
 # pymongo spells a BSON document ``dict[str, Any]``, because a document really
 # can hold anything the driver can encode, and the driver's own generics are
@@ -893,8 +897,17 @@ def ping(collection: UserCollection) -> None:
     looking for everything Starguard asks of its database should find it all
     in one file, and a future change of store should not have to notice a
     stray ``database.command`` in a Flask handler.
+
+    Bounded well under the driver's default server-selection deadline, and
+    that bound is the point rather than tidiness. /healthz is unauthenticated
+    and this is the only route that waits on the database before answering,
+    so at the default thirty seconds anyone can hold a waitress thread for
+    half a minute by asking whether the service is well. There are four
+    threads. A probe is a question about the current state, and a database
+    that has not answered in two seconds has answered it.
     """
-    collection.database.command("ping")
+    with operation_timeout(PING_TIMEOUT_SECONDS):
+        collection.database.command("ping")
 
 
 @translates_driver_errors

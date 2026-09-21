@@ -16,6 +16,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from pymongo import _csot
 from pymongo.errors import DuplicateKeyError, PyMongoError, ServerSelectionTimeoutError
 
 from common.deliveries import (
@@ -25,6 +26,7 @@ from common.deliveries import (
 )
 from common.storage import (
     COLLECTION_NAME,
+    PING_TIMEOUT_SECONDS,
     SCHEMA_VERSION,
     STAR_SOURCE_SWEEP,
     STAR_SOURCE_WEBHOOK,
@@ -38,6 +40,7 @@ from common.storage import (
     iter_links,
     iter_pending_role_syncs,
     link_account,
+    ping,
     purge_legacy_secrets,
     read_updated_at,
     record_star_event,
@@ -1106,6 +1109,53 @@ def test_a_delivery_index_that_cannot_be_created_does_not_skip_the_purge(caplog)
     assert "github_token" not in collection.documents[0]
     assert collection.documents[0]["schema_version"] == SCHEMA_VERSION
     assert "index the deliveries collection" in caplog.text
+
+
+class TimeoutObservingDatabase:
+    """A database that records the deadline in force when it is asked."""
+
+    def __init__(self):
+        self.timeout_in_force = "not asked"
+
+    def command(self, name):
+        """Report the client-side operation timeout this call runs under."""
+        # Reading the deadline rather than asserting the constant is what
+        # makes this test say anything: a ping that dropped the bound would
+        # still call command("ping") with the right name, and a test that
+        # only checked PING_TIMEOUT_SECONDS would pass against code that
+        # never applied it.
+        self.timeout_in_force = _csot.get_timeout()
+        return {"ok": 1.0}
+
+
+class ProbedCollection(RecordingCollection):
+    """A collection whose database reports the deadline the probe set."""
+
+    def __init__(self):
+        super().__init__()
+        self.database = TimeoutObservingDatabase()
+
+
+def test_the_health_probe_is_bounded_well_under_the_drivers_default():
+    # /healthz is unauthenticated and this is the only route that waits on
+    # the database before answering. At the driver's default deadline of
+    # thirty seconds, anyone could hold one of waitress's four threads for
+    # half a minute per request by asking whether the service is well.
+    collection = ProbedCollection()
+
+    ping(collection)
+
+    assert collection.database.timeout_in_force == PING_TIMEOUT_SECONDS
+    assert PING_TIMEOUT_SECONDS < 30
+
+
+def test_the_probes_bound_does_not_leak_into_later_work():
+    # The deadline is set on a context variable, so a bound left standing
+    # would apply to whatever the worker did next. A sweep page or a link
+    # write taking longer than a health probe is allowed to is normal.
+    ping(ProbedCollection())
+
+    assert _csot.get_timeout() is None
 
 
 def test_an_unreachable_database_stops_after_the_first_preparation(caplog):
