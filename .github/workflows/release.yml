@@ -1,104 +1,140 @@
 name: Release
 
+# Everything that happens to main happens here, in this order:
+#
+#   1. the CI gate runs (ci.yml, called below);
+#   2. release-please opens or updates a "chore(main): release X.Y.Z" pull
+#      request describing what has accumulated since the last release, and,
+#      when that pull request is itself merged, drafts the GitHub release;
+#   3. the images are built and pushed, always as :main and the commit sha,
+#      and additionally as the version tags when step 2 cut a release;
+#   4. the drafted release is published, which is also what creates the git
+#      tag, because GitHub holds the tag back until a draft goes public.
+#
+# Step 4 is a separate job rather than part of step 2 so that the release a
+# person can see is never ahead of the images it documents. A release names
+# ghcr.io tags in its notes and the compose files pull them, so publishing it
+# before the registry has them advertises artifacts that do not exist; if the
+# build or the signature fails, the release stays a draft, no tag is created,
+# and the previous release is still the newest thing anybody can find.
+#
+# The recovery when step 3 fails is to re-run this workflow's failed jobs.
+# The draft is already there and release-please will not cut a second one for
+# a version its manifest already records, so a successful re-run promotes the
+# same draft. A draft that is abandoned instead has to be deleted by hand.
+#
+# main has no separate push trigger in ci.yml precisely so that this is the
+# only pipeline running on it. A release is therefore never published from a
+# commit whose tests have not passed, and never published twice.
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
 
 permissions:
   contents: read
 
-jobs:
-  validate-tag:
-    name: Validate release tag
-    runs-on: ubuntu-latest
-    steps:
-      - name: Reject tags that are not a valid container reference
-        env:
-          REF_NAME: ${{ github.ref_name }}
-        # The container tag grammar ([\w][\w.-]{0,127}) has no room for the
-        # "+" in SemVer build metadata (e.g. v1.2.3+build), so a tag like
-        # that would pass the v* trigger and then fail deep inside the
-        # docker/build-push-action step below with a confusing error, after
-        # the full CI gate has already run. Reject it here instead, before
-        # the ci job spends any time on it. Build metadata carries no
-        # release-identity meaning under SemVer, so rejecting rather than
-        # mangling it into the tag keeps the container tag, the git tag and
-        # the CHANGELOG.md heading this workflow reads all in agreement.
-        run: |
-          if ! [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+(\.[0-9A-Za-z]+)*)?$ ]]; then
-            echo "::error::Tag '$REF_NAME' is not a supported release tag. Expected vMAJOR.MINOR.PATCH with an optional -prerelease suffix; SemVer build metadata (e.g. +build) is not valid in a container tag and is rejected." >&2
-            exit 1
-          fi
+concurrency:
+  group: release-${{ github.ref }}
+  # Two pushes to main land close together often enough. Cancelling the
+  # earlier run would abandon a half-finished publish, leaving :main on one
+  # commit for the bot image and another for the server, so they queue.
+  cancel-in-progress: false
 
+jobs:
   ci:
     name: CI gate
-    needs: validate-tag
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
 
-  publish-images:
-    name: Publish (${{ matrix.image }})
-    needs: [validate-tag, ci]
+  release-please:
+    name: Maintain the release pull request
+    needs: ci
     runs-on: ubuntu-latest
+    permissions:
+      # Write the CHANGELOG.md and version.txt commit on the release branch,
+      # and create the tag and the GitHub release when the pull request is
+      # merged.
+      contents: write
+      # Open and update the release pull request itself.
+      pull-requests: write
+    outputs:
+      # Empty on an ordinary push to main. Set to the released version, with
+      # no leading "v", on the push that merged the release pull request.
+      # This is what tells the publish job below whether to move :latest.
+      #
+      # The manifest keys this repository's only package on ".", and the
+      # action writes a root package's outputs unprefixed, so these are the
+      # plain names rather than ".--version".
+      version: ${{ steps.release.outputs.version }}
+      # The numeric id of the drafted release, which is how the announce job
+      # addresses it. Addressing it by tag would not work: GitHub creates no
+      # tag for a draft, so there is nothing yet for a tag lookup to find.
+      #
+      # action.yml declares no outputs at all, so none of these are in its
+      # documented list; the action sets them from the release object it
+      # built, one per field, and CreatedRelease carries id. The action is
+      # pinned by digest below, so that cannot change underneath this
+      # without someone moving the pin. The announce job still refuses to
+      # continue on an empty id rather than reporting success.
+      release_id: ${{ steps.release.outputs.id }}
+    steps:
+      - name: Open, update or land the release pull request
+        id: release
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish:
+    name: Publish images
+    needs: [ci, release-please]
     permissions:
       contents: read
       packages: write
-    strategy:
-      matrix:
-        include:
-          - image: starguard-bot
-            dockerfile: Dockerfile.bot
-          - image: starguard-server
-            dockerfile: Dockerfile.server
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Log in to the GitHub Packages registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push ${{ matrix.image }}
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ github.ref_name }}
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+      id-token: write
+    uses: ./.github/workflows/publish.yml
+    with:
+      version: ${{ needs.release-please.outputs.version }}
 
-  github-release:
-    name: Create GitHub release
-    needs: publish-images
+  announce:
+    name: Publish the drafted release
+    # Both, and in this order: the version comes from release-please and the
+    # images have to be in the registry before the release that names them
+    # is visible. needs on the publish job covers its promote stage too, so
+    # this cannot run while a tag is still pointing at the previous digest.
+    needs: [release-please, publish]
+    # Only the push that merged a release pull request has a version, and
+    # only that push has a draft to publish.
+    if: needs.release-please.outputs.version != ''
     runs-on: ubuntu-latest
     permissions:
+      # Flip the release from draft to published, which also creates the tag.
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Extract release notes from CHANGELOG.md
+      - name: Take the release out of draft
         env:
-          REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.release-please.outputs.release_id }}
+          VERSION: ${{ needs.release-please.outputs.version }}
         run: |
-          version="${REF_NAME#v}"
-          awk -v ver="$version" '
-            BEGIN { found = 0 }
-            /^## \[/ {
-              if (found) exit
-              if ($0 ~ ("\\[" ver "\\]")) { found = 1; next }
-              next
-            }
-            found { print }
-          ' CHANGELOG.md > release_notes.md
-          if [ ! -s release_notes.md ]; then
-            echo "No CHANGELOG.md section found for version $version" >&2
+          set -euo pipefail
+
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::release-please reported version ${VERSION} but no release id, so there is no draft to publish." >&2
             exit 1
           fi
-      - name: Create release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
-        with:
-          body_path: release_notes.md
+
+          # -F rather than -f, so draft is sent as the JSON boolean false
+          # rather than the string "false", which GitHub reads as truthy and
+          # would leave the release drafted while reporting success.
+          gh api --method PATCH \
+            "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+            -F draft=false >/dev/null
+
+          published="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" --jq '.draft')"
+          if [ "$published" != "false" ]; then
+            echo "::error::Release ${RELEASE_ID} is still a draft after the update." >&2
+            exit 1
+          fi
+          echo "Published release ${RELEASE_ID} for v${VERSION}."

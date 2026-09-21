@@ -21,6 +21,7 @@ from interactions.client.errors import Forbidden
 from pymongo.errors import PyMongoError
 
 from bot import messages
+from bot.memberlock import MemberLocks
 from bot.verification import (
     CLAIM_BUTTON_ID,
     RELINK_BUTTON_ID,
@@ -61,7 +62,12 @@ class RecordingClient:
 
 
 class Sent:
-    """One message a handler sent back to the interaction."""
+    """One message a handler sent back to the interaction.
+
+    ``ephemeral`` is what Discord would actually do with the message, not
+    what the call asked for. The two differ on exactly one message per
+    interaction; see FakeContext.send.
+    """
 
     def __init__(self, content, components, ephemeral, embed):
         self.content = content
@@ -111,12 +117,25 @@ class FakeContext:
         self.author_id = self.author.id
         self.sent = []
         self.deferred = False
+        self.deferred_ephemeral = None
 
     async def defer(self, ephemeral=False):
         self.deferred = True
+        self.deferred_ephemeral = ephemeral
 
     async def send(self, content=None, components=None, ephemeral=False, embed=None):
-        self.sent.append(Sent(content, components, ephemeral, embed))
+        # interactions.py routes the first send after a defer to
+        # edit_interaction_message, which edits the reply Discord already
+        # created, and its visibility was fixed by the defer. Only the sends
+        # after that one become followups carrying their own flags. So a
+        # handler that defers ephemeral and then sends the message everybody
+        # is supposed to see gets a private one and no error, which is the
+        # sort of thing a fake that simply believes the argument would never
+        # show. See interactions.models.internal.context._send_http_request.
+        effective = ephemeral
+        if self.deferred and not self.sent:
+            effective = self.deferred_ephemeral
+        self.sent.append(Sent(content, components, effective, embed))
 
     @property
     def last(self):
@@ -140,11 +159,19 @@ class FakeUsers:
         return self.document
 
 
-def register(users=None, **config_overrides):
-    """Register the verification flow and return (client, config)."""
+def register(users=None, member_locks=None, **config_overrides):
+    """Register the verification flow and return (client, config).
+
+    ``member_locks`` is the registry the claim button takes the clicking
+    member's mutex from. The tests that pit a claim against a sweep or a
+    drain pass the registry those share, because a private one here would
+    be a second set of mutexes and no exclusion at all.
+    """
     config = make_config(secret_key=SECRET, **config_overrides)
     client = RecordingClient()
-    register_verification(client, config, users)
+    register_verification(
+        client, config, users, MemberLocks() if member_locks is None else member_locks
+    )
     return client, config
 
 
@@ -154,10 +181,18 @@ def run(client, custom_id, ctx):
     return ctx
 
 
-def linked(starred=True):
+def linked(starred=True, repo=None):
+    """A link document as ``link_account`` writes one.
+
+    ``linked_repo`` is part of it because the claim path checks it. A row
+    only says somebody starred the repository it was made for, and taking
+    it as evidence about some other repository is the bug behind
+    :func:`test_a_link_to_another_repository_cannot_claim_the_role`.
+    """
     return {
         "discord_id": str(AUTHOR_ID),
         "github_username": "Octocat",
+        "linked_repo": make_config().repo_url if repo is None else repo,
         "starred_repo": starred,
     }
 
@@ -242,6 +277,68 @@ def test_claiming_with_a_recorded_star_grants_the_role():
     assert str(AUTHOR_ID) in ctx.last.content
 
 
+class DeferWatchingUsers(FakeUsers):
+    """Records whether the interaction had been acked by lookup time."""
+
+    def __init__(self, document, ctx):
+        super().__init__(document)
+        self._ctx = ctx
+        self.deferred_at_lookup = None
+
+    def find_one(self, query, projection=None):
+        self.deferred_at_lookup = self._ctx.deferred
+        return super().find_one(query, projection)
+
+
+def test_claiming_acks_the_interaction_before_it_touches_the_database():
+    # The defect this closes. Discord drops the interaction token unless
+    # something answers inside three seconds, and the answer used to be the
+    # final ctx.send, behind a member lock, a Mongo read and a role call. A
+    # lock held by a sweep working on this same member, or a role call
+    # retried through a 429, put the first answer past the window: the member
+    # read "This interaction failed" while the role had been granted and
+    # recorded, so the outcome looked like its own opposite.
+    #
+    # Checked from inside the lookup rather than after the handler returns,
+    # because ctx.deferred is True at the end either way, including if the
+    # defer were the last line in the function.
+    ctx = FakeContext(FakeMember())
+    users = DeferWatchingUsers(linked(starred=True), ctx)
+    client, _ = register(users=users)
+
+    run(client, CLAIM_BUTTON_ID, ctx)
+
+    assert users.deferred_at_lookup is True
+
+
+def test_the_public_thank_you_is_the_second_message_and_not_the_first():
+    # The ordering is the design, not a detail. The defer has to be ephemeral
+    # because every other outcome is for the member alone, and that makes the
+    # first send ephemeral whatever it asks for. So the private confirmation
+    # goes first to settle the interaction and the thank-you follows as a
+    # followup, which is the only send left that can still be public.
+    #
+    # Written as an explicit two-message assertion rather than a check on the
+    # last message, because the way this breaks is by collapsing back into
+    # one send: that version answers, grants the role, records it and passes
+    # every other test here, and the only thing wrong with it is that the
+    # message the whole server is meant to see is visible to one person.
+    client, _ = register(users=FakeUsers(linked(starred=True)))
+    ctx = run(client, CLAIM_BUTTON_ID, FakeContext(FakeMember()))
+
+    assert ctx.deferred_ephemeral is True
+    assert len(ctx.sent) == 2
+
+    # Indexed rather than unpacked, because FakeContext.sent starts empty and
+    # pylint reads the unpacking against that initial value.
+    confirmation = ctx.sent[0]
+    thanks = ctx.sent[1]
+    assert confirmation.content == messages.CLAIM_GRANTED
+    assert confirmation.ephemeral is True
+    assert thanks.ephemeral is False
+    assert str(AUTHOR_ID) in thanks.content
+
+
 def test_claiming_looks_the_member_up_by_their_own_discord_id():
     users = FakeUsers(linked())
     client, _ = register(users=users)
@@ -309,6 +406,37 @@ def test_claiming_without_a_link_offers_a_new_one():
     assert messages.VERIFY_BUTTON_RELINK in ctx.last.content
     assert [b.custom_id for b in ctx.last.buttons] == [RELINK_BUTTON_ID]
     assert member.roles == set()
+
+
+def test_a_link_to_another_repository_cannot_claim_the_role():
+    # An operator who repoints REPO_OWNER or GITHUB_REPO and keeps the
+    # database is left with rows that say starred_repo about the previous
+    # repository. Looking the claim up by Discord ID alone accepted every
+    # one of them, so everybody who had verified before the move could take
+    # the role for a repository they had never starred.
+    client, config = register(users=FakeUsers(linked(repo="https://github.com/owner/other/")))
+    member = FakeMember()
+    ctx = run(client, CLAIM_BUTTON_ID, FakeContext(member))
+
+    assert config.repo_url == "https://github.com/owner/repo/"
+    assert member.roles == set()
+    assert member.added == 0
+    # Sent back through the link flow, which rewrites the row for the
+    # repository that is actually configured now.
+    assert messages.VERIFY_BUTTON_RELINK in ctx.last.content
+    assert [b.custom_id for b in ctx.last.buttons] == [RELINK_BUTTON_ID]
+
+
+def test_a_link_to_the_configured_repository_still_claims_the_role():
+    # The other half: the check must be an equality against the configured
+    # repository and not something that turns every claim down.
+    client, config = register(users=FakeUsers(linked(repo="https://github.com/owner/repo/")))
+    member = FakeMember()
+    ctx = run(client, CLAIM_BUTTON_ID, FakeContext(member))
+
+    assert config.repo_url == "https://github.com/owner/repo/"
+    assert member.roles == {ROLE_ID}
+    assert str(AUTHOR_ID) in ctx.last.content
 
 
 def test_claiming_without_a_star_is_refused():

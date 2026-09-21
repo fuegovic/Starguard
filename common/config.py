@@ -9,6 +9,9 @@ import os
 from typing import Final, overload
 from urllib.parse import urlsplit
 
+from pymongo import MongoClient
+from pymongo.errors import PyMongoError
+
 
 class ConfigError(RuntimeError):
     """Raised when the environment is missing or has an unusable value."""
@@ -29,6 +32,12 @@ PLACEHOLDER_SECRET_KEYS: Final[frozenset[str]] = frozenset(
 )
 
 MIN_SECRET_KEY_LENGTH: Final = 16
+
+# The range a TCP port can actually be. Zero is excluded on purpose: the
+# kernel reads it as "any free port", which is useful in a test and useless
+# in a deployment, where nothing would know where the service ended up.
+MIN_PORT: Final = 1
+MAX_PORT: Final = 65535
 
 
 # The overloads exist so that ``optional_env(name, "")`` is a str at the call
@@ -67,7 +76,15 @@ def require_env(name: str, hint: str | None = None) -> str:
 
 
 def env_int(name: str, default: int, minimum: int | None = None) -> int:
-    """Return ``name`` as an int, clamped to ``minimum`` when one is given."""
+    """Return ``name`` as an int, clamped to ``minimum`` when one is given.
+
+    ``minimum`` clamps rather than raising, which is right for the values
+    that use it: an ``AUTOMATIC_CHECK_DELAY`` under the floor becomes the
+    floor and the deployment carries on with a value the operator can live
+    with. There is deliberately no ``maximum`` to match, because a ceiling
+    that clamped would be wrong wherever one is wanted. See
+    :func:`env_port`, which is the case that wanted one.
+    """
     raw = optional_env(name)
     if raw is None:
         value = default
@@ -78,6 +95,32 @@ def env_int(name: str, default: int, minimum: int | None = None) -> int:
             raise ConfigError(f"{name} must be a whole number, got {raw!r}.") from exc
     if minimum is not None and value < minimum:
         return minimum
+    return value
+
+
+def env_port(name: str, default: int) -> int:
+    """Return ``name`` as a TCP port, rejecting anything outside 1-65535.
+
+    A reader of its own rather than a bound passed to :func:`env_int`,
+    because this one raises where that one clamps, and the difference is
+    the whole point. Clamping a port is not a smaller version of what was
+    asked for, it is a different address: ``BOT_HEALTH_PORT=70000`` would
+    quietly bind 65535, and an operator hunting their typo would find a
+    service listening and answering on a port they never named.
+
+    Raising is also what the alternative costs. ``bind()`` answers a port
+    above the ceiling with ``OverflowError``, and a caller that survives
+    that is a caller that came up without the socket: for the bot's
+    optional health endpoint, a container whose healthcheck then fails
+    every probe for its whole life, explained only by one startup log line
+    that has long scrolled past. Naming the variable at startup is what
+    every other unusable value in this module does.
+    """
+    value = env_int(name, default)
+    if not MIN_PORT <= value <= MAX_PORT:
+        raise ConfigError(
+            f"{name} must be a TCP port between {MIN_PORT} and {MAX_PORT}, got {value}."
+        )
     return value
 
 
@@ -131,6 +174,38 @@ def require_https_url(name: str) -> str:
             f"{name} must be a plain URL with no query string or fragment, got {raw!r}."
         )
     return raw.rstrip("/")
+
+
+def require_mongo_host(name: str) -> str:
+    """Return ``name`` as a connection string the driver will accept.
+
+    The driver itself is the check, constructed the way
+    :func:`common.storage.connect` constructs it, rather than a pattern of
+    this module's own. The value can be a bare hostname, a Docker service
+    name, a host list or a full ``mongodb://`` URI carrying options, and
+    only the driver knows the whole of that grammar; a rule written here
+    would refuse something it will happily take, which is the worse
+    mistake of the two.
+
+    Worth checking at all because this is the one setting whose bad values
+    are not reported like every other. A port that is not a number, or one
+    outside 1 to 65535, makes the constructor raise ``ValueError``, which
+    is not a ``PyMongoError`` and so goes straight past the guard the
+    server wraps its connection in: the process dies with a traceback and
+    the container restarts into the same traceback forever. A password
+    with an unescaped character raises ``InvalidURI``, which is caught, and
+    leaves a server that answers every request and can link nobody.
+    Neither outcome names the variable that is wrong.
+
+    Nothing is dialed. ``connect=False`` defers every socket, so this
+    parses the value and throws the client away.
+    """
+    value = require_env(name)
+    try:
+        MongoClient(host=value, connect=False).close()
+    except (ValueError, PyMongoError) as exc:
+        raise ConfigError(f"{name} is not a usable MongoDB connection string: {exc}") from exc
+    return value
 
 
 def require_secret_key() -> str:

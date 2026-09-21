@@ -3,28 +3,44 @@
 # Test names document the behaviour under test, and the fakes below
 # deliberately mirror signatures they do not use.
 # pylint: disable=missing-function-docstring,unused-argument
+#
+# Over pylint's default module length, and deliberately so. This file is
+# where the lost-update class this project keeps rediscovering is pinned
+# down, one interleaving per test with the comment that says which release
+# shipped it, and every one of them is driven through the same fakes at the
+# top. Splitting it would put a race in one module and the collection that
+# reproduces it in another, which is how one of these regressions came back
+# the first time.
+# pylint: disable=too-many-lines
 
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo import _csot
+from pymongo.errors import DuplicateKeyError, PyMongoError, ServerSelectionTimeoutError
 
+from common.deliveries import (
+    DELIVERY_COLLECTION_NAME,
+    claim_delivery,
+    release_delivery,
+)
 from common.storage import (
     COLLECTION_NAME,
-    DELIVERY_COLLECTION_NAME,
+    PING_TIMEOUT_SECONDS,
     SCHEMA_VERSION,
     STAR_SOURCE_SWEEP,
     STAR_SOURCE_WEBHOOK,
     AccountAlreadyLinkedError,
     all_links,
-    claim_delivery,
     clear_role_sync_pending,
+    clear_role_sync_pending_by_id,
     connect,
     find_link,
     find_link_by_github_id,
     iter_links,
     iter_pending_role_syncs,
     link_account,
+    ping,
     purge_legacy_secrets,
     read_updated_at,
     record_star_event,
@@ -40,17 +56,36 @@ WHEN = datetime(2026, 1, 1, tzinfo=UTC)
 # about that race passes an instant later than any star event it set up.
 SWEPT_AT = datetime(2026, 6, 1, tzinfo=UTC)
 
+# When /authorize's OAuth star check was answered. link_account orders its
+# star state against the webhook from this instant exactly as the sweep does
+# from the one above.
+OBSERVED_AT = datetime(2026, 3, 1, tzinfo=UTC)
+
 
 MISSING = object()
+
+
+# The query operators this stub understands, as a table rather than a chain
+# of branches: the chain outgrew pylint's limit the moment $ne was added,
+# and a table is where operators were always going to accumulate.
+OPERATORS = {
+    "$exists": lambda value, expected: (value is not MISSING) == expected,
+    "$lt": lambda value, expected: value is not MISSING and value < expected,
+    "$lte": lambda value, expected: value is not MISSING and value <= expected,
+    # A missing field is not equal to anything, which is how a legacy row
+    # carrying no github_id matches the account-change statement.
+    "$ne": lambda value, expected: value is MISSING or value != expected,
+}
 
 
 def matches(document, query):
     """Match a document against the query syntax common.storage actually uses.
 
-    Plain equality, plus the ``$or``/``$exists``/``$lt``/``$lte`` that the
-    schema upgrade's query and the sweep's conditional write are built from.
-    Anything else is a query this stub has not been taught, and silently
-    matching everything would make a test pass for the wrong reason.
+    Plain equality, ``$or``, and the operators in OPERATORS above, which
+    are what the schema upgrade's query, the sweep's conditional write and
+    the account-change statement are built from. Anything else is a query
+    this stub has not been taught, and silently matching everything would
+    make a test pass for the wrong reason, so it raises instead.
     """
     for key, condition in query.items():
         if key == "$or":
@@ -61,17 +96,13 @@ def matches(document, query):
         if not isinstance(condition, dict):
             if value != condition:
                 return False
-        elif "$exists" in condition:
-            if (value is not MISSING) != condition["$exists"]:
+            continue
+        for operator, expected in condition.items():
+            compare = OPERATORS.get(operator)
+            if compare is None:
+                raise AssertionError(f"unsupported query: {condition!r}")
+            if not compare(value, expected):
                 return False
-        elif "$lt" in condition:
-            if value is MISSING or not value < condition["$lt"]:
-                return False
-        elif "$lte" in condition:
-            if value is MISSING or not value <= condition["$lte"]:
-                return False
-        else:
-            raise AssertionError(f"unsupported query: {condition!r}")
     return True
 
 
@@ -109,10 +140,16 @@ class FakeCollection:
         for document in self.documents:
             if matches(document, query):
                 document.update(update.get("$set", {}))
+                for field in update.get("$unset", {}):
+                    document.pop(field, None)
                 return UpdateResult(1)
         if upsert:
             new = dict(query)
             new.update(update.get("$set", {}))
+            # Only on this path, which is the whole point of the operator:
+            # a link that already exists keeps the star state the row
+            # holds rather than the one the caller arrived with.
+            new.update(update.get("$setOnInsert", {}))
             self.documents.append(new)
         # Nothing matched either way: an upsert that inserted still reports
         # a matched_count of zero, which is what pymongo does.
@@ -142,7 +179,7 @@ class FakeCollection:
         return None
 
 
-def link(collection, discord_id, github_id, github_username, starred=True):
+def link(collection, discord_id, github_id, github_username, starred=True, observed_at=None):
     return link_account(
         collection,
         discord_id=discord_id,
@@ -151,6 +188,7 @@ def link(collection, discord_id, github_id, github_username, starred=True):
         github_username=github_username,
         linked_repo=REPO,
         starred_repo=starred,
+        observed_at=observed_at,
     )
 
 
@@ -191,6 +229,82 @@ def test_a_github_account_cannot_be_reused_by_another_discord_user():
     assert find_link(collection, "1")["discord_id"] == "1"
 
 
+def test_a_legacy_row_with_no_id_still_reserves_its_github_account():
+    # Rows written before github_id was recorded cannot be found by it,
+    # and one of them is still a link and still holds the role. Without a
+    # second lookup the same GitHub account authenticates for another
+    # Discord ID and gets a row of its own, so one star earns the role
+    # twice for as long as the original member does not re-verify.
+    collection = FakeCollection(
+        [{"discord_id": "1", "github_username": "Octocat", "github_username_lower": "octocat"}]
+    )
+
+    with pytest.raises(AccountAlreadyLinkedError) as excinfo:
+        link(collection, "2", 100, "Octocat")
+
+    assert excinfo.value.existing_discord_id == "1"
+    assert len(collection.documents) == 1
+
+
+def test_the_owner_of_a_legacy_row_re_verifies_into_it():
+    # The same lookup must not lock somebody out of their own row, which
+    # is how a legacy row gets its id and stops being ambiguous at all.
+    collection = FakeCollection(
+        [{"discord_id": "1", "github_username": "Octocat", "github_username_lower": "octocat"}]
+    )
+
+    link(collection, "1", 100, "Octocat")
+
+    assert len(collection.documents) == 1
+    assert find_link(collection, "1")["github_id"] == 100
+
+
+@pytest.mark.parametrize(
+    "orphan",
+    # Null is the shape production actually holds: every server from
+    # 2023-10-28 until the rebuild read the Discord ID off the query
+    # string unvalidated and wrote it, so a bare GET to /login with no
+    # id, followed by OAuth, stored one of these. Missing is the
+    # one-day schema before that field existed at all.
+    [{}, {"discord_id": None}, {"discord_id": ""}],
+    ids=["missing", "null", "empty"],
+)
+def test_a_legacy_row_that_names_no_discord_user_does_not_block_a_link(orphan):
+    # The other half of the lookup above, and the reason it checks the
+    # Discord ID rather than trusting the name match. Nothing can hold a
+    # role for a row that names no Discord user, whichever of the three
+    # shapes it is, so it is not a competing claim on the star. Blocking
+    # would
+    # hold the GitHub account hostage to a row that redeems nothing, and
+    # tell its rightful owner it is already linked to Discord ID None.
+    collection = FakeCollection(
+        [{**orphan, "github_username": "Octocat", "github_username_lower": "octocat"}]
+    )
+
+    document = link(collection, "1", 100, "Octocat")
+
+    assert document["discord_id"] == "1"
+    assert find_link(collection, "1")["github_id"] == 100
+    # The orphan is left where it was. Nothing here can say whose it was.
+    assert len(collection.documents) == 2
+
+
+def test_a_login_its_previous_owner_gave_up_is_not_refused():
+    # The false rejection the lookup has to avoid. A login is not
+    # immutable: renaming a GitHub account leaves the old one free for
+    # somebody else to register. The row that still records that spelling
+    # has a github_id, so it has already been ruled out on the one field
+    # that cannot change, and matching it by name would refuse the new
+    # owner a link they are entitled to.
+    collection = FakeCollection()
+    link(collection, "1", 999, "Octocat")
+
+    link(collection, "2", 100, "Octocat")
+
+    assert len(collection.documents) == 2
+    assert find_link(collection, "2")["github_id"] == 100
+
+
 def test_different_github_accounts_coexist():
     collection = FakeCollection()
     link(collection, "1", 100, "one")
@@ -208,7 +322,7 @@ def test_discord_ids_are_normalised_to_strings():
 def test_set_starred_updates_the_flag():
     collection = FakeCollection()
     link(collection, "1", 100, "one", starred=True)
-    set_starred(collection, "1", False, SWEPT_AT)
+    set_starred(collection, "1", False, SWEPT_AT, 100)
     assert find_link(collection, "1")["starred_repo"] is False
 
 
@@ -265,7 +379,7 @@ def test_updated_at_is_stored_as_a_real_date():
 def test_set_starred_stores_a_real_date_too():
     collection = FakeCollection()
     link(collection, "1", 100, "one")
-    set_starred(collection, "1", False, SWEPT_AT)
+    set_starred(collection, "1", False, SWEPT_AT, 100)
     assert isinstance(find_link(collection, "1")["updated_at"], datetime)
 
 
@@ -339,6 +453,46 @@ def test_an_event_that_does_move_the_state_queues_the_bot():
     assert updated["role_sync_pending"] is True
 
 
+def test_a_delivery_that_arrives_behind_a_newer_one_is_not_recorded():
+    # Deliveries are not ordered, and GitHub retries the ones whose
+    # response it did not see, so an older event can reach this after a
+    # newer one has already been recorded. It reports the row as it
+    # stands rather than winding it back.
+    collection = FakeCollection()
+    link(collection, "1", 100, "Octocat", starred=False)
+    later = WHEN + timedelta(seconds=1)
+    record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, later)
+
+    outcome = record_star_event(collection, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
+
+    assert outcome["starred_repo"] is False
+    assert outcome["star_event_at"] == later
+    assert not list(iter_pending_role_syncs(collection))
+
+
+def test_an_overtaken_delivery_does_not_write_its_older_state():
+    # The interleaving itself, driven rather than hoped for. From a row
+    # that says un-starred, the star delivery is the older event and the
+    # un-star the newer one, and the star's write lands last. Deciding
+    # from a read taken before the un-star ran left the row saying
+    # starred with work queued, and the bot then handed out the role for
+    # a star that had already been taken back.
+    collection = InterleavingCollection()
+    link(collection, "1", 100, "Octocat", starred=False)
+    later = WHEN + timedelta(seconds=1)
+    collection.before_first_write(
+        lambda: record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, later)
+    )
+
+    outcome = record_star_event(collection, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
+
+    assert outcome["starred_repo"] is False
+    row = find_link(collection, "1")
+    assert row["starred_repo"] is False
+    assert row["star_event_at"] == later
+    assert not list(iter_pending_role_syncs(collection))
+
+
 def test_a_star_event_from_somebody_who_never_verified_is_silent():
     # Most star events are these: no row, nothing written, nothing said.
     collection = FakeCollection()
@@ -365,12 +519,69 @@ def test_the_pending_queue_streams_rather_than_building_a_list():
         next(rows)
 
 
+@pytest.mark.parametrize(
+    "orphan",
+    # The two shapes that are genuinely stuck. Null is the one released
+    # code produced for nearly three years, from an unvalidated Discord
+    # ID written straight through; missing is the schema of the day
+    # before that field existed. The empty string is not here on
+    # purpose: see the test below for why it proves nothing.
+    [{}, {"discord_id": None}],
+    ids=["missing", "null"],
+)
+def test_a_row_with_no_discord_id_is_cleared_by_its_mongo_id(orphan):
+    collection = FakeCollection(
+        [{**orphan, "_id": "row-1", "starred_repo": True, "role_sync_pending": True}]
+    )
+    queued = next(iter_pending_role_syncs(collection))
+
+    # What the drain can reach with the Discord-keyed clear: nothing. It
+    # stringifies what it is handed, so the filter asks for the literal
+    # "None" and the row is read and reported again on every poll for as
+    # long as the process runs. It says so, at least: the refusal is the
+    # answer, and a caller that reads it knows not to act as though the
+    # row had come off the queue.
+    assert clear_role_sync_pending(collection, queued.get("discord_id"), True) is False
+    assert [row["_id"] for row in iter_pending_role_syncs(collection)] == ["row-1"]
+
+    clear_role_sync_pending_by_id(collection, queued["_id"])
+
+    assert not list(iter_pending_role_syncs(collection))
+
+
+def test_an_empty_discord_id_was_never_the_row_that_got_stuck():
+    # Why the case above excludes it, written down rather than left to
+    # be rediscovered. An empty string round-trips through str(), so the
+    # Discord-keyed clear matches and the row comes off the queue on its
+    # own. A regression test built on this shape passes without the by-id
+    # clear existing at all, which is how the real bug survived one.
+    collection = FakeCollection(
+        [{"_id": "row-1", "discord_id": "", "starred_repo": True, "role_sync_pending": True}]
+    )
+
+    assert clear_role_sync_pending(collection, "", True) is True
+
+    assert not list(iter_pending_role_syncs(collection))
+
+
+def test_clearing_by_id_does_not_need_the_star_state_to_match():
+    # The guard the Discord-keyed clear carries is against a webhook
+    # moving the row while the bot talked to Discord. Nothing talked to
+    # Discord about a member that does not exist, so here it would only
+    # be a second way to match nothing.
+    collection = FakeCollection([{"_id": "row-1", "role_sync_pending": True}])
+
+    clear_role_sync_pending_by_id(collection, "row-1")
+
+    assert not list(iter_pending_role_syncs(collection))
+
+
 def test_clearing_the_flag_takes_the_row_off_the_queue():
     collection = FakeCollection()
     link(collection, "1", 100, "one", starred=False)
     record_star_event(collection, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
 
-    clear_role_sync_pending(collection, 1, True)
+    assert clear_role_sync_pending(collection, 1, True) is True
 
     assert not list(iter_pending_role_syncs(collection))
     # Only the flag moves: the star state and the event it came from stay.
@@ -401,8 +612,10 @@ def test_a_clear_does_not_lower_a_flag_the_bot_has_not_acted_on():
     record_star_event(collection, 100, True, STAR_SOURCE_WEBHOOK, WHEN)
     record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, WHEN)
 
-    # The bot acted on the star it read, which is no longer what the row says.
-    clear_role_sync_pending(collection, "1", True)
+    # The bot acted on the star it read, which is no longer what the row
+    # says. The refusal is reported, because the caller cannot see the
+    # filter and a silent no-op reads exactly like a clear that landed.
+    assert clear_role_sync_pending(collection, "1", True) is False
 
     assert [row["discord_id"] for row in iter_pending_role_syncs(collection)] == ["1"]
     assert find_link(collection, "1")["starred_repo"] is False
@@ -411,7 +624,7 @@ def test_a_clear_does_not_lower_a_flag_the_bot_has_not_acted_on():
 def test_the_sweep_stamps_itself_as_the_source():
     collection = FakeCollection()
     link(collection, "1", 100, "one")
-    set_starred(collection, "1", False, SWEPT_AT)
+    set_starred(collection, "1", False, SWEPT_AT, 100)
     assert find_link(collection, "1")["star_source"] == STAR_SOURCE_SWEEP
 
 
@@ -426,7 +639,7 @@ def test_the_sweep_does_not_write_over_a_star_event_it_did_not_see():
     later = SWEPT_AT + timedelta(seconds=30)
     record_star_event(collection, 100, True, STAR_SOURCE_WEBHOOK, later)
 
-    assert set_starred(collection, "1", False, SWEPT_AT) is False
+    assert set_starred(collection, "1", False, SWEPT_AT, 100) is False
 
     row = find_link(collection, "1")
     assert row["starred_repo"] is True
@@ -452,13 +665,31 @@ def test_a_star_event_older_than_the_listing_is_still_swept():
     assert find_link(collection, "1")["starred_repo"] is True
     assert [queued["discord_id"] for queued in iter_pending_role_syncs(collection)] == ["1"]
 
-    assert set_starred(collection, "1", False, SWEPT_AT) is True
+    assert set_starred(collection, "1", False, SWEPT_AT, 100) is True
 
     row = find_link(collection, "1")
     assert row["starred_repo"] is False
     assert row["star_source"] == STAR_SOURCE_SWEEP
     # The flag is untouched, because only the bot ever lowers it.
     assert [queued["discord_id"] for queued in iter_pending_role_syncs(collection)] == ["1"]
+
+
+def test_a_relink_during_the_sweep_does_not_write_onto_the_new_account():
+    # The lost update the timestamp guard does not reach. The sweep walks
+    # 45,000 stargazers against one listing; a member who re-links partway
+    # through is a different GitHub account by the time the sweep gets to
+    # their row, and link_account clears star_event_at when the account
+    # changes, so the $exists arm matches and the timestamp has nothing to
+    # say. The sweep's answer is about the account they left.
+    collection = FakeCollection()
+    link(collection, "1", 100, "one", starred=True)
+    link(collection, "1", 200, "two", starred=True)
+
+    assert set_starred(collection, "1", False, SWEPT_AT, 100) is False
+
+    # Otherwise: they star through the new account, the sweep has already
+    # taken the role, and the row agrees they never starred.
+    assert find_link(collection, "1")["starred_repo"] is True
 
 
 def test_an_ordinary_row_no_webhook_has_touched_is_written_normally():
@@ -468,8 +699,95 @@ def test_an_ordinary_row_no_webhook_has_touched_is_written_normally():
     link(collection, "1", 100, "one", starred=True)
 
     assert "star_event_at" not in find_link(collection, "1")
-    assert set_starred(collection, "1", False, SWEPT_AT) is True
+    assert set_starred(collection, "1", False, SWEPT_AT, 100) is True
     assert find_link(collection, "1")["starred_repo"] is False
+
+
+def test_a_relink_does_not_write_over_a_star_event_it_did_not_see():
+    # The interleaving the sixth instance of this bug class hid in, driven
+    # rather than hoped for. /authorize asks GitHub, is told the member
+    # stars the repository, and writes that down; the member un-stars in
+    # between, and the webhook records it and queues the role change. The
+    # relink used to put the stale True back while deliberately leaving
+    # the flag raised, so the drain read the restored value off the row,
+    # reconciled the role to it and lowered the flag, and the un-star was
+    # lost until the next full sweep.
+    collection = InterleavingCollection()
+    link(collection, "1", 100, "Octocat", starred=True)
+    unstarred_at = OBSERVED_AT + timedelta(seconds=1)
+    collection.before_write(
+        1, lambda: record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, unstarred_at)
+    )
+
+    document = link(collection, "1", 100, "Octocat-Renamed", starred=True, observed_at=OBSERVED_AT)
+
+    row = find_link(collection, "1")
+    assert row["starred_repo"] is False
+    assert row["star_event_at"] == unstarred_at
+    # The work stays queued, and the drain now finds the state the webhook
+    # recorded rather than the one the relink used to restore under it.
+    assert [queued["discord_id"] for queued in iter_pending_role_syncs(collection)] == ["1"]
+    # Only the star state is held back. Everything /authorize actually
+    # established about this person is still written.
+    assert row["github_username"] == "Octocat-Renamed"
+    assert row["github_id"] == 100
+    # And the caller is told what the row holds, not what it offered.
+    assert document["starred_repo"] is False
+    assert document["github_username"] == "Octocat-Renamed"
+
+
+def test_a_row_a_relink_creates_carries_its_star_state_from_the_first_instant():
+    # Why the insert sets starred_repo with $setOnInsert rather than
+    # leaving it to the conditional write. The row is visible to the
+    # webhook by its github_id as soon as it exists, and record_star_event
+    # reads a row with no starred_repo as neither state, so an event
+    # landing in between would be recorded without the role change it came
+    # with ever being queued.
+    collection = InterleavingCollection()
+    unstarred_at = OBSERVED_AT + timedelta(seconds=1)
+    # Third, not second: link_account opens with the account-change
+    # statement, which matches nothing here because there is no row yet,
+    # and the insert this test is about is the one after it.
+    collection.before_write(
+        3, lambda: record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, unstarred_at)
+    )
+
+    link(collection, "1", 100, "Octocat", starred=True, observed_at=OBSERVED_AT)
+
+    assert find_link(collection, "1")["starred_repo"] is False
+    assert [queued["discord_id"] for queued in iter_pending_role_syncs(collection)] == ["1"]
+
+
+def test_a_relink_writes_over_a_star_event_older_than_the_oauth_check():
+    # The other side of the guard, and the reason it is a timestamp rather
+    # than "has a webhook ever touched this row". A stale event ages out of
+    # the way, so re-verifying still repairs a row whose webhook was never
+    # delivered instead of deferring to it forever.
+    collection = FakeCollection()
+    link(collection, "1", 100, "Octocat", starred=True)
+    record_star_event(collection, 100, False, STAR_SOURCE_WEBHOOK, OBSERVED_AT - timedelta(days=1))
+
+    document = link(collection, "1", 100, "Octocat", starred=True, observed_at=OBSERVED_AT)
+
+    assert document["starred_repo"] is True
+    assert find_link(collection, "1")["starred_repo"] is True
+    # The flag is left exactly as it was: only the bot ever lowers it.
+    assert [queued["discord_id"] for queued in iter_pending_role_syncs(collection)] == ["1"]
+
+
+def test_a_first_link_is_created_however_old_the_observation_is():
+    # The ordering condition must not reach the insert. There is no row to
+    # be newer than one, so a condition on the upsert would turn a
+    # first-time link into a silent no-op, or upsert the condition itself
+    # into the document.
+    collection = FakeCollection()
+
+    document = link(collection, "1", 100, "Octocat", observed_at=datetime(2020, 1, 1, tzinfo=UTC))
+
+    row = find_link(collection, "1")
+    assert row["starred_repo"] is True
+    assert document["starred_repo"] is True
+    assert "$or" not in row
 
 
 @pytest.mark.parametrize(
@@ -477,7 +795,11 @@ def test_an_ordinary_row_no_webhook_has_touched_is_written_normally():
     [
         (None, False),
         (SWEPT_AT - timedelta(seconds=1), False),
-        (SWEPT_AT, False),
+        # The last stored instant that can only have happened before the
+        # listing was taken. Anything after this shares a millisecond with
+        # it, which the database cannot tell apart from after it.
+        (SWEPT_AT - timedelta(milliseconds=1), False),
+        (SWEPT_AT, True),
         (SWEPT_AT + timedelta(seconds=1), True),
         # What the driver hands back: BSON dates are UTC but arrive naive.
         # Comparing one of those against an aware instant raises, which
@@ -490,11 +812,25 @@ def test_star_event_is_newer_reads_the_boundary_the_sweep_depends_on(stored, exp
     assert star_event_is_newer(document, SWEPT_AT) is expected
 
 
+def test_a_star_event_in_the_listings_own_millisecond_counts_as_newer():
+    # BSON holds a datetime as whole milliseconds, so a star event stamped
+    # a few hundred microseconds after the listing was taken is stored as
+    # having happened before it. Comparing that stored value against the
+    # sweep's own microseconds read it as older, and the sweep then took
+    # the role and wrote its stale state over the newer one.
+    observed_at = SWEPT_AT + timedelta(microseconds=500)
+    # What the database kept of a webhook that landed at .000900.
+    assert star_event_is_newer({"star_event_at": SWEPT_AT}, observed_at) is True
+    # A whole millisecond earlier is unambiguous, and still the sweep's.
+    earlier = SWEPT_AT - timedelta(milliseconds=1)
+    assert star_event_is_newer({"star_event_at": earlier}, observed_at) is False
+
+
 def test_the_sweep_does_not_queue_a_role_sync():
     # The sweep has already moved the role itself by the time it writes.
     collection = FakeCollection()
     link(collection, "1", 100, "one")
-    set_starred(collection, "1", False, SWEPT_AT)
+    set_starred(collection, "1", False, SWEPT_AT, 100)
     assert not list(iter_pending_role_syncs(collection))
 
 
@@ -508,6 +844,49 @@ def test_different_delivery_ids_are_claimed_independently():
     deliveries = FakeDeliveryCollection()
     assert claim_delivery(deliveries, "abc", WHEN) is True
     assert claim_delivery(deliveries, "def", WHEN) is True
+
+
+def test_a_released_delivery_is_new_work_again():
+    # The receiver claims a delivery before it records anything, so a
+    # delivery whose recording failed is claimed and unrecorded at once.
+    # Leaving the claim standing turns the operator's manual redelivery,
+    # which is the documented recovery, into "already handled".
+    deliveries = FakeDeliveryCollection()
+    assert claim_delivery(deliveries, "abc", WHEN) is True
+
+    release_delivery(deliveries, "abc")
+
+    assert claim_delivery(deliveries, "abc", WHEN) is True
+
+
+def test_releasing_one_delivery_leaves_the_others_claimed():
+    deliveries = FakeDeliveryCollection()
+    claim_delivery(deliveries, "abc", WHEN)
+    claim_delivery(deliveries, "def", WHEN)
+
+    release_delivery(deliveries, "abc")
+
+    assert claim_delivery(deliveries, "def", WHEN) is False
+    assert claim_delivery(deliveries, "abc", WHEN) is True
+
+
+def test_releasing_a_delivery_nobody_claimed_does_nothing():
+    # The caller releases on a failure path and cannot always know which
+    # side of the claim it failed on.
+    deliveries = FakeDeliveryCollection()
+    release_delivery(deliveries, "never-seen")
+    assert deliveries.documents == []
+
+
+def test_a_delivery_id_is_released_as_the_string_it_was_claimed_as():
+    # Both ends normalise here rather than at the call site, so the
+    # release names the row the claim wrote whatever the caller holds.
+    deliveries = FakeDeliveryCollection()
+    claim_delivery(deliveries, 17, WHEN)
+
+    release_delivery(deliveries, "17")
+
+    assert deliveries.documents == []
 
 
 def test_a_delivery_id_is_stored_as_a_string():
@@ -536,11 +915,65 @@ class RecordingCollection(FakeCollection):
         return kwargs.get("name")
 
 
+class UnpurgeableCollection(RecordingCollection):
+    """A collection the credential purge is not allowed to write to."""
+
+    def update_many(self, query, update):
+        raise PyMongoError("not authorized on starguard to execute update")
+
+
 class RacingCollection(FakeCollection):
     """A collection that loses the race to a concurrent link."""
 
     def update_one(self, query, update, upsert=False):
         raise DuplicateKeyError("github_id_unique")
+
+
+class InterleavingCollection(FakeCollection):
+    """A collection that lets one writer run inside another.
+
+    Two deliveries for the same account racing each other is not a thing
+    to hope a test reproduces. The hook runs once, immediately before a
+    chosen write statement, which is the point the losing writer used to
+    have already decided what it was going to write.
+
+    The position is counted from the moment the hook is registered rather
+    than from the start of the test, because setting the row up takes
+    writes of its own. ``link_account`` is up to three statements: the
+    account-change write, which matches nothing unless the GitHub account
+    really changed, then the upsert, then the guarded star write. So the
+    statement a test means is worth counting out rather than assuming,
+    and a position that silently slides onto a neighbour is why each of
+    these says which write it is waiting for.
+    """
+
+    def __init__(self, documents=None):
+        super().__init__(documents)
+        self._hook = None
+        self._at = 1
+        self._writes = 0
+
+    def before_first_write(self, hook):
+        self.before_write(1, hook)
+
+    def before_write(self, position, hook):
+        self._at, self._hook, self._writes = position, hook, 0
+
+    def _run_hook(self):
+        # The hook writes too, and those writes count here as well; it is
+        # cleared before it runs, so it cannot fire inside itself.
+        self._writes += 1
+        if self._hook is not None and self._writes == self._at:
+            hook, self._hook = self._hook, None
+            hook()
+
+    def update_one(self, query, update, upsert=False):
+        self._run_hook()
+        return super().update_one(query, update, upsert)
+
+    def find_one_and_update(self, query, update, projection=None, return_document=None):
+        self._run_hook()
+        return super().find_one_and_update(query, update, projection, return_document)
 
 
 class FakeDeliveryCollection(FakeCollection):
@@ -551,6 +984,13 @@ class FakeDeliveryCollection(FakeCollection):
             raise DuplicateKeyError("delivery_id_unique")
         self.documents.append(dict(document))
 
+    def delete_one(self, query):
+        for index, document in enumerate(self.documents):
+            if matches(document, query):
+                del self.documents[index]
+                return None
+        return None
+
 
 class FakeDatabase(dict):
     """Enough of a pymongo database to walk to a collection by name."""
@@ -560,8 +1000,8 @@ class FakeDatabase(dict):
         return created
 
 
-def mongo_factory(collection):
-    """A client_factory that hands connect() the collection given here."""
+def mongo_factory(collection, deliveries=None):
+    """A client_factory that hands connect() the collections given here."""
 
     class FakeMongoClient:
         """Enough of a MongoClient for connect() to walk to a collection."""
@@ -570,6 +1010,8 @@ def mongo_factory(collection):
             self.host = host
             self.database_name = None
             self.database = FakeDatabase({COLLECTION_NAME: collection})
+            if deliveries is not None:
+                self.database[DELIVERY_COLLECTION_NAME] = deliveries
 
         def get_database(self, name):
             self.database_name = name
@@ -636,6 +1078,143 @@ def test_a_database_that_refuses_the_preparation_still_yields_a_collection(caplo
 
     assert users is collection
     assert "not primary" in caplog.text
+
+
+def legacy_row_holding_a_token():
+    """One row from the version that stored OAuth tokens in clear text."""
+    return {
+        "_id": "row-1",
+        "discord_id": "1",
+        "github_username": "OldUser",
+        "github_token": {"access_token": "gho_leaked", "scope": "repo"},
+    }
+
+
+def test_an_index_that_cannot_be_created_does_not_skip_the_purge(caplog):
+    # The pairing that makes this more than bookkeeping. A collection
+    # carrying rows from the version that keyed on the GitHub email holds
+    # several rows per Discord account, so the unique discord_id index is
+    # exactly what fails, on exactly the upgrade that also has to delete
+    # that version's stored tokens. One shared try meant the index error
+    # skipped the purge and the tokens stayed in the database.
+    collection = RecordingCollection(
+        [legacy_row_holding_a_token()],
+        index_error=DuplicateKeyError("discord_id_unique"),
+    )
+
+    with caplog.at_level("WARNING", logger="common.storage"):
+        connect("mongodb://db/", "starguard", mongo_factory(collection))
+
+    assert "github_token" not in collection.documents[0]
+    assert collection.documents[0]["schema_version"] == SCHEMA_VERSION
+    # And the operator is told which step it was, rather than that
+    # something about the collection did not work.
+    assert "index the users collection" in caplog.text
+
+
+def test_a_delivery_index_that_cannot_be_created_does_not_skip_the_purge(caplog):
+    # The deliveries collection is new in this version, so the permission
+    # to create it is the one an upgraded deployment is most likely to be
+    # missing. Preparing it must not cost the users collection the
+    # maintenance the upgrade is for.
+    collection = RecordingCollection([legacy_row_holding_a_token()])
+    deliveries = RecordingCollection(index_error=PyMongoError("not authorized"))
+
+    with caplog.at_level("WARNING", logger="common.storage"):
+        connect("mongodb://db/", "starguard", mongo_factory(collection, deliveries))
+
+    assert "discord_id_unique" in collection.indexes
+    assert "github_token" not in collection.documents[0]
+    assert collection.documents[0]["schema_version"] == SCHEMA_VERSION
+    assert "index the deliveries collection" in caplog.text
+
+
+class TimeoutObservingDatabase:
+    """A database that records the deadline in force when it is asked."""
+
+    def __init__(self):
+        self.timeout_in_force = "not asked"
+
+    def command(self, name):
+        """Report the client-side operation timeout this call runs under."""
+        # Reading the deadline rather than asserting the constant is what
+        # makes this test say anything: a ping that dropped the bound would
+        # still call command("ping") with the right name, and a test that
+        # only checked PING_TIMEOUT_SECONDS would pass against code that
+        # never applied it.
+        self.timeout_in_force = _csot.get_timeout()
+        return {"ok": 1.0}
+
+
+class ProbedCollection(RecordingCollection):
+    """A collection whose database reports the deadline the probe set."""
+
+    def __init__(self):
+        super().__init__()
+        self.database = TimeoutObservingDatabase()
+
+
+def test_the_health_probe_is_bounded_well_under_the_drivers_default():
+    # /healthz is unauthenticated and this is the only route that waits on
+    # the database before answering. At the driver's default deadline of
+    # thirty seconds, anyone could hold one of waitress's four threads for
+    # half a minute per request by asking whether the service is well.
+    collection = ProbedCollection()
+
+    ping(collection)
+
+    assert collection.database.timeout_in_force == PING_TIMEOUT_SECONDS
+    assert PING_TIMEOUT_SECONDS < 30
+
+
+def test_the_probes_bound_does_not_leak_into_later_work():
+    # The deadline is set on a context variable, so a bound left standing
+    # would apply to whatever the worker did next. A sweep page or a link
+    # write taking longer than a health probe is allowed to is normal.
+    ping(ProbedCollection())
+
+    assert _csot.get_timeout() is None
+
+
+def test_an_unreachable_database_stops_after_the_first_preparation(caplog):
+    # The limit on the isolation above. Each preparation waits for the
+    # driver's whole server-selection deadline before it gives up, so
+    # attempting all four against a database that is not there costs four
+    # of those waits, in a process that is not listening yet. The bot's
+    # Compose health check allows sixty seconds for startup and the default
+    # deadline is thirty, so carrying on turns a database that is briefly
+    # away into a container the health check kills.
+    collection = RecordingCollection(
+        [legacy_row_holding_a_token()],
+        index_error=ServerSelectionTimeoutError("no replica set members available"),
+    )
+
+    with caplog.at_level("WARNING", logger="common.storage"):
+        _, users = connect("mongodb://db/", "starguard", mongo_factory(collection))
+
+    # Still a usable collection: an unreachable database at startup is not
+    # a reason to refuse to start, only a reason to stop asking.
+    assert users is collection
+    # Nothing after the first preparation was attempted, so the row is
+    # untouched rather than half-prepared.
+    assert "github_token" in collection.documents[0]
+    assert "schema_version" not in collection.documents[0]
+    assert "database is unreachable" in caplog.text
+    # And the log names the step that established it, not just the failure.
+    assert "index the users collection" in caplog.text
+    assert "purge credentials written by older versions" not in caplog.text
+
+
+def test_a_purge_that_cannot_run_does_not_skip_the_upgrade(caplog):
+    # The general property, rather than the two pairs above: every step
+    # is attempted, whichever of them the database refuses.
+    collection = UnpurgeableCollection([{"_id": "row-1", "discord_id": "1"}])
+
+    with caplog.at_level("WARNING", logger="common.storage"):
+        connect("mongodb://db/", "starguard", mongo_factory(collection))
+
+    assert collection.documents[0]["schema_version"] == SCHEMA_VERSION
+    assert "purge credentials written by older versions" in caplog.text
 
 
 def test_losing_the_race_to_link_a_github_account_is_not_a_crash():

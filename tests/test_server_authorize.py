@@ -14,14 +14,21 @@ test_storage, so nothing here reaches GitHub or MongoDB.
 # deliberately mirror signatures they do not use.
 # pylint: disable=missing-function-docstring,unused-argument
 
+import time
 from collections import namedtuple
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from authlib.integrations.flask_client import OAuthError
 from pymongo.errors import PyMongoError
+from requests.exceptions import ConnectionError as RequestsConnectionError
+from requests.exceptions import ConnectTimeout, ReadTimeout
 
+from common.storage import STAR_SOURCE_WEBHOOK, link_account, record_star_event
+from common.storage_errors import StorageError
 from server import messages
 from server.server import ServerContext, connect_users, create_app, main
+from server.webhooks import MAX_REQUEST_BODY_BYTES
 from tests.test_server_routes import ENVIRONMENT, make_config
 from tests.test_storage import FakeCollection
 
@@ -60,7 +67,7 @@ class FakeGitHub:
     exception to raise instead.
     """
 
-    def __init__(self, token=_DEFAULT, responses=None, token_error=None):
+    def __init__(self, token=_DEFAULT, responses=None, token_error=None, delay=0.0, during=None):
         self.token = ACCESS_TOKEN if token is _DEFAULT else token
         self.token_error = token_error
         self.responses = responses or {
@@ -68,6 +75,14 @@ class FakeGitHub:
             STARRED_PATH: FakeApiResponse(status_code=STARRED),
         }
         self.requests = []
+        # ``delay`` puts a measurable gap between the question and the
+        # answer, so a test can tell which side of the call an instant was
+        # taken on. ``answered`` is when each reply came back. ``during``
+        # runs while the call is in flight, which is how a test makes a
+        # webhook land in the middle of the OAuth flow.
+        self.delay = delay
+        self.during = during
+        self.answered = []
 
     def authorize_access_token(self):
         if self.token_error is not None:
@@ -79,7 +94,38 @@ class FakeGitHub:
         result = self.responses[path]
         if isinstance(result, Exception):
             raise result
+        if self.delay:
+            time.sleep(self.delay)
+        self.answered.append(datetime.now(UTC))
+        if self.during is not None:
+            self.during(path)
         return result
+
+
+class FakeDatabase:
+    """The one call the health probe makes, and whether it answers.
+
+    /healthz pings rather than trusting the handle, because pymongo connects
+    lazily: a collection object exists whether or not MongoDB is reachable.
+    """
+
+    def __init__(self, error=None):
+        self.error = error
+        self.commands = []
+
+    def command(self, name):
+        self.commands.append(name)
+        if self.error is not None:
+            raise self.error
+        return {"ok": 1.0}
+
+
+class ProbeableCollection(FakeCollection):
+    """A collection whose database answers the probe, or refuses to."""
+
+    def __init__(self, documents=None, error=None):
+        super().__init__(documents)
+        self.database = FakeDatabase(error)
 
 
 class ExplodingCollection(FakeCollection):
@@ -176,6 +222,116 @@ def test_a_visitor_who_has_not_starred_is_told_which_repository_to_star():
     assert stored(flow)["starred_repo"] is False
 
 
+def test_the_star_check_instant_predates_the_answer_and_reaches_link_account(monkeypatch):
+    # link_account refuses to write over a star event newer than the
+    # horizon it is given, so the horizon has to be the caller's and it has
+    # to predate the answer: a webhook that lands while GitHub is being
+    # asked should win. Left out, the horizon would be link_account's own
+    # clock, later than the answer by the length of the OAuth exchange.
+    seen = {}
+
+    def spy(collection, **kwargs):
+        seen.update(kwargs)
+        return link_account(collection, **kwargs)
+
+    monkeypatch.setattr("server.server.link_account", spy)
+
+    flow = build(github=FakeGitHub(delay=0.002))
+    before = datetime.now(UTC)
+    assert authorize(flow).status_code == 200
+
+    assert before <= seen["observed_at"] < flow.github.answered[-1]
+
+
+def test_an_unstar_that_lands_during_the_flow_is_not_written_back():
+    # The interleaving the P1 is about, driven rather than simulated. The
+    # visitor re-verifies, GitHub answers that they star the repository,
+    # and while that answer is in flight an un-star webhook records the
+    # opposite and raises the flag for it. The old single write put the
+    # stale True back while deliberately leaving the flag up, so the drain
+    # read the restored value off the row, reconciled the role to it and
+    # lowered the flag, and the un-star was lost until the next sweep.
+    flow = build()
+    assert authorize(flow).status_code == 200
+    assert stored(flow)["starred_repo"] is True
+
+    def unstar_arrives(path):
+        if path != STARRED_PATH:
+            return
+        record_star_event(
+            flow.users,
+            github_id=PROFILE["id"],
+            starred=False,
+            source=STAR_SOURCE_WEBHOOK,
+            occurred_at=datetime.now(UTC),
+        )
+        # The rest of the OAuth request, from GitHub's answer to the write
+        # reaching the database. This is the window link_account's own
+        # clock cannot see, and the whole reason the caller has to hand it
+        # the instant it asked at: without that, the horizon is taken here,
+        # after the webhook, and the stale True is written.
+        time.sleep(0.005)
+
+    flow.github.during = unstar_arrives
+    response = authorize(flow)
+
+    row = stored(flow)
+    assert row["starred_repo"] is False
+    # The flag the webhook raised is still up for the drain to act on.
+    assert row["role_sync_pending"] is True
+    assert b"you have not starred owner/repo yet" in response.data
+
+
+def test_a_star_a_newer_event_contradicts_is_neither_written_nor_announced():
+    # /authorize reads starred, a webhook records the un-star while the
+    # OAuth exchange is still running, and the old single write put the
+    # stale True back while leaving the flag that event raised up, so the
+    # drain handed the role back. link_account now refuses that write and
+    # returns what the row holds; the page has to follow the row, because
+    # sending somebody off to claim a role the database will not give them
+    # is worse than telling them to star.
+    flow = build()
+    assert authorize(flow).status_code == 200
+
+    row = stored(flow)
+    row["starred_repo"] = False
+    row["star_event_at"] = datetime.now(UTC) + timedelta(hours=1)
+
+    response = authorize(flow)
+    assert response.status_code == 200
+    assert b"you have not starred owner/repo yet" in response.data
+    assert stored(flow)["starred_repo"] is False
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 500, 502, 301])
+def test_a_star_check_github_could_not_answer_is_not_an_absent_star(status):
+    # Only 404 means unstarred. Reading a 401, a 429 or a 5xx as "no" wrote
+    # starred_repo=False over a link that was true and sent the visitor off
+    # to star a repository they had already starred.
+    flow = build()
+    flow.github.responses[STARRED_PATH] = FakeApiResponse(status_code=status)
+
+    response = authorize(flow)
+    assert response.status_code == 502
+    assert messages.PROFILE_UNREADABLE.encode() in response.data
+    # Nothing was recorded, so a link that already said starred survives.
+    assert flow.users.documents == []
+
+
+def test_the_page_for_an_unstarred_visitor_asks_them_to_sign_in_again():
+    # The claim button answers from the star state recorded here, and
+    # nothing turns a recorded false back into true on its own: the
+    # periodic check only ever records an un-star, and the webhook that
+    # would record the star is optional. "Star it, then claim" was advice
+    # that failed for precisely the person who followed it.
+    flow = build()
+    flow.github.responses[STARRED_PATH] = FakeApiResponse(status_code=NOT_STARRED)
+
+    page = authorize(flow).data
+    assert b"run /verify in Discord again" in page
+    assert stored(flow)["starred_repo"] is False
+
+
 def test_a_callback_without_a_session_never_reaches_github():
     flow = build()
     response = flow.client.get("/authorize?code=abc&state=xyz")
@@ -245,6 +401,17 @@ def test_an_empty_token_is_a_failed_sign_in(token):
             "user": FakeApiResponse(payload=dict(PROFILE)),
             STARRED_PATH: OAuthError(error="server_error", description="502"),
         },
+        # GitHub did not answer in time. Only reachable since client_kwargs
+        # began passing default_timeout: without it the call hung rather
+        # than raising, so this escaped as a 500 the first time a request
+        # actually timed out.
+        {"user": ReadTimeout("read timed out")},
+        # And the star check on the far side of a connection that dropped
+        # between the two calls.
+        {
+            "user": FakeApiResponse(payload=dict(PROFILE)),
+            STARRED_PATH: RequestsConnectionError("connection aborted"),
+        },
     ],
 )
 def test_an_unreadable_profile_is_a_bad_gateway(responses):
@@ -253,6 +420,20 @@ def test_an_unreadable_profile_is_a_bad_gateway(responses):
 
     assert response.status_code == 502
     assert messages.PROFILE_UNREADABLE.encode() in response.data
+    assert flow.users.documents == []
+
+
+def test_a_token_exchange_that_times_out_is_a_bad_gateway():
+    # The exchange reaches GitHub over the same session as the reads above
+    # and can time out the same way, but it sits in its own try that only
+    # knew about OAuthError. A timeout there is not a refused sign-in: the
+    # member did nothing wrong, so they are not told their sign-in failed.
+    flow = build(github=FakeGitHub(token_error=ConnectTimeout("connect timed out")))
+    response = authorize(flow)
+
+    assert response.status_code == 502
+    assert messages.PROFILE_UNREADABLE.encode() in response.data
+    assert messages.SIGN_IN_FAILED.encode() not in response.data
     assert flow.users.documents == []
 
 
@@ -306,10 +487,30 @@ def test_the_page_announces_failure_more_loudly_than_success(status, role, label
 
 
 def test_healthz_is_ok_once_the_database_is_reachable():
-    flow = build()
+    users = ProbeableCollection()
+    flow = build(users=users)
     response = flow.client.get("/healthz")
     assert response.status_code == 200
     assert response.get_json() == {"status": "ok"}
+    # It really asked the server, rather than reporting on the handle.
+    assert users.database.commands == ["ping"]
+
+
+def test_healthz_reports_a_database_that_has_stopped_answering(caplog):
+    # connect() logs a failed preparation and returns the handle anyway, and
+    # pymongo connects lazily, so a non-None collection says nothing about
+    # whether MongoDB is up. Without a real command this endpoint answered
+    # 200 straight through an outage and the compose healthcheck kept the
+    # container in service while every link attempt failed.
+    users = ProbeableCollection(error=PyMongoError("no primary available"))
+    flow = build(users=users)
+
+    with caplog.at_level("ERROR", logger="starguard.server"):
+        response = flow.client.get("/healthz")
+
+    assert response.status_code == 503
+    assert response.get_json() == {"status": "degraded", "database": "unavailable"}
+    assert "no primary available" in caplog.text
 
 
 def test_connect_users_returns_the_collection(monkeypatch):
@@ -323,7 +524,7 @@ def test_an_unreachable_database_leaves_the_server_running(monkeypatch, caplog):
     # A degraded /healthz and a clear message beat a process that will not
     # start, because the OAuth flow is the only thing that needs the database.
     def refuse(host, database, factory):
-        raise PyMongoError("no route to host")
+        raise StorageError("no route to host")
 
     monkeypatch.setattr("server.server.connect", refuse)
     with caplog.at_level("ERROR", logger="starguard.server"):
@@ -357,3 +558,9 @@ def test_main_serves_the_application_with_waitress(monkeypatch):
     assert served["app"][0] == "app"
     assert served["port"] == 5055
     assert served["host"] == "0.0.0.0"
+    # The same bound as MAX_CONTENT_LENGTH, and it has to be given twice:
+    # Flask checks once the request reaches the application, by which time
+    # waitress has already spooled the body under its own one gibibyte
+    # default. The webhook route is public and deliberately not rate
+    # limited, and a body this bounds is the stated reason that is safe.
+    assert served["max_request_body_size"] == MAX_REQUEST_BODY_BYTES

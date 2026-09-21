@@ -21,6 +21,7 @@ LICENSE
 
 # Tests and dev tooling, not needed inside the images
 tests/
+e2e/
 .pytest_cache/
 .coverage
 .coverage.*
@@ -31,6 +32,13 @@ pytest.ini
 .pylintrc
 pyproject.toml
 requirements-dev.txt
+.hadolint.yaml
+
+# Release bookkeeping. release-please maintains these on main; nothing in
+# either image reads them.
+version.txt
+release-please-config.json
+.release-please-manifest.json
 
 # Compose and Docker files themselves
 docker-compose*.yml

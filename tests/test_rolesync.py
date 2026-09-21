@@ -21,9 +21,11 @@ from interactions.client.errors import Forbidden
 from pymongo.errors import PyMongoError
 
 from bot.bot import create_client
+from bot.memberlock import MemberLocks
 from bot.rolesync import DRAIN_ERROR_BACKOFF_MAX_SECONDS, DrainResult, RoleSyncDrainer
 from bot.starcheck import StarChecker
 from common.storage import STAR_SOURCE_WEBHOOK, record_star_event
+from common.storage_errors import StorageError, StorageUnavailableError
 from tests.test_roles import discord_error
 from tests.test_starcheck import (
     GUILD_ID,
@@ -33,12 +35,11 @@ from tests.test_starcheck import (
     FakeGuild,
     FakeMember,
     FakeUsers,
-    account_id,
-    drive_loop,
     link,
     listing,
     make_config,
 )
+from tests.test_starcheck_loop import drive_loop
 
 
 class RecordingUsers(FakeUsers):
@@ -89,20 +90,57 @@ class ExplodingGuild(FakeGuild):
 
 
 def pending(discord_id, starred, username="Someone"):
-    """A link the server has queued for the bot to act on."""
+    """A link the server has queued for the bot to act on.
+
+    It carries an ``_id`` because the pending cursor is the one that keeps
+    it. For a row with no usable ``discord_id`` that is the only identity
+    the drain has to clear the flag by, so a fake without one would let
+    the clear be deleted with the suite still green.
+    """
     return {
+        "_id": f"oid-{discord_id}",
         **link(discord_id, username, starred=starred),
         "role_sync_pending": True,
         "star_source": "webhook",
     }
 
 
-def build(documents, holds=(), members=None, guild=None, **config_overrides):
+# Every shape a queued row with no usable Discord ID comes in.
+#
+# ``null`` is the one production actually holds. From b715c73 (October
+# 2023) until the rebuild, /login read the Discord ID from an unvalidated
+# query parameter and stored whatever came back, so an unauthenticated GET
+# with no id, followed by OAuth, wrote ``discord_id: None``. That is nearly
+# three years of releases and nothing ever backfilled them.
+#
+# ``missing`` was only producible for about a day in the same month, and
+# ``empty`` is the one the original bug hid behind: it round-trips through
+# str() and so matched the Discord-keyed clear that the other two do not.
+NO_DISCORD_ID = ("null", "missing", "empty")
+
+
+def unusable(spelling, discord_id=1, starred=False):
+    """A queued row carrying no Discord ID, in one of the three shapes."""
+    document = pending(discord_id, starred)
+    if spelling == "missing":
+        del document["discord_id"]
+    else:
+        document["discord_id"] = None if spelling == "null" else ""
+    return document
+
+
+def build(documents, holds=(), members=None, guild=None, member_locks=None, **config_overrides):
     """Wire a drainer up to fakes. Returns (drainer, members, channel, users).
 
     ``holds`` names the Discord IDs that already have the role, which is
     the other half of every case here: the drain's job is the difference
     between what the row says and what Discord says.
+
+    ``member_locks`` is the registry the drain takes a member's mutex from.
+    A private one is right for a drain on its own; the tests that run a
+    drain against a sweep or a claim pass the registry they share, because
+    three private registries would be three sets of mutexes and no
+    exclusion at all.
     """
     if members is None:
         held = {str(one) for one in holds}
@@ -118,7 +156,12 @@ def build(documents, holds=(), members=None, guild=None, **config_overrides):
     channel = FakeChannel()
     users = RecordingUsers(documents)
     client = FakeClient(FakeGuild(members) if guild is None else guild, channel)
-    drainer = RoleSyncDrainer(client, make_config(**config_overrides), users, asyncio.Lock())
+    drainer = RoleSyncDrainer(
+        client,
+        make_config(**config_overrides),
+        users,
+        MemberLocks() if member_locks is None else member_locks,
+    )
     return drainer, members, channel, users
 
 
@@ -241,7 +284,7 @@ def test_a_webhook_landing_mid_call_is_not_unqueued_by_the_clear():
     members = {"1": InterruptedMember("1", roles=())}
     channel = FakeChannel()
     client = FakeClient(FakeGuild(members), channel)
-    drainer = RoleSyncDrainer(client, make_config(), users, asyncio.Lock())
+    drainer = RoleSyncDrainer(client, make_config(), users, MemberLocks())
 
     async def two_polls():
         return await drainer.drain_once(), await drainer.drain_once()
@@ -257,6 +300,48 @@ def test_a_webhook_landing_mid_call_is_not_unqueued_by_the_clear():
     assert members["1"].roles == set()
     assert users.documents[0]["role_sync_pending"] is False
     assert len(channel.sent) == 1
+
+
+def test_a_re_star_while_the_role_is_being_taken_gets_no_public_farewell():
+    # The sibling of the case above on the other side of the row. The
+    # removal succeeds, and before the clear runs a webhook records the
+    # re-star and raises the flag again, so the conditional clear matches
+    # nothing and the newer grant is still queued. That much already
+    # worked. What did not is that the farewell went out anyway: the next
+    # poll hands the role straight back, and "sorry to see you go" stays
+    # in the channel for somebody who stars the repository.
+    documents = [pending(1, False)]
+    users = RecordingUsers(documents)
+
+    class InterruptedMember(FakeMember):
+        """A member whose row a webhook rewrites while the call is in flight."""
+
+        async def remove_role(self, role_id, reason=None):
+            await super().remove_role(role_id, reason)
+            # What record_star_event writes in that window: the star is
+            # back, and the flag that was already up stays up.
+            users.documents[0].update(starred_repo=True, role_sync_pending=True)
+
+    members = {"1": InterruptedMember("1", roles=(ROLE_ID,))}
+    channel = FakeChannel()
+    client = FakeClient(FakeGuild(members), channel)
+    drainer = RoleSyncDrainer(client, make_config(), users, MemberLocks())
+
+    async def two_polls():
+        return await drainer.drain_once(), await drainer.drain_once()
+
+    first, second = asyncio.run(two_polls())
+
+    # The role really was taken, so the pass reports it. What it does not
+    # do is say so in public, because it is about to be given back.
+    assert first == DrainResult(examined=1, removed=1)
+    assert not channel.sent
+    # The flag stayed up, so the next poll acts on the newer value.
+    assert second == DrainResult(examined=1, granted=1)
+    assert members["1"].roles == {ROLE_ID}
+    assert users.documents[0]["role_sync_pending"] is False
+    # And still nothing was announced, about either half of it.
+    assert not channel.sent
 
 
 def test_one_unusable_row_does_not_strand_the_rest_of_the_queue(caplog):
@@ -275,19 +360,81 @@ def test_one_unusable_row_does_not_strand_the_rest_of_the_queue(caplog):
     assert "member cache is confused" in caplog.text
 
 
-def test_a_row_with_no_discord_id_is_dropped_rather_than_read_forever(caplog):
-    # Only rows written by the oldest version, keyed on a GitHub email, can
-    # look like this. There is nobody to move a role for, and leaving the
-    # flag up would put this row in front of the drain on every poll.
-    document = {**pending(1, False), "discord_id": ""}
+@pytest.mark.parametrize("spelling", NO_DISCORD_ID)
+def test_a_row_with_no_discord_id_is_cleared_by_its_mongo_id(caplog, spelling):
+    # There is nobody to move a role for, and the clear this used to issue
+    # was keyed on the very field the row does not have: a null or absent
+    # `discord_id` was searched for as the literal string "None", which
+    # matched nothing, so the flag stayed raised and the row came back on
+    # the next poll, and the next, with the same line claiming it had been
+    # dropped every thirty seconds for as long as the bot ran. The
+    # empty-string spelling happened to match, which is why a passing test
+    # did not catch it. All three take the by-id path now.
+    document = unusable(spelling)
     drainer, _, channel, users = build([document])
 
-    with caplog.at_level("WARNING", logger="starguard.bot"):
-        assert asyncio.run(drainer.drain_once()) == DrainResult(examined=1, failed=1)
+    async def two_polls():
+        return [await drainer.drain_once() for _ in range(2)]
 
+    with caplog.at_level("WARNING", logger="starguard.bot"):
+        results = asyncio.run(two_polls())
+
+    # The flag really comes down, so the second poll reads an empty queue
+    # rather than the same row again.
     assert users.documents[0]["role_sync_pending"] is False
+    assert results == [DrainResult(examined=1, unusable=1), DrainResult()]
+    # Cleared by the Mongo _id, unconditionally. Naming the star state
+    # here would be a second way to match nothing, not a safeguard.
+    assert users.writes == [({"_id": "oid-1"}, {"$set": {"role_sync_pending": False}})]
+    # Counted apart from a failure, so a row nothing can act on does not
+    # put the drain into the backoff a Discord refusal earns.
+    assert drainer._consecutive_failures == 0
     assert not channel.sent
-    assert "no Discord ID" in caplog.text
+    # Said out loud, once, with enough to find the row again by hand: this
+    # deletes queued work, and a silent delete is the worse failure.
+    assert caplog.text.count("no Discord ID") == 1
+    assert "clearing it" in caplog.text
+    assert "oid-1" in caplog.text
+
+
+@pytest.mark.parametrize("spelling", NO_DISCORD_ID)
+def test_an_unusable_row_does_not_stop_the_rest_of_the_queue(caplog, spelling):
+    # The counterpart to the test above: clearing the row is only the right
+    # answer if everything behind it still moves.
+    row = unusable(spelling, starred=True)
+    drainer, members, _, users = build([row, pending(2, True, username="Other")])
+
+    with caplog.at_level("WARNING", logger="starguard.bot"):
+        result = asyncio.run(drainer.drain_once())
+
+    assert result == DrainResult(examined=2, granted=1, unusable=1)
+    assert members["2"].roles == {ROLE_ID}
+    assert users.documents[0]["role_sync_pending"] is False
+    assert users.documents[1]["role_sync_pending"] is False
+    # Pinned to the by-id filter, not just to the flag coming down. The
+    # empty-string spelling is the one the Discord-keyed clear reaches on
+    # its own, so a test that only checks the queue emptied would pass for
+    # it with the fix removed, and that parameter would be decoration.
+    assert ({"_id": "oid-1"}, {"$set": {"role_sync_pending": False}}) in users.writes
+
+
+@pytest.mark.parametrize("spelling", NO_DISCORD_ID)
+def test_a_failed_clear_of_an_unusable_row_is_logged_not_raised(caplog, spelling):
+    # The same shrug as an ordinary clear that fails. Nothing was going to
+    # happen to this row in any case, so the cost of the failure is the
+    # same line again on the next poll, not a traceback out of the drain.
+    drainer, _, _, users = build([unusable(spelling, starred=True)])
+
+    def refuse(query, update, upsert=False):
+        raise PyMongoError("no primary available")
+
+    users.update_one = refuse
+
+    with caplog.at_level("ERROR", logger="starguard.bot"):
+        assert asyncio.run(drainer.drain_once()) == DrainResult(examined=1, unusable=1)
+
+    assert "Could not clear the unusable pending role sync" in caplog.text
+    assert "no primary available" in caplog.text
 
 
 def test_a_clear_that_fails_does_not_undo_the_role_change(caplog):
@@ -326,6 +473,12 @@ def test_no_database_connection_is_skipped_rather_than_crashing(caplog):
         assert asyncio.run(drainer.drain_once()) == DrainResult()
 
     assert "no database connection" in caplog.text
+    # And it is not progress. On a deployment with AUTOMATIC_CHECK=false
+    # this loop is the only one reconciling anything, so counting a pass
+    # that never reached the database would be the health endpoint
+    # answering 200 about a bot that does nothing. A connection made at
+    # startup is never remade, so this state lasts until a restart.
+    assert drainer.last_completed is None
 
 
 def test_a_guild_missing_from_the_cache_is_skipped():
@@ -334,6 +487,50 @@ def test_a_guild_missing_from_the_cache_is_skipped():
     assert asyncio.run(drainer.drain_once()) == DrainResult()
     assert members["1"].additions == 0
     assert not users.writes
+    # Nor is this, for the same reason: nothing was reconciled.
+    assert drainer.last_completed is None
+
+
+def test_a_pass_that_walked_the_queue_is_recorded_as_progress():
+    # The other side of the two above, and what the health endpoint reads
+    # off this loop. An empty queue counts: reading the partial index and
+    # finding nothing waiting is the drain working, not the drain stuck.
+    drainer, _, _, _ = build([])
+    assert drainer.last_completed is None
+
+    asyncio.run(drainer.drain_once())
+    idle = drainer.last_completed
+    assert idle is not None
+
+    drainer, members, _, _ = build([pending(1, True)])
+    asyncio.run(drainer.drain_once())
+    assert members["1"].roles == {ROLE_ID}
+    assert drainer.last_completed is not None
+
+
+def test_the_completion_time_is_only_set_once_a_pass_has_walked_the_queue():
+    # The health endpoint reports the age of this value, so a pass that
+    # never reconciled anything must not look like one that just did.
+    drainer, _, _, _ = build([pending(1, True)])
+    assert drainer.last_completed is None
+
+    asyncio.run(drainer.drain_once())
+    assert isinstance(drainer.last_completed, float)
+
+
+@pytest.mark.parametrize("skip", ["no database", "no guild"])
+def test_a_skipped_pass_does_not_count_as_a_completed_one(skip):
+    # Both early returns do no reconciling at all. Recording them as a
+    # completed pass is what let a drain-only deployment report itself
+    # healthy while moving no roles: the endpoint would see a fresh
+    # timestamp every thirty seconds for a loop that was doing nothing.
+    guild_id = GUILD_ID + 1 if skip == "no guild" else GUILD_ID
+    drainer, _, _, _ = build([pending(1, True)], guild_id=guild_id)
+    if skip == "no database":
+        drainer._users = None
+
+    assert asyncio.run(drainer.drain_once()) == DrainResult()
+    assert drainer.last_completed is None
 
 
 def test_the_loop_waits_the_configured_interval_between_drains(monkeypatch):
@@ -364,6 +561,32 @@ def test_a_failing_drain_is_logged_and_retried_rather_than_killing_the_loop(monk
     assert 22.5 <= delays[0] <= 37.5
     assert "Role sync drain failed" in caplog.text
     assert "no primary available" in caplog.text
+
+
+def test_a_pass_that_leaves_rows_queued_backs_off_like_a_failure(monkeypatch, caplog):
+    # A role above the bot's own in the hierarchy, or a missing permission,
+    # fails every row in the queue and fails it again on every pass. The
+    # loop used to call that a completed drain: the counter was reset, the
+    # ordinary interval was used, and the same refused requests went back
+    # out a few seconds later, forever, taking the shared lock off the
+    # sweep each time. Nothing about it recovers faster for being retried.
+    members = {"1": RefusingMember("1", roles=())}
+    drainer, _, _, users = build([pending(1, True)], members=members, role_sync_interval=30)
+
+    with caplog.at_level("WARNING", logger="starguard.bot"):
+        delays = drive_loop(monkeypatch, drainer, cycles=3)
+
+    assert drainer._consecutive_failures == 3
+    assert delays == sorted(delays)
+    assert 22.5 <= delays[0] <= 37.5
+    assert delays[-1] > delays[0]
+    # Still queued, which is the point: the row is retried, just not at
+    # the polling interval.
+    assert users.documents[0]["role_sync_pending"] is True
+    assert "left 1 row(s) queued" in caplog.text
+    # Nothing was raised, so nothing prints a traceback. A stack trace for
+    # a Discord refusal the row already logged is noise.
+    assert "Traceback" not in caplog.text
 
 
 def test_the_drain_backoff_tops_out_well_below_the_sweeps(monkeypatch):
@@ -414,8 +637,9 @@ def test_a_star_during_the_walk_survives_the_sweep_and_reaches_the_drain(monkeyp
         return listing()
 
     monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", star_during_the_walk)
-    checker = StarChecker(client, config, users)
-    drainer = RoleSyncDrainer(client, config, users, checker.lock)
+    member_locks = MemberLocks()
+    checker = StarChecker(client, config, users, member_locks)
+    drainer = RoleSyncDrainer(client, config, users, member_locks)
 
     async def sweep_then_drain():
         return await checker.run_once(), await drainer.drain_once()
@@ -472,8 +696,9 @@ def test_a_role_taken_on_stale_information_is_queued_and_put_back(monkeypatch):
     members["1"].remove_role = star_between_the_check_and_the_write
 
     monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", lambda *a, **k: listing())
-    checker = StarChecker(client, config, users)
-    drainer = RoleSyncDrainer(client, config, users, checker.lock)
+    member_locks = MemberLocks()
+    checker = StarChecker(client, config, users, member_locks)
+    drainer = RoleSyncDrainer(client, config, users, member_locks)
 
     async def sweep_then_drain():
         return await checker.run_once(), await drainer.drain_once()
@@ -548,58 +773,75 @@ def test_startup_with_the_drain_turned_off_starts_nothing(caplog):
     assert "ROLE_SYNC_ENABLED=false" in caplog.text
 
 
-def test_a_sweep_and_a_drain_never_act_at_the_same_time(monkeypatch):
-    # The two loops reach the same members and the same role. A lock of the
-    # drain's own would be no exclusion at all, which is why it is handed
-    # the checker's: two mutexes held independently let both loops into the
-    # same member at once, and the double role change is exactly what the
-    # checker's lock was added to stop.
-    depth = {"now": 0, "peak": 0}
+def test_an_outage_abandons_the_pass_instead_of_retrying_every_row():
+    # The drain's per-entry guard is the sweep's, and it had the same hole.
+    # An unreachable database is not one unusable row, it is every row left
+    # in the queue, and each pays the driver's whole server-selection
+    # deadline before saying so. Swallowed per row, a pass against a
+    # database that is gone spends batch-size times that reporting failures
+    # instead of backing off once.
+    drainer, _, _, users = build([pending("1", starred=True), pending("2", starred=True)])
+    reads = []
 
-    class TrackedMember(FakeMember):
-        """Counts how many role changes are in flight at once."""
+    def gone(query, projection=None):
+        reads.append(query)
+        raise StorageUnavailableError("no replica set members available")
 
-        async def _tracked(self, call):
-            depth["now"] += 1
-            depth["peak"] = max(depth["peak"], depth["now"])
-            try:
-                # Several yields, so anything free to interleave will.
-                for _ in range(3):
-                    await asyncio.sleep(0)
-                await call
-            finally:
-                depth["now"] -= 1
+    users.find_one = gone
 
-        async def add_role(self, role_id, reason=None):
-            await self._tracked(super().add_role(role_id, reason))
+    with pytest.raises(StorageUnavailableError):
+        asyncio.run(drainer.drain_once())
 
-        async def remove_role(self, role_id, reason=None):
-            await self._tracked(super().remove_role(role_id, reason))
+    # One row was attempted, not both, which is the whole point.
+    assert len(reads) == 1
 
-    # One member the sweep must strip, one the drain must grant, so both
-    # loops have real work and neither can finish without touching Discord.
-    documents = [link(1, "Gone"), pending(2, True, username="Kept")]
-    members = {"1": TrackedMember("1", roles=(ROLE_ID,)), "2": TrackedMember("2", roles=())}
-    channel = FakeChannel()
-    users = RecordingUsers(documents)
-    client = FakeClient(FakeGuild(members), channel)
-    config = make_config()
 
-    def fetch(owner, repo, token=None, cache=None):
-        return listing("kept", ids={account_id("Kept")})
+def test_a_row_the_database_refused_is_still_only_that_row():
+    # The pair, so the fix above cannot be satisfied by letting every
+    # StorageError out: a failure the database answered with still leaves
+    # the row flagged and the queue moving.
+    drainer, _, _, users = build([pending("1", starred=True), pending("2", starred=True)])
+    real = users.find_one
+    calls = []
 
-    monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", fetch)
-    checker = StarChecker(client, config, users)
-    drainer = RoleSyncDrainer(client, config, users, checker.lock)
+    def refuse_the_first(query, projection=None):
+        calls.append(query)
+        if len(calls) == 1:
+            raise StorageError("index not found")
+        return real(query, projection)
 
-    async def both():
-        return await asyncio.gather(checker.run_once(), drainer.drain_once())
+    users.find_one = refuse_the_first
 
-    removed, result = asyncio.run(both())
+    result = asyncio.run(drainer.drain_once())
 
-    assert depth["peak"] == 1
-    assert removed == ["user1"]
-    assert result == DrainResult(examined=1, granted=1)
-    assert members["1"].roles == set()
-    assert members["2"].roles == {ROLE_ID}
-    assert users.documents[1]["role_sync_pending"] is False
+    assert result.examined == 2
+    assert result.failed == 1
+
+
+def test_an_outage_clearing_an_unusable_row_abandons_the_pass():
+    # The unusable-row clear shrugs off a refusal, because nothing was
+    # going to happen to that row anyway. An outage is not a refusal: the
+    # rows behind it are all about to pay the same deadline.
+    drainer, _, _, users = build([unusable("", starred=True), pending("2", starred=True)])
+
+    def gone(query, update, upsert=False):
+        raise StorageUnavailableError("no primary available")
+
+    users.update_one = gone
+
+    with pytest.raises(StorageUnavailableError):
+        asyncio.run(drainer.drain_once())
+
+
+def test_an_outage_clearing_a_synced_row_abandons_the_pass():
+    # And the ordinary clear, which is the write every successful row ends
+    # on, so it is where an outage is likeliest to be met.
+    drainer, _, _, users = build([pending(1, True), pending(2, True)])
+
+    def gone(query, update, upsert=False):
+        raise StorageUnavailableError("no primary available")
+
+    users.update_one = gone
+
+    with pytest.raises(StorageUnavailableError):
+        asyncio.run(drainer.drain_once())

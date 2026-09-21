@@ -26,6 +26,7 @@ from datetime import datetime
 
 import pytest
 
+from bot.memberlock import MemberLocks
 from bot.starcheck import StarChecker
 from common.storage import SCHEMA_VERSION, all_links, connect, find_link
 from server.server import ServerContext, create_app
@@ -109,7 +110,9 @@ def run_the_star_check(monkeypatch, users, stargazers, member, stargazer_ids=())
     monkeypatch.setattr("bot.starcheck.fetch_stargazer_listing", fetch)
     channel = FakeChannel()
     client = FakeClient(FakeGuild({member.id: member}), channel)
-    checker = StarChecker(client, make_bot_config(), users)
+    # A registry of its own, because nothing else in this test is holding a
+    # member lock; the seam under test is the document, not the exclusion.
+    checker = StarChecker(client, make_bot_config(), users, MemberLocks())
     return asyncio.run(checker.run_once()), channel
 
 

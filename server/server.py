@@ -19,18 +19,20 @@ import logging
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Final, Literal, Protocol, TypedDict
 
 from authlib.integrations.flask_client import OAuth, OAuthError
 from dotenv import load_dotenv
 from flask import Flask, Response, current_app, render_template, request, session, url_for
 from pymongo import MongoClient
-from pymongo.errors import PyMongoError
+from requests.exceptions import RequestException
 from waitress import serve
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.wrappers import Response as WerkzeugResponse
 
 from common.config import ConfigError
+from common.github_api import REQUEST_TIMEOUT
 from common.linktoken import LinkTokenError, read_link_token
 from common.logging_setup import configure_logging
 from common.ratelimit import RateLimiter
@@ -39,7 +41,9 @@ from common.storage import (
     UserCollection,
     connect,
     link_account,
+    ping,
 )
+from common.storage_errors import StorageError
 from server import messages
 from server.config import ServerConfig, load_server_config
 from server.security import install_security
@@ -53,8 +57,10 @@ log = logging.getLogger("starguard.server")
 # what a Discord role bot needs, and a serious thing to ask of a visitor.
 GITHUB_OAUTH_SCOPE: Final = "read:user"
 
-# GitHub answers "is this repo starred by me" with 204 (yes) or 404 (no).
+# GitHub answers "is this repo starred by me" with 204 (yes) or 404 (no),
+# and with nothing else; see _read_star_check.
 STARRED_STATUS: Final = 204
+NOT_STARRED_STATUS: Final = 404
 
 RATE_LIMITED_ENDPOINTS: Final[tuple[str, ...]] = ("login", "authorize")
 
@@ -164,6 +170,23 @@ def login() -> WerkzeugResponse:
     return context.github.authorize_redirect(redirect_uri)
 
 
+def _read_star_check(status: int) -> bool:
+    """Turn the starred endpoint's status into an answer, or refuse to guess.
+
+    There are two answers and everything else is GitHub failing to give one.
+    This used to read any status other than 204 as "not starred", so a 401,
+    a 403, a 429 or a 5xx during an outage wrote ``starred_repo=False`` over
+    a link that was true and sent the visitor off to star a repository they
+    had already starred. ValueError so the caller reports it as the
+    unreadable reply it is, rather than recording a fact nobody established.
+    """
+    if status == STARRED_STATUS:
+        return True
+    if status == NOT_STARRED_STATUS:
+        return False
+    raise ValueError(f"the starred check answered {status}")
+
+
 def authorize() -> Response:
     """Complete the OAuth flow and record the user's star status."""
     context = _context()
@@ -182,6 +205,13 @@ def authorize() -> Response:
     except OAuthError as exc:
         log.info("OAuth error for Discord ID %s: %s", discord_id, exc.description)
         return render_result(messages.SIGN_IN_FAILED_REASON.format(reason=exc.description), 400)
+    except RequestException as exc:
+        # The token exchange reaches GitHub over the same session as the
+        # calls below and can time out the same way. Reported as a bad
+        # gateway rather than a refused sign-in, because nothing was
+        # refused: the member did nothing wrong and retrying may work.
+        log.warning("Could not exchange the OAuth code for Discord ID %s: %s", discord_id, exc)
+        return render_result(messages.PROFILE_UNREADABLE, 502)
 
     if not token:
         return render_result(messages.SIGN_IN_FAILED, 400)
@@ -191,13 +221,25 @@ def authorize() -> Response:
         github_username = profile["login"]
         github_id = profile["id"]
 
-        # 204 means the authenticated user has starred the repository.
+        # Taken before the question is asked, not after it is answered.
+        # The answer describes some instant inside the call, and an earlier
+        # horizon is the direction that lets a star event landing during it
+        # win: link_account refuses to write over anything newer than this,
+        # and the webhook's out-of-band fact should beat a read that was
+        # already in flight. The sweep takes its own instant the same way.
+        star_checked_at = datetime.now(UTC)
         starred_response = context.github.get(
             f"user/starred/{context.config.owner}/{context.config.repo}",
             token=token,
         )
-        starred = starred_response.status_code == STARRED_STATUS
-    except (OAuthError, KeyError, ValueError) as exc:
+        starred = _read_star_check(starred_response.status_code)
+    # RequestException covers the transport failures that only became
+    # reachable once client_kwargs started passing default_timeout: before
+    # that a stalled GitHub call hung the worker instead of raising, so
+    # there was nothing here to catch. A timeout, a reset connection and a
+    # DNS failure are all "GitHub did not answer", which is the same 502
+    # this already reported for an answer it could not read.
+    except (OAuthError, KeyError, ValueError, RequestException) as exc:
         log.warning("Could not read the GitHub profile: %s", exc)
         return render_result(messages.PROFILE_UNREADABLE, 502)
 
@@ -209,7 +251,7 @@ def authorize() -> Response:
     )
 
     try:
-        link_account(
+        recorded = link_account(
             context.users,
             discord_id=discord_id,
             discord_username=discord_username,
@@ -217,6 +259,11 @@ def authorize() -> Response:
             github_username=github_username,
             linked_repo=context.config.repo_url,
             starred_repo=starred,
+            # Without this the horizon is link_account's own clock, which
+            # is later than the answer it stands for by however long the
+            # OAuth exchange took, and a webhook that landed inside that
+            # window is written over. Only the caller knows when it asked.
+            observed_at=star_checked_at,
         )
     except AccountAlreadyLinkedError:
         log.info(
@@ -225,11 +272,16 @@ def authorize() -> Response:
             discord_id,
         )
         return render_result(messages.ALREADY_LINKED.format(github_username=github_username), 409)
-    except PyMongoError as exc:
+    except StorageError as exc:
         log.error("Could not save the link: %s", exc)
         return render_result(messages.SAVE_FAILED, 503)
 
-    if starred:
+    # The page follows the row rather than the answer GitHub gave, because
+    # the two can differ: link_account declines to write a star state a
+    # newer webhook event has already contradicted, and hands back what the
+    # row holds instead. Saying "not starred" to somebody the database
+    # records as starred would send them round the whole flow for nothing.
+    if recorded["starred_repo"]:
         return render_result(messages.VERIFIED_AND_STARRED)
     return render_result(
         messages.VERIFIED_NOT_STARRED.format(owner=context.config.owner, repo=context.config.repo)
@@ -238,8 +290,21 @@ def authorize() -> Response:
 
 def healthz() -> tuple[dict[str, str], int]:
     """Liveness probe that also reports database reachability."""
-    if _context().users is None:
+    users = _context().users
+    if users is None:
         return {"status": "degraded", "database": "unavailable"}, 503
+
+    try:
+        # A handle is not a connection, so this asks the server a question
+        # rather than trusting the object's existence; see common.storage.ping
+        # for the whole reason. Without it the compose healthcheck reads 200
+        # straight through an outage and keeps the container in service while
+        # every link attempt fails.
+        ping(users)
+    except StorageError as exc:
+        log.error("Health probe could not reach MongoDB: %s", exc)
+        return {"status": "degraded", "database": "unavailable"}, 503
+
     return {"status": "ok"}, 200
 
 
@@ -253,7 +318,7 @@ def connect_users(config: ServerConfig) -> UserCollection | None:
     try:
         _, users = connect(config.mongo_host, config.mongo_database, MongoClient)
         return users
-    except PyMongoError as exc:
+    except StorageError as exc:
         log.error("Error connecting to MongoDB: %s", exc)
         return None
 
@@ -273,18 +338,26 @@ def create_app(
         users = connect_users(config)
 
     app = Flask(__name__, template_folder="./html")
-    # The server sits behind a reverse proxy, which terminates TLS. Without
-    # this the OAuth redirect_uri would be built as http:// and GitHub would
-    # reject it. The hop count is configurable because ProxyFix counts from
-    # the right, so a second proxy in front silently shifts the client
-    # address the rate limiter sees.
+    # The server usually sits behind a reverse proxy, which terminates TLS.
+    # Without this the OAuth redirect_uri would be built as http:// and
+    # GitHub would reject it. The hop count is configurable because ProxyFix
+    # counts from the right, so a second proxy in front silently shifts the
+    # client address the rate limiter sees.
+    #
+    # Zero hops means the port is reached directly, which docker-compose.yml
+    # publishes it to be, and then the middleware is left off entirely: with
+    # it installed, one hop of trust is all a client needs to hand itself
+    # any X-Forwarded-For it likes and take a fresh rate-limit bucket per
+    # request. A deployment with no proxy has no forwarded header worth
+    # believing, so the safe reading is to believe none of it.
     hops = config.trusted_proxy_count
-    # Replacing wsgi_app is Flask's documented way to wrap the application in
-    # WSGI middleware; mypy only objects because the attribute is declared as
-    # a method on the class.
-    app.wsgi_app = ProxyFix(  # type: ignore[method-assign]
-        app.wsgi_app, x_for=hops, x_proto=hops, x_host=hops
-    )
+    if hops:
+        # Replacing wsgi_app is Flask's documented way to wrap the
+        # application in WSGI middleware; mypy only objects because the
+        # attribute is declared as a method on the class.
+        app.wsgi_app = ProxyFix(  # type: ignore[method-assign]
+            app.wsgi_app, x_for=hops, x_proto=hops, x_host=hops
+        )
     app.secret_key = config.secret_key
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
@@ -308,7 +381,30 @@ def create_app(
         # The real secret is config.client_secret, read from the environment.
         access_token_url="https://github.com/login/oauth/access_token",  # nosec B106
         api_base_url="https://api.github.com/",
-        client_kwargs={"scope": GITHUB_OAUTH_SCOPE},
+        client_kwargs={
+            "scope": GITHUB_OAUTH_SCOPE,
+            # Every call this client makes to GitHub gets a deadline: the
+            # token exchange, the profile read and the starred check. Without
+            # one they inherit requests' default of no timeout at all, so a
+            # connection GitHub never closes holds a waitress worker for as
+            # long as the process runs. waitress serves this whole
+            # application from four threads by default, and /login,
+            # /authorize and the webhook receiver all draw on the same four,
+            # so a handful of hung requests is the difference between a slow
+            # GitHub and an unreachable Starguard.
+            #
+            # The spelling matters. Authlib only applies this when it is
+            # called default_timeout: a plain "timeout" here is not one of
+            # the keys it forwards to the session, so it would be swallowed
+            # into the client's metadata and silently do nothing, which is
+            # the worst of the three outcomes. See
+            # authlib.integrations.requests_client.OAuth2Session.request,
+            # which does kwargs.setdefault("timeout", self.default_timeout).
+            #
+            # The value is the bot's REQUEST_TIMEOUT, so both halves of
+            # Starguard wait the same amount of time on the same API.
+            "default_timeout": REQUEST_TIMEOUT,
+        },
     )
 
     app.extensions["starguard"] = ServerContext(config=config, users=users, github=github)
@@ -359,11 +455,30 @@ def main() -> None:
     # B104: binding to every interface is the point. This process runs
     # in a container and is reached from another one, so loopback would make
     # it unreachable; what is and is not published is the compose file's job.
-    # Bandit prints "nosec encountered (B104), but no failed test" here. That
-    # warning is wrong: delete the suppression and B104 fires on this line. A
-    # bare "# nosec" silences the warning but would also hide any future
-    # finding on this line, so the scoped form stays.
-    serve(app, host="0.0.0.0", port=config.port, ident="Starguard")  # nosec B104
+    # Bandit prints "nosec encountered (B104), but no failed test" here.
+    # That warning is wrong: delete the suppression and B104 fires on the
+    # host line below. An unscoped suppression, one with no test id after
+    # it, silences that warning but would also hide any future finding on
+    # that line, so the scoped form stays. Spelling the unscoped form out
+    # here is not an option either: bandit reads the token wherever it
+    # appears in a comment, prose included, and parses the rest of the
+    # line as test ids, so quoting it printed six warnings of its own.
+    #
+    # max_request_body_size is the same bound as MAX_CONTENT_LENGTH and has
+    # to be stated twice, because the two enforce it in different places.
+    # Flask's check runs once the request has reached the application, by
+    # which time waitress has already spooled the body: its own default is
+    # one gibibyte, so without this an unauthenticated client could make the
+    # public webhook endpoint buffer a thousand times what that route is
+    # documented to bound. The bounded body is the stated reason that route
+    # is safe to leave unlimited, so it has to hold at the front door.
+    serve(
+        app,
+        host="0.0.0.0",  # nosec B104
+        port=config.port,
+        ident="Starguard",
+        max_request_body_size=MAX_REQUEST_BODY_BYTES,
+    )
 
 
 if __name__ == "__main__":

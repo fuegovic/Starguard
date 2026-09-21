@@ -104,6 +104,9 @@ CLAIM_ALREADY_HELD = "You already claimed your role 😁\n💫Thanks!"
 CLAIM_ROLE_FAILED = (
     "I could not assign the role. Please ask a moderator to check my permissions and role position."
 )
+# Sent privately to whoever pressed the button. The public thank-you follows
+# it as a second message; see the claim handler for why the two cannot be one.
+CLAIM_GRANTED = "Role granted. You should see it on your profile now."
 
 # --- /checkstars ----------------------------------------------------------
 CHECK_ALREADY_RUNNING = (
@@ -112,4 +115,7 @@ CHECK_ALREADY_RUNNING = (
 )
 CHECK_NO_CHANGES = "Star status checked, no changes."
 CHECK_REMOVED = "Removed the role from {count} member(s) for un-starring the repo: {names}"
+# Replaces the tail of that list when it would not fit in one Discord
+# message. The count is still exact; only the names are cut short.
+CHECK_REMOVED_MORE = " and {count} more"
 DATABASE_UNREACHABLE = "Could not reach the database right now."

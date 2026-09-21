@@ -7,12 +7,16 @@
 import pytest
 
 from common.config import (
+    MAX_PORT,
+    MIN_PORT,
     ConfigError,
     env_bool,
     env_int,
+    env_port,
     optional_env,
     require_env,
     require_https_url,
+    require_mongo_host,
     require_secret_key,
     require_snowflake,
 )
@@ -59,6 +63,41 @@ def test_env_int_rejects_nonsense(monkeypatch):
     monkeypatch.setenv("DELAY", "one hour")
     with pytest.raises(ConfigError, match="whole number"):
         env_int("DELAY", 3600)
+
+
+@pytest.mark.parametrize("raw", [str(MIN_PORT), "8080", str(MAX_PORT)])
+def test_env_port_accepts_the_whole_range_including_its_ends(monkeypatch, raw):
+    monkeypatch.setenv("PORT", raw)
+    assert env_port("PORT", 5000) == int(raw)
+
+
+def test_env_port_uses_the_default_when_unset(monkeypatch):
+    monkeypatch.delenv("PORT", raising=False)
+    assert env_port("PORT", 5000) == 5000
+
+
+@pytest.mark.parametrize("raw", [str(MIN_PORT - 1), str(MAX_PORT + 1), "70000", "-1"])
+def test_env_port_refuses_a_number_that_is_not_a_port(monkeypatch, raw):
+    # Refused rather than clamped, which is the difference from env_int's
+    # minimum. A clamped port is not a smaller version of what was asked
+    # for, it is a different address: 70000 would bind 65535 and answer
+    # there, and the operator hunting the typo would find a working
+    # service on a port they never named.
+    monkeypatch.setenv("PORT", raw)
+    with pytest.raises(ConfigError, match="PORT") as excinfo:
+        env_port("PORT", 5000)
+
+    # The message has to name the variable and the range, because it is
+    # the only thing the operator gets.
+    assert "TCP port" in str(excinfo.value)
+    assert f"{MIN_PORT} and {MAX_PORT}" in str(excinfo.value)
+    assert raw in str(excinfo.value)
+
+
+def test_env_port_rejects_nonsense_the_way_env_int_does(monkeypatch):
+    monkeypatch.setenv("PORT", "http")
+    with pytest.raises(ConfigError, match="whole number"):
+        env_port("PORT", 5000)
 
 
 @pytest.mark.parametrize(
@@ -152,3 +191,48 @@ def test_require_https_url_rejects_a_query_string_or_fragment(monkeypatch, raw):
     monkeypatch.setenv("DOMAIN", raw)
     with pytest.raises(ConfigError, match="no query string or fragment"):
         require_https_url("DOMAIN")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "mongodb",  # a Docker service name, which is what compose gives you
+        "127.0.0.1",
+        "mongodb://127.0.0.1:27017/",
+        "mongodb://user:pass@a.example:27017,b.example:27017/?replicaSet=rs0",
+    ],
+)
+def test_require_mongo_host_accepts_everything_the_driver_does(monkeypatch, raw):
+    # Not a pattern of this module's own: a bare hostname, a service name,
+    # a host list and a URI with options are all valid here, and a rule
+    # written by hand would refuse something the driver takes.
+    monkeypatch.setenv("MONGO_HOST", raw)
+    assert require_mongo_host("MONGO_HOST") == raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "mongodb://host:notaport/",  # ValueError, which is not a PyMongoError
+        "mongodb://host:70000/",
+        "mongodb://host:0/",
+    ],
+)
+def test_require_mongo_host_names_the_variable_for_an_impossible_port(monkeypatch, raw):
+    # The reason this validator exists. These raise ValueError out of the
+    # driver's constructor, which the server's connect_users does not catch
+    # because it guards PyMongoError, so the process died with a traceback
+    # and the container restarted into the same traceback forever.
+    monkeypatch.setenv("MONGO_HOST", raw)
+    with pytest.raises(ConfigError, match="MONGO_HOST is not a usable"):
+        require_mongo_host("MONGO_HOST")
+
+
+@pytest.mark.parametrize("raw", ["mongodb://user:pa%ss@host/", "mongodb://"])
+def test_require_mongo_host_names_the_variable_for_a_malformed_uri(monkeypatch, raw):
+    # These raise InvalidURI, which is a PyMongoError and so was caught:
+    # the server came up, answered every request and could link nobody,
+    # explained by one startup log line. Refused by name instead.
+    monkeypatch.setenv("MONGO_HOST", raw)
+    with pytest.raises(ConfigError, match="MONGO_HOST is not a usable"):
+        require_mongo_host("MONGO_HOST")

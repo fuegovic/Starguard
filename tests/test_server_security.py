@@ -101,6 +101,40 @@ def test_the_health_probe_is_never_rate_limited():
         assert client.get("/healthz").status_code == 503
 
 
+def test_login_and_its_callback_do_not_share_a_bucket():
+    # A verification is two requests: /login, and the /authorize GitHub
+    # redirects back to. Keyed on the address alone they came out of one
+    # budget, so LOGIN_RATE_LIMIT=1 refused the callback of the single
+    # attempt it allowed and the default of ten permitted five.
+    client = make_client(rate_limit=1, rate_limit_window=60)
+    assert client.get("/login").status_code == 400
+    assert client.get("/authorize").status_code == 400
+    # Each endpoint still has its own limit of one.
+    assert client.get("/login").status_code == 429
+    assert client.get("/authorize").status_code == 429
+
+
+def test_a_forwarded_header_is_ignored_when_no_proxy_is_trusted():
+    # docker-compose publishes the server port on the host, so a client can
+    # reach this application without passing a proxy at all. At zero hops
+    # the middleware is not installed and X-Forwarded-For buys nothing:
+    # both requests count against the address the connection came from,
+    # rather than each one inventing a fresh bucket.
+    client = make_client(rate_limit=1, rate_limit_window=60, trusted_proxy_count=0)
+    first = client.get(
+        "/login",
+        headers={"X-Forwarded-For": "203.0.113.9"},
+        environ_overrides={"REMOTE_ADDR": "10.0.0.1"},
+    )
+    second = client.get(
+        "/login",
+        headers={"X-Forwarded-For": "198.51.100.7"},
+        environ_overrides={"REMOTE_ADDR": "10.0.0.1"},
+    )
+    assert first.status_code == 400
+    assert second.status_code == 429
+
+
 def test_the_limit_is_per_address():
     client = make_client(rate_limit=1, rate_limit_window=60)
     assert client.get("/login", environ_overrides={"REMOTE_ADDR": "10.0.0.1"}).status_code == 400

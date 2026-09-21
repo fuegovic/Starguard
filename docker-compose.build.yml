@@ -1,0 +1,31 @@
+# Build the two images from this checkout instead of pulling them from the
+# GitHub Packages registry.
+#
+# The compose files pull by default, so an operator never has to clone the
+# source or wait for a build. This file is the opt-in for the other case:
+# working on Starguard itself, or running a patched image you have not
+# published anywhere.
+#
+#   # bot + OAuth server, built locally
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+#
+#   # the all-in-one stack, built locally
+#   docker compose -f docker-compose.alt.yml -f docker-compose.build.yml up -d --build
+#
+# It layers onto either of them, and onto docker-compose.override.yml as
+# well, because the service names match. Adding a build: section to a service
+# that already has an image: makes compose tag the built image with that name
+# rather than pull it, so nothing else in the file has to change.
+#
+# Note --build. Without it compose reuses whatever it built last, which is
+# the usual reason a code change appears to do nothing.
+services:
+  discord-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile.server

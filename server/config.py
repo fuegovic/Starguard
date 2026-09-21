@@ -13,8 +13,10 @@ from common.config import (
     PLACEHOLDER_SECRET_KEYS,
     ConfigError,
     env_int,
+    env_port,
     optional_env,
     require_env,
+    require_mongo_host,
     require_secret_key,
 )
 
@@ -103,9 +105,16 @@ def load_server_config() -> ServerConfig:
         secret_key=require_secret_key(),
         client_id=require_env("GITHUB_CLIENT_ID"),
         client_secret=require_env("GITHUB_CLIENT_SECRET"),
-        mongo_host=require_env("MONGO_HOST"),
+        # Validated by constructing the driver rather than only read, so a
+        # port that is not a port names the variable here instead of killing
+        # the process with a ValueError connect_users cannot catch.
+        mongo_host=require_mongo_host("MONGO_HOST"),
         mongo_database=require_env("MONGO_DATABASE"),
-        port=env_int("SERVER_BIND_PORT", DEFAULT_BIND_PORT, minimum=1),
+        # A port rather than a number with a floor. env_port raises where
+        # env_int clamps, and its docstring says why a port is the case that
+        # wants raising; the floor here used to leave the ceiling open, so a
+        # typo above it reached waitress and failed at bind.
+        port=env_port("SERVER_BIND_PORT", DEFAULT_BIND_PORT),
         link_token_max_age=env_int(
             "LINK_TOKEN_MAX_AGE",
             DEFAULT_LINK_TOKEN_MAX_AGE,
@@ -115,7 +124,14 @@ def load_server_config() -> ServerConfig:
         # nth value from the right of X-Forwarded-For, so getting this wrong
         # is the difference between the real client address and one a client
         # chose for itself, which would defeat the rate limit outright.
-        trusted_proxy_count=env_int("TRUSTED_PROXY_COUNT", 1, minimum=1),
+        #
+        # Zero is allowed, and is the honest setting for a port reached
+        # directly: the middleware is then not installed at all and no
+        # forwarded header is believed. The floor used to be one, which
+        # silently turned that deployment into the spoofable one, because
+        # an operator who wrote 0 to say "nothing in front of me" was
+        # clamped back up to trusting one hop of a header anybody can send.
+        trusted_proxy_count=env_int("TRUSTED_PROXY_COUNT", 1, minimum=0),
         rate_limit=env_int("LOGIN_RATE_LIMIT", DEFAULT_RATE_LIMIT, minimum=1),
         rate_limit_window=env_int(
             "LOGIN_RATE_LIMIT_WINDOW", DEFAULT_RATE_WINDOW_SECONDS, minimum=1

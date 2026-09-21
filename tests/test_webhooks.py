@@ -18,19 +18,24 @@ endpoint verifies.
 import hashlib
 import hmac
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pymongo.errors import PyMongoError
 
 from common.config import ConfigError
-from common.storage import (
-    clear_role_sync_pending,
+from common.deliveries import (
     deliveries_for,
     ensure_delivery_indexes,
+)
+from common.storage import (
+    clear_role_sync_pending,
     ensure_indexes,
     find_link,
     link_account,
+    read_datetime,
 )
+from common.storage_errors import StorageError
 from server.config import WEBHOOK_SECRET_ENV, load_server_config, optional_secret
 from server.server import create_app
 from server.webhooks import (
@@ -333,6 +338,46 @@ def test_an_event_that_changes_nothing_queues_nothing(client, users):
     assert "role_sync_pending" not in find_link(users, "123456789")
 
 
+def test_a_delivery_that_arrived_behind_a_newer_event_says_so(client, users, caplog):
+    # record_star_event has three outcomes and only two of them write. A row
+    # already carrying a later star event is returned untouched, so the row
+    # and the reply would otherwise disagree: the delivery log would read
+    # "Recorded." and the log line would confirm it, which is the one place
+    # an operator looks when a role did not move.
+    link(users, starred=True)
+    later = datetime.now(UTC) + timedelta(hours=1)
+    users.update_one({"discord_id": "123456789"}, {"$set": {"star_event_at": later}})
+
+    with caplog.at_level("INFO", logger="starguard.webhooks"):
+        response = post(client, star_body("deleted"))
+
+    assert response.status_code == 202
+    assert response.data == b"Superseded by a newer event."
+    assert "arrived behind a newer event" in caplog.text
+    assert "Recorded star" not in caplog.text
+    # The newer fact is still what the database holds, and nothing this
+    # delivery would have written is there: record_star_event always sets
+    # star_source when it writes, and link_account never does.
+    row = find_link(users, "123456789")
+    assert row["starred_repo"] is True
+    assert "star_source" not in row
+    assert read_datetime(row, "star_event_at") > datetime.now(UTC)
+
+
+def test_a_delivery_that_did_land_still_says_it_was_recorded(client, users, caplog):
+    # The other side of the check above: an ordinary delivery writes, and
+    # the reply and the log line have to keep saying so.
+    link(users, starred=False)
+
+    with caplog.at_level("INFO", logger="starguard.webhooks"):
+        response = post(client, star_body("created"))
+
+    assert response.status_code == 202
+    assert response.data == b"Recorded."
+    assert "Recorded star created" in caplog.text
+    assert find_link(users, "123456789")["starred_repo"] is True
+
+
 @pytest.mark.parametrize("action", ["created", "deleted"])
 def test_a_star_from_a_stranger_is_accepted_and_dropped(client, users, action):
     # Most people who star the repository have never used the bot.
@@ -373,10 +418,69 @@ def test_a_database_error_mid_request_is_reported(client, users, monkeypatch, fa
     link(users)
 
     def explode(*_args, **_kwargs):
-        raise PyMongoError("connection lost")
+        raise StorageError("connection lost")
 
     monkeypatch.setattr(f"server.webhooks.{failing}", explode)
     assert post(client, star_body()).status_code == 503
+
+
+def test_a_delivery_whose_write_failed_can_still_be_redelivered(client, users, monkeypatch):
+    # Pressing Redeliver in GitHub's delivery log is the documented way to
+    # recover from a 5xx, and GitHub reuses the delivery id when you do. The
+    # claim is taken before the write is attempted, so a claim left standing
+    # over a write that never happened answers that recovery with "Already
+    # handled" for the next ten minutes and records nothing.
+    link(users, starred=False)
+
+    def explode(*_args, **_kwargs):
+        raise StorageError("connection lost")
+
+    monkeypatch.setattr("server.webhooks.record_star_event", explode)
+    assert post(client, star_body("created"), delivery="same-id").status_code == 503
+    assert find_link(users, "123456789")["starred_repo"] is False
+
+    # The database is back, and the operator redelivers.
+    monkeypatch.undo()
+    assert post(client, star_body("created"), delivery="same-id").status_code == 202
+    assert find_link(users, "123456789")["starred_repo"] is True
+
+
+def test_a_release_that_fails_too_still_answers_503(client, users, monkeypatch, caplog):
+    # The database the release has to reach is the one that just refused the
+    # write, so a second refusal is the expected outcome and must not turn
+    # the 503 GitHub needs into a traceback.
+    link(users, starred=False)
+
+    # Two levels, and the exceptions differ because the levels do. The first
+    # replaces a storage function, which is the thing that raises StorageError.
+    # The second breaks the driver method underneath a real release_delivery,
+    # so it raises what pymongo raises and the translation in
+    # common.storage_errors is what has to turn it into the StorageError the
+    # caller catches. If that seam ever came undone this is the test that
+    # would notice, because the traceback would escape instead of the 503.
+    def storage_fails(*_args, **_kwargs):
+        raise StorageError("connection lost")
+
+    def driver_fails(*_args, **_kwargs):
+        raise PyMongoError("connection lost")
+
+    monkeypatch.setattr("server.webhooks.record_star_event", storage_fails)
+    monkeypatch.setattr(deliveries_for(users), "delete_one", driver_fails)
+
+    with caplog.at_level("ERROR", logger="starguard.webhooks"):
+        assert post(client, star_body("created"), delivery="same-id").status_code == 503
+    assert "Could not release webhook delivery same-id" in caplog.text
+
+
+def test_a_delivery_that_was_handled_is_still_only_handled_once(client, users):
+    # The release is for work that did not happen. Work that did must stay
+    # claimed, or GitHub's own retry of a delivery whose response it never
+    # saw would be applied a second time.
+    link(users, starred=False)
+    assert post(client, star_body("created"), delivery="same-id").status_code == 202
+    replay = post(client, star_body("deleted"), delivery="same-id")
+    assert replay.status_code == 200
+    assert find_link(users, "123456789")["starred_repo"] is True
 
 
 def test_the_receiver_is_not_rate_limited(users):

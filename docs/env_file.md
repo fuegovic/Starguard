@@ -38,18 +38,75 @@ Under Docker this looks like a container that starts and immediately exits,
 with `restart: always` putting it into a restart loop. Read the reason with
 `docker compose logs discord-bot` or `docker compose logs server`.
 
-Three kinds of validation appear below:
+Four kinds of validation appear below:
 
 - **Required.** Unset or blank is a fatal error. Leading and trailing
   whitespace is stripped from every value, so a line of spaces counts as
   blank.
 - **Clamped.** A number below the documented minimum is silently raised to
-  that minimum. This is not an error and is not logged.
+  that minimum. This is not an error and is not logged. Every clamped value
+  is an interval or a duration, where the floor is still a value you can run
+  with.
+- **A TCP port.** `1` to `65535`, and anything outside it is a fatal error
+  naming the variable. Ports are the one number that is not clamped, because
+  a clamped port is a different address rather than a smaller value. This
+  applies to `SERVER_BIND_PORT` and `BOT_HEALTH_PORT`.
 - **Falls back.** An unrecognised value is silently replaced with the default.
   This applies only to `LOG_LEVEL` and `LOG_FORMAT`.
 
 Anything else that cannot be parsed, such as a non-numeric value where a
 number is expected, is a fatal error.
+
+## Images
+
+Which prebuilt images the compose files run. Both are read by Docker Compose
+when it expands the `image:` lines, and by nothing else; the containers
+receive them through `env_file:` but no Starguard code looks at them.
+
+The images are published by this repository's Release workflow for
+`linux/amd64` and `linux/arm64`, signed with cosign, and carry an SBOM and a
+build provenance attestation. See [Verifying what you
+pulled](./installation.md#verifying-what-you-pulled).
+
+### `STARGUARD_IMAGE_OWNER`
+
+**Optional. Compose only.** Default: `librechat-ai`.
+
+The GitHub account the images were published under, which is the first path
+segment of the registry reference. Leave it alone to run the official builds.
+Set it to your own account if you run a fork whose Release workflow publishes
+to your own namespace.
+
+**It must be lowercase.** A container reference has no uppercase in its path,
+so an account spelled `My-Org` is written here as `my-org`. The workflow
+lowercases the name when it publishes, and Docker will reject the reference
+rather than fall back if you do not do the same here.
+
+### `STARGUARD_IMAGE_TAG`
+
+**Optional. Compose only.** Default: `latest`.
+
+Which version to run:
+
+| Value | What it points at |
+| --- | --- |
+| `latest` | The newest stable release. Moves when a release is cut. |
+| `v1.2.0` | Exactly that release. Never moves. |
+| `v1.2` | The newest patch of the 1.2 series. Moves on a patch release. |
+| `main` | The tip of the `main` branch, which no release has been cut from. |
+| `sha-<commit>` | One exact commit on `main`. Never moves. |
+
+A prerelease such as `v1.2.0-rc.1` is published under its own version tag and
+deliberately does **not** move `latest`, so pinning to `latest` never puts you
+on a release candidate.
+
+`main` is gated by the same CI as everything else and is how you run a fix
+before the release containing it is cut. It is not a release: nobody has
+decided it is ready, and it can move several times a day.
+
+Changing this takes effect on the next `docker compose pull && docker compose
+up -d`. `up -d` alone restarts what you already have, because the tag it
+resolves has not changed.
 
 ## Discord
 
@@ -125,7 +182,12 @@ Configuration error: AUTOMATIC_CHECK must be a boolean such as true/false, got '
 ```
 
 With this off, `/checkstars` still works on demand, and the bot's health
-endpoint reports `"star_check": "disabled"` rather than tracking staleness.
+endpoint reports `"star_check": "disabled"` rather than tracking that loop's
+staleness. It still tracks the **other** loop: a webhook-only deployment,
+`AUTOMATIC_CHECK=false` with `ROLE_SYNC_ENABLED=true`, is measured by
+`role_sync` instead, which is the point of reporting both. Only with both
+loops off does the endpoint stop measuring reconciliation altogether and
+report no more than that the bot reached Startup.
 
 ### `AUTOMATIC_CHECK_DELAY`
 
@@ -140,9 +202,99 @@ repository burns through the API rate limit. Useful values: `300` (5 minutes),
 A non-numeric value is fatal:
 `AUTOMATIC_CHECK_DELAY must be a whole number, got '1h'.`
 
-This value also sets the bot health endpoint's staleness threshold: a
-completed check older than `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds makes the
-endpoint report `degraded` and return 503.
+This value also sets the star check's health deadline, one of two the
+endpoint tracks: a completed check older than
+`AUTOMATIC_CHECK_DELAY * 3 + 300` seconds makes `star_check` report `stale`,
+and the whole response `degraded` with 503. The drain has its own deadline
+from [`ROLE_SYNC_INTERVAL`](#role_sync_interval), and either one going stale
+is enough for the 503.
+
+### `ROLE_SYNC_ENABLED`
+
+**Optional.** Read by the bot. Default: `true`. Same accepted spellings as
+`AUTOMATIC_CHECK`.
+
+Whether the bot drains the role changes the GitHub star webhook recorded. The
+webhook arrives at the **server** process, which writes the new star state to
+the database and marks the row pending; only the **bot** process is connected
+to Discord, so only it can move the role. This loop is that second half.
+
+It is independent of `AUTOMATIC_CHECK`, and the two answer different needs, so
+any combination is valid:
+
+| `AUTOMATIC_CHECK` | `ROLE_SYNC_ENABLED` | Result |
+| --- | --- | --- |
+| `true` | `true` | Recommended with a webhook configured. Role changes land in seconds, and the sweep repairs anything a delivery missed. |
+| `true` | `false` | No webhook configured. An un-star is acted on at the next sweep, up to `AUTOMATIC_CHECK_DELAY` seconds later. A new star is never acted on automatically at all: the sweep only ever takes the role away, so the member has to sign in with GitHub again. |
+| `false` | `true` | Webhook only. Nothing repairs a delivery that was lost while the server was down, because GitHub does not retry failed deliveries. |
+| `false` | `false` | Nothing happens automatically. Only `/checkstars`, which removes, and the **Claim your role** button, which grants from the star state recorded at sign-in, move a role. |
+
+Turning it off when no webhook is configured costs you nothing either way: the
+queue it polls is empty forever. It is worth turning off only to keep one
+fewer task and one fewer log line in play.
+
+On startup the bot logs which way it went:
+
+```
+Draining queued role changes every 30 seconds
+The role sync drain is disabled (ROLE_SYNC_ENABLED=false)
+```
+
+With this off, the bot's health endpoint reports `"role_sync": "disabled"`
+rather than tracking staleness. See [Bot health check](#bot-health-check).
+
+### `ROLE_SYNC_INTERVAL`
+
+**Optional.** Read by the bot. Default: `30` (seconds). Whole number,
+**clamped** to a minimum of `5`.
+
+How often the bot looks for queued role changes when it finds none: the idle
+polling interval. A queued change is normally applied within one interval of
+the webhook recording it, and a sweep running at the same time does not hold
+it up. The sweep, the drain and the **Claim your role** button exclude each
+other one member at a time, for just as long as that member's read, role
+change and write take, so two different members are handled concurrently and
+the only thing a queued change ever waits for is another component acting on
+that same member.
+
+It is still an interval rather than a deadline. A pass that leaves rows
+queued because Discord refused the role change backs off, as below, and a
+burst of stars takes as long as Discord takes to accept them. Nothing is lost
+while any of that happens, because the flag stays raised until the bot itself
+lowers it.
+
+This can be seconds where `AUTOMATIC_CHECK_DELAY` has to be an hour, because
+the two do completely different work. A sweep is one GitHub API request per
+100 stargazers. A drain is one read of a database index that is built over
+only the rows actually waiting, so a poll that finds nothing reads nothing and
+writes nothing, however many verified members you have.
+
+A pass that did something logs a one-line summary; a pass that found an empty
+queue, which is nearly all of them, logs nothing at all:
+
+```
+Role sync drain complete: examined=1 granted=1 removed=0 failed=0
+```
+
+A non-numeric value is fatal:
+`ROLE_SYNC_INTERVAL must be a whole number, got '30s'.`
+
+On a failure the bot retries with the same exponential backoff the sweep uses:
+the first retry is one interval, it doubles on each consecutive failure up to
+about 300 seconds, and a quarter of jitter is applied either way.
+
+```
+Role sync drain failed (1 in a row); retrying in 33 seconds
+```
+
+That ceiling is far lower than the sweep's half hour, because a queued row is
+somebody holding, or missing, a role right now.
+
+This value also sets the drain's health deadline, at
+`ROLE_SYNC_INTERVAL * 3 + 300` seconds, or 390 with the default. Only a pass
+that actually walked the queue counts: one that returned early for want of a
+database connection or a cached guild did no reconciling, so it does not
+reset the clock and the endpoint eventually reports `"role_sync": "stale"`.
 
 ### `COMMAND_NAME`
 
@@ -184,18 +336,55 @@ Each URL must be a complete address including the scheme, for example
 ## Bot health check
 
 The bot serves `GET /healthz` inside its own container. The `discord-bot`
-healthcheck in both compose files calls it. It returns:
+healthcheck in both compose files calls it.
 
-- **503** with `{"status": "starting", ..., "gateway": "connecting"}` until
-  the Discord gateway connects.
-- **200** with `{"status": "ok", ...}` once connected, plus `"star_check"` set
-  to `disabled`, `pending` or `ok`.
-- **503** with `{"status": "degraded", ..., "star_check": "stale"}` when
-  automatic checks are on but the last completed one is older than
-  `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds.
+Every response carries `status`, `uptime_seconds` and `gateway`. Until the
+Discord gateway connects, that is the whole of it, with **503**:
 
-Every response also carries `uptime_seconds`, and an `ok` one carries
-`last_check_age_seconds`.
+```json
+{"status": "starting", "uptime_seconds": 5.0, "gateway": "connecting"}
+```
+
+Neither loop field appears there, because nothing has been measured yet. A
+monitor that reads them has to tolerate their absence in this state as well
+as in the ones below.
+
+Once connected, the payload also names each of the bot's two reconciling
+loops, whether or not that loop is turned on:
+
+| Field | The loop | Turned on by | Its deadline |
+| --- | --- | --- | --- |
+| `star_check` | the periodic star sweep | `AUTOMATIC_CHECK` | `AUTOMATIC_CHECK_DELAY * 3 + 300` seconds |
+| `role_sync` | the role sync drain | `ROLE_SYNC_ENABLED` | `ROLE_SYNC_INTERVAL * 3 + 300` seconds |
+
+Each field is one of four values:
+
+- `disabled`: the loop is off, so nothing can be late.
+- `pending`: on, and no pass has finished yet. Its grace runs from startup
+  rather than from a last pass.
+- `ok`: on, and the last completed pass is inside the deadline.
+- `stale`: on, and it is not. The response is then **503** with
+  `"status": "degraded"`, whichever of the two loops it was. One stale loop
+  is enough; the other keeps reporting its own state beside it.
+
+**The age fields are optional, and a monitor has to treat them that way.** A
+loop reports the age of its last completed pass, in `last_check_age_seconds`
+for `star_check` and `last_role_sync_age_seconds` for `role_sync`, only once
+a pass has actually completed. A `disabled` loop carries no age, a `pending`
+one carries none, and a loop that went `stale` without ever finishing a pass
+carries none either. So `"status": "ok"` does not imply either age field is
+present, and a perfectly healthy bot answers like this for as long as its
+first pass takes:
+
+```json
+{"status": "ok", "uptime_seconds": 60.0, "gateway": "connected", "star_check": "pending", "role_sync": "pending"}
+```
+
+A bot with both loops running and both fresh answers **200** with:
+
+```json
+{"status": "ok", "uptime_seconds": 60.0, "gateway": "connected", "star_check": "ok", "last_check_age_seconds": 10.0, "role_sync": "ok", "last_role_sync_age_seconds": 5.0}
+```
 
 ### `BOT_HEALTH_ENABLED`
 
@@ -224,12 +413,18 @@ system.
 ### `BOT_HEALTH_PORT`
 
 **Optional.** Read by the bot **and by Docker Compose**. Default: `8080`.
-Whole number, **clamped** to a minimum of `1`.
+A TCP port, `1` to `65535`, refused by name at startup rather than clamped,
+exactly as [`SERVER_BIND_PORT`](#server_bind_port) is:
+
+```
+Configuration error: BOT_HEALTH_PORT must be a TCP port between 1 and 65535, got 70000.
+```
 
 The port the health endpoint listens on. Both compose files interpolate this
 into the healthcheck command, so changing it here moves both sides together.
 
-If the port cannot be bound, the bot logs
+If the port is in the range but cannot be bound, because something else holds
+it, the bot logs
 `Could not start the health endpoint on <host>:<port>: <reason>` and carries
 on without it. The bot keeps working; the container is reported unhealthy.
 
@@ -264,10 +459,22 @@ The port published on the **host** machine for the OAuth server. Change it
 freely if something else on the host already uses 5000. The application never
 reads this.
 
+**Both compose files publish it on the loopback interface only**, as
+`127.0.0.1:${SERVER_PORT}:${SERVER_BIND_PORT}`, so nothing off the machine can
+reach the application directly. That is not a restriction in the intended
+setup: `DOMAIN` must be an HTTPS address, so a TLS-terminating proxy is
+required anyway, and a proxy on the same host reaches loopback. If your proxy
+runs on a **different** machine, remove the `127.0.0.1:` from the mapping in
+your own compose file, and set [`TRUSTED_PROXY_COUNT`](#trusted_proxy_count)
+to your real hop count, knowing that the origin is then reachable without TLS
+by anything that can route to it.
+
 ### `SERVER_BIND_PORT`
 
 **Optional.** Read by the server **and by Docker Compose**. Default: `5000`.
-Whole number, **clamped** to a minimum of `1`.
+A TCP port, `1` to `65535`. A value outside that range is **refused by name**
+at startup rather than clamped, because a clamped port is not a smaller
+version of what you asked for, it is a different address.
 
 The port the server listens on **inside** its container. Leave it at 5000
 unless something else in your setup needs that port internally. Both compose
@@ -327,8 +534,15 @@ the callback and the visitor sees `GitHub sign-in failed: <reason>` with HTTP
 
 A GitHub personal access token, used only to list the repository's
 stargazers. **No scopes are needed for a public repository**; `public_repo` is
-enough if you prefer to grant one. A private repository needs a token that can
-read it.
+enough if you prefer to grant one.
+
+**A private repository cannot be made to work by granting this token more.**
+It would let the bot's sweep read the stargazer listing, but the sweep is
+only half of the flow. The server decides whether a member has starred by
+asking GitHub with the **member's own** OAuth token, which carries only
+`read:user` and cannot see a private repository, so GitHub answers 404 and
+the server records "not starred" for everyone. See
+[Step 5 of the installation guide](./installation.md#step-5-create-a-github-personal-access-token).
 
 The listing is fetched 100 stargazers per request. Without a token, GitHub
 allows 60 requests per hour from your server's address, so a single full pass
@@ -375,6 +589,64 @@ verification link fails with `This verification link is not valid.`
 Changing the key invalidates all outstanding verification links and signs
 every existing session out. Nobody loses their role or their link record.
 
+### `GITHUB_WEBHOOK_SECRET`
+
+**Optional.** Read by the server. No default. At least 16 characters when it
+is set.
+
+The shared secret GitHub signs each `star` webhook delivery with. Setting it
+turns on the receiver at `POST /webhooks/github`, which is how the server
+learns about a star the moment it happens. Without it the server learns about
+a new star only when the member signs in with GitHub again, because the sweep
+only ever takes the role away. The same value goes in the **Secret** field of
+the webhook on GitHub. The full setup is
+[Step 12 of the installation guide](./installation.md#step-12-set-up-the-star-webhook-optional).
+
+**This is a second, separate secret. Do not reuse `SECRET_KEY`.** Generate
+another one the same way:
+
+```sh
+python -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+**Leaving it unset is a supported configuration, and it is the default.** The
+route is then never registered: there is no `/webhooks/github` on the server
+at all, not a stub that answers an error, and a request for it gets the
+ordinary 404 any unknown path gets. The bot keeps working exactly as before,
+noticing star changes only at each sweep.
+
+It is validated against the same two rules as `SECRET_KEY`, which is the
+point: a webhook secret copied out of `.env.example` would let anybody sign a
+star event for anybody.
+
+```
+Configuration error: GITHUB_WEBHOOK_SECRET is still set to a placeholder value. Generate a real one with: python -c "import secrets; print(secrets.token_urlsafe(32))" and paste the same value into the webhook's secret field on GitHub.
+Configuration error: GITHUB_WEBHOOK_SECRET must be at least 16 characters, got 8.
+```
+
+The rejected placeholders are the same list as for `SECRET_KEY`.
+
+**Treat it as a credential of the same weight as the others.** Every delivery
+is authenticated by this value and by nothing else, so anybody who has it can
+sign a star event claiming any GitHub account starred or un-starred your
+repository, and the server will act on it. Redact it from anything you paste
+into an issue, and if it is ever exposed, generate a new one, put it in both
+`.env` and the hook's **Secret** field on GitHub, and restart the server.
+
+The source address and the `User-Agent` are not checked, because both can be
+forged and the signature cannot. A delivery whose signature does not match is
+answered with HTTP 401 and `Invalid signature.`, and the server logs that
+only at `DEBUG`: the route is deliberately not rate limited, so a log line per
+rejected request would be a way to fill your disk from outside. GitHub's own
+delivery log is where you read those, not yours. See
+[the webhook section of the troubleshooting
+guide](./troubleshooting.md#the-star-webhook-is-not-working).
+
+Only the server reads this value. The bot does not need it, and the two
+processes still never talk to each other: the server records what changed in
+the database and the bot picks it up, which is what `ROLE_SYNC_ENABLED` and
+`ROLE_SYNC_INTERVAL` control.
+
 ### `LINK_TOKEN_MAX_AGE`
 
 **Optional.** Read by the server. Default: `900` (15 minutes). Whole number of
@@ -391,26 +663,40 @@ change this value the message will no longer match. Edit
 ### `TRUSTED_PROXY_COUNT`
 
 **Optional.** Read by the server. Default: `1`. Whole number, **clamped** to a
-minimum of `1`.
+minimum of `0`.
 
 How many reverse proxies **you operate** sit directly in front of the server.
 The server passes this to Werkzeug's `ProxyFix`, which rewrites the request's
 scheme, host and client address from the last N entries of the
 `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` headers. Two
 things depend on getting it right: the OAuth `redirect_uri` is rebuilt as
-`https://` from the forwarded scheme, and the per-address rate limit on
-`/login` and `/authorize` keys on the resulting client address.
+`https://` from the forwarded scheme, and the rate limit on `/login` and
+`/authorize` keys on the resulting client address.
 
 Count the hops, starting at the server and working outwards, that you control:
 
 | Your setup | Value |
 | --- | --- |
+| Nothing in front: you removed the `127.0.0.1:` from the port mapping and clients reach the container directly | `0` |
 | The bundled Nginx Proxy Manager from `docker-compose.alt.yml`, nothing in front of it | `1` |
 | Your own Nginx, Caddy or Traefik in front of the container | `1` |
 | A CDN or load balancer (Cloudflare, an ALB) in front of your own proxy | `2` |
 | Two of your own proxies plus a CDN | `3` |
 
 Do not count proxies that are not yours, and do not count the client.
+
+`0` is not a hop count but an instruction: install no `ProxyFix` at all and
+believe no forwarded header. Use it whenever a client can reach the server's
+port without passing through something you run. With even one trusted hop,
+such a client can put any address it likes in `X-Forwarded-For` and take a
+fresh rate-limit bucket for every request.
+
+Out of the box that cannot happen, because both compose files publish the
+port as `127.0.0.1:${SERVER_PORT}:${SERVER_BIND_PORT}` and only something on
+the same host can reach it. `1` is therefore the right default. If you widen
+that mapping so the container is reachable from elsewhere, decide again: `0`
+if clients arrive directly, your hop count if they still pass through a proxy
+you run.
 
 Setting it **too low** means every visitor behind your own proxy is seen as
 that proxy's address, so one busy proxy trips the rate limit for everyone.
@@ -419,20 +705,59 @@ from the right, so a client that prepends forged entries to `X-Forwarded-For`
 can make the server read an address the client chose, defeating the rate limit
 entirely and putting a value of the attacker's choosing into the logs.
 
-If you are unsure, start at `1`, make a request through your real front door,
-and check the address the server logged for it.
+**How to check what the server actually resolved.** Nothing is logged for an
+ordinary request, so a single visit tells you nothing. The client address
+appears in exactly one line, the one written when the rate limit refuses a
+request, so the way to see it is to trip the limit on purpose from a machine
+that reaches the server the way a real member does:
+
+```sh
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w '%{http_code}\n' 'https://starguard.example.com/login?token=x'
+done
+```
+
+The first ten answer 400, because the token is nonsense, and the rest answer
+429. Then read the server's log:
+
+```sh
+docker compose logs -n 20 server | grep 'Rate limited'
+```
+
+```
+Rate limited login for 203.0.113.7
+```
+
+That address is what `TRUSTED_PROXY_COUNT` resolved to. Compare it with the
+public address of the machine you ran `curl` on. If it is your proxy's
+address, or a container address such as `172.18.0.1`, the value is too low.
+If it matches the client, it is right. Wait out
+`LOGIN_RATE_LIMIT_WINDOW` afterwards, or restart the server, since the
+limiter is held in memory.
+
+Do the same check from a second machine if you can: two different clients
+must produce two different addresses. One address for both is the collapse
+that too low a value causes, and it is invisible from a single client.
 
 ### `LOGIN_RATE_LIMIT`
 
 **Optional.** Read by the server. Default: `10`. Whole number, **clamped** to
 a minimum of `1`.
 
-How many requests to `/login` and `/authorize` a single client address may
-make within `LOGIN_RATE_LIMIT_WINDOW`. Over the limit, the visitor gets HTTP
-429 with a `Retry-After` header and the page
+How many requests a single client address may make within
+`LOGIN_RATE_LIMIT_WINDOW`. Over the limit, the visitor gets HTTP 429 with a
+`Retry-After` header and the page
 `Too many verification attempts from your address. Please wait a moment and
 try again.`, and the server logs
 `Rate limited <endpoint> for <address>`.
+
+**`/login` and `/authorize` are counted separately**, one bucket per route
+per address, so the default of `10` is ten of each rather than ten between
+them. One verification is one request to each, so it spends one of the ten on
+each side. A shared bucket would charge an ordinary flow twice, and
+`LOGIN_RATE_LIMIT=1` would then refuse the callback of the single attempt it
+had just allowed. Only these two routes are limited at all; `/healthz`, the
+landing page and the webhook receiver are not.
 
 The limiter is a sliding window held in memory by the single server process.
 It resets when the server restarts, and it counts per process rather than
@@ -472,23 +797,106 @@ above works either way, but the moment anyone appends a database name, as in
 the user in `starguard` and authentication would start failing. Saying
 `authSource` explicitly makes that impossible.
 
-If the password contains any of `: / ? # [ ] @`, percent-encode it, or use a
-password that avoids them.
+**Percent-encode the credentials.** PyMongo parses this value as a URI, so a
+reserved character in the username or password has to be percent-encoded.
+The ones that matter, and what each does when you leave it unencoded:
 
-Neither process refuses to start when MongoDB is unreachable. Both log
-`Could not prepare the users collection: <reason>` and keep going, and each
-database operation then fails as it is attempted. A connection string the
-driver cannot parse at all is different: that one is logged as
-`Error connecting to MongoDB: <reason>` and leaves the server answering
-`/healthz` with 503. See
-[MongoDB connection and authentication failures](./troubleshooting.md#mongodb-connection-and-authentication-failures).
+Which of them is fatal depends on the process, because the server checks
+this value as it loads its configuration and the bot does not. **On the
+server every case below is caught**, reported as
+`MONGO_HOST is not a usable MongoDB connection string`, and the process
+exits without serving. On the bot they split:
+
+- `@`, `:`, `/` and `%` raise a caught error. Something goes wrong at
+  startup and says so, and the bot runs on granting no roles.
+- `?` raises an **uncaught** error, in the form this file's examples use:
+  everything after the `?` is read as the connection string's query part,
+  which leaves the rest of the password sitting where the port belongs, and
+  a port that is not a number is fatal. A mistyped port such as
+  `mongodb://mongodb:70000/` fails the same way for the same reason. (A `?`
+  in a string carrying no `?authSource=admin` or other trailing option is
+  caught instead, but every example here carries one.)
+- `+` is the worst of them, because nothing complains at all. It is silently
+  decoded to a space, so the password is quietly wrong.
+- `#`, `[`, `]`, `!` and `$` need no encoding. Encoding them anyway does no
+  harm if you would rather not remember the list.
+
+**Encode it in `MONGO_HOST` and nowhere else.** MongoDB is handed the
+password literally, through `MONGO_INITDB_ROOT_PASSWORD`, and so are the
+`mongosh` healthcheck and Mongo Express in both compose files. Encoding it
+there too creates the nastiest version of this: the `mongodb` container
+reports healthy, because it and its healthcheck agree on a password, while
+the bot and the server authenticate with a different one and fail. Encode an
+existing password with
+
+```sh
+python -c "import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=''))" 'your password'
+```
+
+A database that is simply unreachable, or that refuses the credentials, does
+not stop either process. A client is built, both attempt four pieces of
+startup work, each reported by name when it fails, and both keep going:
+
+```
+Could not index the users collection: <reason>
+Could not index the deliveries collection: <reason>
+Could not purge credentials written by older versions: <reason>
+Could not upgrade user records: <reason>
+```
+
+Each database operation then fails as it is attempted, and the server's
+`/healthz` answers 503, because it sends a `ping` to MongoDB on every probe
+rather than assuming that a client which exists is a database that answers.
+
+A value the driver cannot use is a different matter, and **the two processes
+do not treat it alike**.
+
+**The server refuses to start, naming the variable.** It parses `MONGO_HOST`
+with the driver while loading its configuration, so anything the driver
+rejects is reported the way every other bad setting is, and the process exits
+1 rather than serving:
+
+```
+Configuration error: MONGO_HOST is not a usable MongoDB connection string: <reason>
+```
+
+**The bot does not.** It reads `MONGO_HOST` as a plain string, so a value the
+driver cannot use is only discovered when it tries to connect, and what
+happens then depends on how the driver fails. A rejection it reports as a
+MongoDB error, such as an unencoded `@`, `:`, `/` or `%`, is caught: the bot
+logs `Error connecting to MongoDB: <reason>` and runs on with no database,
+granting no roles. A malformed **port** is not caught. `mongodb://mongodb:70000/`,
+`mongodb://mongodb:notaport/` and the parse that an unencoded `?` produces
+when it leaves password text sitting in the port position all raise a plain
+`ValueError`, which is not a MongoDB error, so nothing catches it:
+
+```
+ValueError: Port contains non-digit characters. Hint: username and password must be escaped according to RFC 3986, use urllib.parse.quote_plus
+```
+
+The bot exits with that traceback, `restart: always` brings the container
+back, and it exits again. If the `discord-bot` container is looping while the
+`server` container is up, or if the server exited with the configuration
+error above and the bot did not, this asymmetry is why. See [a malformed
+connection string](./troubleshooting.md#a-malformed-connection-string) and
+[MongoDB connection and authentication
+failures](./troubleshooting.md#mongodb-connection-and-authentication-failures).
 
 ### `MONGO_DATABASE`
 
 **Required.** Read by both the bot and the server. `.env.example` ships
 `starguard`, but the value is not optional: blanking it is a fatal error.
 
-The database name. Starguard uses one collection inside it, `users`.
+The database name. Starguard uses two collections inside it: `users`, one
+document per verified member, and `webhook_deliveries`, which remembers the id
+of each webhook delivery for ten minutes so a redelivered one is not acted on
+twice.
+
+**Both are created and indexed at every startup**, whether or not a webhook
+is configured, so a database user that can write only one of them logs a
+failure for the other. On an installation with no webhook,
+`webhook_deliveries` exists and stays empty. Its rows expire by themselves,
+through a TTL index, so nothing has to clean it up.
 
 ### `MONGO_INITDB_ROOT_USERNAME`
 

@@ -2,15 +2,18 @@
 {% block title %}StarGuard - Verification Result{% endblock %}
 {% block content %}
 <h1>GitHub Verification</h1>
-{# Tone comes from the HTTP status. A failure interrupts the screen reader,
-   a success waits its turn. The visible label carries the same distinction in
-   text, so it does not depend on the colour of the border alone. #}
+{# Tone comes from the HTTP status. role="alert" already carries an implicit
+   assertive live region, so a failure interrupts on that alone; role="status"
+   already carries an implicit polite live region, so a success waits its
+   turn the same way. Neither state adds an explicit aria-live (it would only
+   restate what the role already implies) or moves focus to the message
+   (that would open a second, competing announcement path, and for the
+   success case would contradict "waits its turn" by stealing focus outright).
+   The visible label carries the same distinction in text, so it does not
+   depend on the colour of the border alone. #}
 <p
   class="message {{ 'message-error' if is_error else 'message-success' }}"
   role="{{ 'alert' if is_error else 'status' }}"
-  aria-live="{{ 'assertive' if is_error else 'polite' }}"
-  tabindex="-1"
-  autofocus
 >
   <strong class="message-label">{{ "Problem" if is_error else "Success" }}:</strong>
   {{ message }}

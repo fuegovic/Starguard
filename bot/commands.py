@@ -10,6 +10,9 @@ The verification flow lives in :mod:`bot.verification`.
 
 import asyncio
 import logging
+from collections.abc import Sequence
+from itertools import accumulate
+from typing import Final
 
 from interactions import (
     ActionRow,
@@ -20,16 +23,59 @@ from interactions import (
     SlashContext,
     slash_command,
 )
-from pymongo.errors import PyMongoError
 
 from bot import messages
 from bot.config import BotConfig
+from bot.memberlock import MemberLocks
 from bot.starcheck import CheckAlreadyRunningError, StarChecker
 from bot.verification import register_verification
 from common.github_api import GitHubError, fetch_stargazer_logins
 from common.storage import UserCollection
+from common.storage_errors import StorageError
 
 log = logging.getLogger("starguard.bot")
+
+# Discord rejects a message whose content is longer than this outright. It
+# matters here rather than anywhere else because /checkstars concatenates one
+# name per member who lost the role, and a sweep after a repository loses a
+# lot of stars at once can produce hundreds. The roles and the database rows
+# have already been changed by the time the answer is sent, so an over-long
+# list has to be shortened: failing the send would report the whole command
+# as unsuccessful for work that did in fact happen.
+DISCORD_CONTENT_LIMIT: Final = 2000
+
+# What ", " costs between two names, spelled out so the arithmetic below
+# reads as the join it is measuring.
+SEPARATOR: Final = ", "
+
+
+def removed_message(removed: Sequence[str]) -> str:
+    """Render the /checkstars result, short enough for Discord to accept."""
+    names = [f"**{name}**" for name in removed]
+    content = messages.CHECK_REMOVED.format(count=len(names), names=SEPARATOR.join(names))
+    if len(content) <= DISCORD_CONTENT_LIMIT:
+        return content
+
+    # The room the names may use: the limit, less the sentence around them,
+    # less the tail at its longest. The tail is reserved at the worst case
+    # (every name omitted) so the count it carries can never be the thing
+    # that pushes the line back over the limit.
+    room = (
+        DISCORD_CONTENT_LIMIT
+        - len(messages.CHECK_REMOVED.format(count=len(names), names=""))
+        - len(messages.CHECK_REMOVED_MORE.format(count=len(names)))
+    )
+    # Each name's running cost including the separator that precedes the
+    # next one, which overpays by one separator and so cannot under-count.
+    widths = accumulate(len(name) + len(SEPARATOR) for name in names)
+    # The widths only grow, so counting the ones that fit is the same as
+    # taking the longest prefix that fits, without a loop to break out of.
+    shown = sum(width <= room for width in widths)
+    return messages.CHECK_REMOVED.format(
+        count=len(names),
+        names=SEPARATOR.join(names[:shown])
+        + messages.CHECK_REMOVED_MORE.format(count=len(names) - shown),
+    )
 
 
 def register_commands(
@@ -37,11 +83,12 @@ def register_commands(
     config: BotConfig,
     checker: StarChecker,
     users: UserCollection | None,
+    member_locks: MemberLocks,
 ) -> None:
     """Register every command and callback against ``client``."""
     register_info_commands(client, config)
     register_star_commands(client, config, checker)
-    register_verification(client, config, users)
+    register_verification(client, config, users, member_locks)
     register_links_command(client, config)
 
 
@@ -125,7 +172,7 @@ def register_star_commands(client: Client, config: BotConfig, checker: StarCheck
         except GitHubError as exc:
             await ctx.send(messages.GITHUB_UNREACHABLE.format(reason=exc), ephemeral=True)
             return
-        except PyMongoError as exc:
+        except StorageError as exc:
             log.error("checkstars failed: %s", exc)
             await ctx.send(messages.DATABASE_UNREACHABLE, ephemeral=True)
             return
@@ -134,11 +181,7 @@ def register_star_commands(client: Client, config: BotConfig, checker: StarCheck
             await ctx.send(messages.CHECK_NO_CHANGES, ephemeral=True)
             return
 
-        names = ", ".join(f"**{name}**" for name in removed)
-        await ctx.send(
-            messages.CHECK_REMOVED.format(count=len(removed), names=names),
-            ephemeral=True,
-        )
+        await ctx.send(removed_message(removed), ephemeral=True)
 
     client.add_command(starcount)
     client.add_command(check_stars_command)
