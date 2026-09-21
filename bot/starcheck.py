@@ -405,6 +405,31 @@ class StarChecker:
                 )
                 return None
 
+            # The same question about identity rather than freshness, and it
+            # has to be asked separately because a re-link is invisible to
+            # the one above: link_account clears star_event_at when the
+            # account changes, so the row comes back looking untouched by
+            # anything newer than this listing. The decision waiting to be
+            # acted on is about the account this cycle judged, and this row
+            # is no longer that account.
+            #
+            # set_starred refuses the write for the same reason, so the
+            # database was never going to be wrong either way. What it
+            # cannot undo is the role removal, which happens first: without
+            # this the member is stripped on the strength of an answer about
+            # an account they have left, and gets it back a drain interval
+            # later through queue_role_sync. Declining here is what keeps
+            # that interval from happening at all. A legacy row that gained
+            # an account while this waited compares unequal too, which is
+            # the same situation and wants the same answer.
+            if current.get("github_id") != judged_account:
+                log.debug(
+                    "Discord ID %s re-linked while this cycle waited; "
+                    "the listing says nothing about their new account.",
+                    discord_id,
+                )
+                return None
+
             # A member who left the guild returns None here. Calling
             # has_role on that used to raise and take the whole loop down
             # with it.

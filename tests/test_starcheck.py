@@ -562,6 +562,43 @@ def test_a_member_who_stars_during_the_walk_keeps_the_role(monkeypatch):
     assert users.documents[0]["role_sync_pending"] is True
 
 
+def test_a_member_who_relinks_while_the_cycle_waits_keeps_the_role(monkeypatch):
+    # The freshness re-check under the lock cannot see a re-link, and that
+    # is not an oversight in the check: link_account clears star_event_at
+    # when the account changes, so the row comes back looking untouched by
+    # anything newer than the listing.
+    #
+    # set_starred refuses the write, because it names the account this cycle
+    # judged, so the database is right either way. What that refusal cannot
+    # undo is the role removal, which happens first. Without the identity
+    # check the member is stripped on the strength of an answer about an
+    # account they have left, and gets the role back only when the drain
+    # next runs on the entry queue_role_sync raised. Declining here is what
+    # stops that interval from happening at all.
+    document = link(1, "Gone", starred=False)
+    checker, members, channel, users = build(monkeypatch, [document], set())
+    reread = users.find_one
+
+    def relink_first(query, projection=None):
+        # The window between the row this cycle judged and the re-read it
+        # does holding the lock. Applied to the row rather than through
+        # link_account, whose $ne and $unset this module's fake does not
+        # take; that link_account leaves this shape is asserted in
+        # tests/test_storage.py and against mongomock.
+        users.find_one = reread
+        users.documents[0].update(github_id=account_id("Elsewhere"), starred_repo=True)
+        users.documents[0].pop("star_event_at", None)
+        return reread(query, projection)
+
+    users.find_one = relink_first
+
+    assert asyncio.run(checker.run_once()) == []
+    assert members["1"].removals == 0
+    assert members["1"].roles == {ROLE_ID}
+    assert not channel.sent
+    assert users.documents[0]["starred_repo"] is True
+
+
 def test_a_star_event_older_than_the_listing_does_not_stop_the_sweep(monkeypatch):
     # The regression guard for gating on role_sync_pending instead of a
     # timestamp. An operator running with the drain turned off accumulates
