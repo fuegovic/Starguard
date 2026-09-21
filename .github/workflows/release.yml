@@ -70,6 +70,13 @@ jobs:
       # The numeric id of the drafted release, which is how the announce job
       # addresses it. Addressing it by tag would not work: GitHub creates no
       # tag for a draft, so there is nothing yet for a tag lookup to find.
+      #
+      # action.yml declares no outputs at all, so none of these are in its
+      # documented list; the action sets them from the release object it
+      # built, one per field, and CreatedRelease carries id. The action is
+      # pinned by digest below, so that cannot change underneath this
+      # without someone moving the pin. The announce job still refuses to
+      # continue on an empty id rather than reporting success.
       release_id: ${{ steps.release.outputs.id }}
     steps:
       - name: Open, update or land the release pull request
