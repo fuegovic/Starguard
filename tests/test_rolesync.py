@@ -25,6 +25,7 @@ from bot.memberlock import MemberLocks
 from bot.rolesync import DRAIN_ERROR_BACKOFF_MAX_SECONDS, DrainResult, RoleSyncDrainer
 from bot.starcheck import StarChecker
 from common.storage import STAR_SOURCE_WEBHOOK, record_star_event
+from common.storage_errors import StorageError, StorageUnavailableError
 from tests.test_roles import discord_error
 from tests.test_starcheck import (
     GUILD_ID,
@@ -770,3 +771,77 @@ def test_startup_with_the_drain_turned_off_starts_nothing(caplog):
     # The sweep is independent and keeps running.
     assert check_task is not None
     assert "ROLE_SYNC_ENABLED=false" in caplog.text
+
+
+def test_an_outage_abandons_the_pass_instead_of_retrying_every_row():
+    # The drain's per-entry guard is the sweep's, and it had the same hole.
+    # An unreachable database is not one unusable row, it is every row left
+    # in the queue, and each pays the driver's whole server-selection
+    # deadline before saying so. Swallowed per row, a pass against a
+    # database that is gone spends batch-size times that reporting failures
+    # instead of backing off once.
+    drainer, _, _, users = build([pending("1", starred=True), pending("2", starred=True)])
+    reads = []
+
+    def gone(query, projection=None):
+        reads.append(query)
+        raise StorageUnavailableError("no replica set members available")
+
+    users.find_one = gone
+
+    with pytest.raises(StorageUnavailableError):
+        asyncio.run(drainer.drain_once())
+
+    # One row was attempted, not both, which is the whole point.
+    assert len(reads) == 1
+
+
+def test_a_row_the_database_refused_is_still_only_that_row():
+    # The pair, so the fix above cannot be satisfied by letting every
+    # StorageError out: a failure the database answered with still leaves
+    # the row flagged and the queue moving.
+    drainer, _, _, users = build([pending("1", starred=True), pending("2", starred=True)])
+    real = users.find_one
+    calls = []
+
+    def refuse_the_first(query, projection=None):
+        calls.append(query)
+        if len(calls) == 1:
+            raise StorageError("index not found")
+        return real(query, projection)
+
+    users.find_one = refuse_the_first
+
+    result = asyncio.run(drainer.drain_once())
+
+    assert result.examined == 2
+    assert result.failed == 1
+
+
+def test_an_outage_clearing_an_unusable_row_abandons_the_pass():
+    # The unusable-row clear shrugs off a refusal, because nothing was
+    # going to happen to that row anyway. An outage is not a refusal: the
+    # rows behind it are all about to pay the same deadline.
+    drainer, _, _, users = build([unusable("", starred=True), pending("2", starred=True)])
+
+    def gone(query, update, upsert=False):
+        raise StorageUnavailableError("no primary available")
+
+    users.update_one = gone
+
+    with pytest.raises(StorageUnavailableError):
+        asyncio.run(drainer.drain_once())
+
+
+def test_an_outage_clearing_a_synced_row_abandons_the_pass():
+    # And the ordinary clear, which is the write every successful row ends
+    # on, so it is where an outage is likeliest to be met.
+    drainer, _, _, users = build([pending(1, True), pending(2, True)])
+
+    def gone(query, update, upsert=False):
+        raise StorageUnavailableError("no primary available")
+
+    users.update_one = gone
+
+    with pytest.raises(StorageUnavailableError):
+        asyncio.run(drainer.drain_once())

@@ -39,7 +39,7 @@ from common.storage import (
     find_link,
     iter_pending_role_syncs,
 )
-from common.storage_errors import StorageError
+from common.storage_errors import StorageError, StorageUnavailableError
 
 log = logging.getLogger("starguard.bot")
 
@@ -240,6 +240,21 @@ class RoleSyncDrainer:
                 examined += 1
                 try:
                     outcomes[await self._sync_one(guild, channel, entry)] += 1
+                # An unreachable database is not one unusable row, it is
+                # every row left in the queue, and each one pays the
+                # driver's whole server-selection deadline before saying
+                # so. Swallowed here, a drain against a database that is
+                # gone spends batch-size times thirty seconds reporting
+                # failures instead of backing off once. run_forever is
+                # already the right place for it: it logs, counts the
+                # failure and waits. Same rule as bot.starcheck._sweep.
+                except StorageUnavailableError:
+                    log.error(
+                        "The database became unreachable %s row(s) into the queue; "
+                        "abandoning this pass rather than retrying every row.",
+                        examined,
+                    )
+                    raise
                 # One unusable row must not strand the rest of the queue
                 # behind it. Everything below already handles the failures
                 # it expects, so anything reaching here is a surprise worth
@@ -411,6 +426,10 @@ class RoleSyncDrainer:
                 self._users,  # type: ignore[arg-type]
                 entry.get("_id"),
             )
+        # Ahead of StorageError, which it is a subclass of, so an outage
+        # reaches the guard in _drain instead of being counted as this row.
+        except StorageUnavailableError:
+            raise
         except StorageError as exc:
             # Nothing was going to happen to this row anyway, so a failed
             # clear costs only the same line again on the next poll.
@@ -436,6 +455,10 @@ class RoleSyncDrainer:
                 discord_id,
                 starred,
             )
+        # Same reason as above: an unreachable database belongs to the pass,
+        # not to this row.
+        except StorageUnavailableError:
+            raise
         except StorageError as exc:
             # The role is already right and only the bookkeeping failed, so
             # carrying on costs nothing: the next poll reads the row again,
