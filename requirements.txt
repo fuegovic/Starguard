@@ -10,6 +10,6 @@ pymongo==4.18.1
 # 1.2.2 is the fix for PYSEC-2026-2270: set_key/unset_key followed
 # symlinks when rewriting a .env file. Starguard only reads, but shipping a
 # pinned vulnerable version is not worth the argument.
-python-dotenv==1.2.2
+python-dotenv==1.2.3
 requests==2.34.2
 waitress==3.0.2
