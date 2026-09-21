@@ -286,6 +286,22 @@ it is a **replacement** for `docker-compose.yml`, not an addition to it:
 docker compose -f docker-compose.alt.yml up -d
 ```
 
+Set `COMPOSE_FILE` in `.env` at the same time, and every later command in
+this guide is then correct without repeating the `-f` flags:
+
+```dotenv
+COMPOSE_FILE=docker-compose.alt.yml
+```
+
+Compose reads `COMPOSE_FILE` from `.env`, so a bare `docker compose pull` or
+`docker compose up -d server` acts on the stack you actually run. Without it
+those commands read `docker-compose.yml` plus any override instead, which is
+a different set of services: an upgrade restarts containers you are not
+using, and the ones you are keep running the old image. List the files in the
+order you want them merged, separated by `:`, for example
+`docker-compose.yml:docker-compose.override.yml` if you run the default pair
+and want to be explicit.
+
 Before you expose ports 80 and 443, set `NPM_INITIAL_ADMIN_EMAIL` and
 `NPM_INITIAL_ADMIN_PASSWORD` in `.env`. Without them, Nginx Proxy Manager
 starts with its well-known default login (`admin@example.com` / `changeme`)
@@ -551,6 +567,12 @@ docker compose up -d
 `pull` is the one that fetches the newer image. Without it, `up -d` sees a
 container whose image tag has not changed and restarts what you were already
 running, which is the usual reason an upgrade appears to have done nothing.
+
+Those two commands assume Compose resolves to the stack you run. If you
+deploy anything other than `docker-compose.yml` plus its automatic override,
+set `COMPOSE_FILE` in `.env` or pass the same `-f` flags you started with;
+otherwise `pull` fetches images for services you are not running and `up -d`
+leaves the ones you are on their old image.
 
 If you pin `STARGUARD_IMAGE_TAG` to an exact version, change it in `.env`
 first; `pull` then fetches that version instead. Check what you ended up with:
@@ -984,11 +1006,22 @@ It layers onto the all-in-one file the same way:
 docker compose -f docker-compose.alt.yml -f docker-compose.build.yml up -d --build
 ```
 
+Naming files with `-f` turns off the automatic `docker-compose.override.yml`,
+so if you run the bundled MongoDB you have to list it yourself or you will
+build the two images and start them against no database:
+
+```sh
+docker compose -f docker-compose.yml -f docker-compose.override.yml \
+  -f docker-compose.build.yml up -d --build
+```
+
+Setting `COMPOSE_FILE` in `.env`, as described in
+[Step 9](#step-9-start-the-stack), saves repeating that on every command.
+
 Adding a `build:` section to a service that already has an `image:` makes
 compose tag what it builds with that name rather than pull it, so the rest of
-the file is unchanged and `docker-compose.override.yml` still applies. Note
-`--build`: without it compose reuses whatever it built last, which is the
-usual reason a source change appears to do nothing.
+the file is unchanged. Note `--build`: without it compose reuses whatever it
+built last, which is the usual reason a source change appears to do nothing.
 
 ## Verifying what you pulled
 
