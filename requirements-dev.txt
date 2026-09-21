@@ -1,6 +1,6 @@
 -r requirements.txt
 
-pylint==3.3.9
+pylint==4.0.8
 # 9.0.3 is the fix for PYSEC-2026-1845: predictable /tmp/pytest-of-{user}
 # directories, a local privilege escalation. Dev only, never shipped in an
 # image, but CI and maintainer machines run it.
