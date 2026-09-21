@@ -280,6 +280,39 @@ def test_unexpected_payload_shape_raises():
         fetch_stargazer_logins("o", "r", session=session)
 
 
+class UnparseableResponse(FakeResponse):
+    """A 200 whose body is not JSON, the way requests reports it."""
+
+    def json(self):
+        # requests raises this rather than the stdlib error, and it
+        # subclasses RequestException as well as ValueError. That second
+        # base is the whole point of the test: it makes this look like a
+        # transport failure to anything catching RequestException, while it
+        # is raised from a place _get_page's own handler does not cover.
+        raise requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0)
+
+
+def test_a_200_whose_body_is_not_json_raises_githuberror():
+    # A truncated response, or a proxy interstitial served with the status of
+    # the page it replaced. The listing must refuse it as GitHubError, which
+    # is the only exception every caller catches; escaping as requests'
+    # JSONDecodeError took the check cycle down with a traceback instead.
+    session = FakeSession([UnparseableResponse()])
+    with pytest.raises(GitHubError, match="body that is not JSON"):
+        fetch_stargazer_logins("o", "r", session=session)
+
+
+def test_an_unparseable_body_is_refused_rather_than_retried():
+    # Refused on the first response, not retried: a body that is not JSON is
+    # not a transport failure, and _get_page must not be handed a second
+    # chance to turn it into one. One queued response and a session that
+    # raises on an extra request is what proves only one was made.
+    session = FakeSession([UnparseableResponse()])
+    with pytest.raises(GitHubError):
+        fetch_stargazer_logins("o", "r", session=session, sleep=no_sleep)
+    assert len(session.calls) == 1
+
+
 def page(*logins, etag=None, next_url=None):
     """A 200 page, optionally tagged and linked to a next page."""
     return FakeResponse(

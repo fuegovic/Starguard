@@ -389,7 +389,25 @@ def _absorb_page(walk: _Walk, url: str, response: requests.Response, caching: bo
     if response.status_code != OK:
         raise GitHubError(_describe_failure(response))
 
-    page = response.json()
+    try:
+        page = response.json()
+    except ValueError as exc:
+        # A 200 whose body is not JSON at all: a truncated response, or a
+        # proxy or CDN interstitial served with the status of the thing it
+        # replaced. requests raises its own JSONDecodeError, which subclasses
+        # RequestException as well as ValueError, and that inheritance is the
+        # trap: _get_page catches RequestException around the transport call
+        # only, so this parse sits outside it and the error escaped
+        # fetch_stargazer_listing unconverted. Every caller catches
+        # GitHubError and nothing else, so an un-translated one took down the
+        # check cycle with a traceback instead of the handled path.
+        #
+        # Refused rather than retried, alongside the shape check below, for
+        # the reason in this function's own docstring: a listing this cannot
+        # read in full is incomplete, and acting on an incomplete listing
+        # strips roles from people who never un-starred.
+        raise GitHubError("A page of stargazers came back with a body that is not JSON.") from exc
+
     if not isinstance(page, list):
         raise GitHubError("Unexpected response shape from the GitHub API.")
 
