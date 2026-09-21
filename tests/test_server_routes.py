@@ -7,11 +7,14 @@ nothing in the module reaches for MongoDB.
 
 # Test names document the behaviour under test, and the fakes below
 # deliberately mirror signatures they do not use.
-# pylint: disable=missing-function-docstring,unused-argument
+# The deadline test below reaches for the Authlib session the registered
+# client builds, which is the only place the value it asserts can be read.
+# pylint: disable=missing-function-docstring,unused-argument,protected-access
 
 import pytest
 
 from common.config import ConfigError
+from common.github_api import REQUEST_TIMEOUT
 from common.linktoken import issue_link_token
 from server.config import ServerConfig, load_server_config
 from server.server import create_app, main
@@ -57,6 +60,29 @@ def make_client(**overrides):
 @pytest.fixture(name="client")
 def client_fixture():
     return make_client()
+
+
+def test_every_github_call_from_the_server_has_a_deadline():
+    # Authlib applies this per request, so without it the token exchange, the
+    # profile read and the starred check inherit requests' default of no
+    # timeout at all and a connection GitHub never closes pins a waitress
+    # worker for the life of the process. There are four of those threads by
+    # default and every route shares them.
+    #
+    # Asserted on the session Authlib actually builds, not on the kwargs this
+    # code passes in, because the spelling is the part that breaks silently:
+    # "default_timeout" is forwarded to the session, while a plain "timeout"
+    # would be swallowed into the client's metadata and leave the calls
+    # exactly as unbounded as they were, with a line of configuration that
+    # reads as though it had fixed them.
+    app = create_app(make_config(), users=None)
+    with app.test_request_context("/"):
+        session = app.extensions["starguard"].github._get_oauth_client()
+
+    assert session.default_timeout == REQUEST_TIMEOUT
+    # The same deadline the bot's own GitHub client uses, so the two halves
+    # wait the same amount of time on the same API.
+    assert REQUEST_TIMEOUT == 30
 
 
 def test_home_page_reveals_nothing(client):

@@ -18,15 +18,18 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
+from common.deliveries import (
+    DELIVERY_COLLECTION_NAME,
+    claim_delivery,
+    release_delivery,
+)
 from common.storage import (
     COLLECTION_NAME,
-    DELIVERY_COLLECTION_NAME,
     SCHEMA_VERSION,
     STAR_SOURCE_SWEEP,
     STAR_SOURCE_WEBHOOK,
     AccountAlreadyLinkedError,
     all_links,
-    claim_delivery,
     clear_role_sync_pending,
     clear_role_sync_pending_by_id,
     connect,
@@ -38,7 +41,6 @@ from common.storage import (
     purge_legacy_secrets,
     read_updated_at,
     record_star_event,
-    release_delivery,
     set_starred,
     star_event_is_newer,
 )

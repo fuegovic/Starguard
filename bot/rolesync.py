@@ -26,7 +26,6 @@ from dataclasses import asdict, dataclass
 from typing import Final, Literal
 
 from interactions import TYPE_MESSAGEABLE_CHANNEL, Client, Guild
-from pymongo.errors import PyMongoError
 
 from bot.config import BotConfig
 from bot.memberlock import MemberLocks
@@ -40,6 +39,7 @@ from common.storage import (
     find_link,
     iter_pending_role_syncs,
 )
+from common.storage_errors import StorageError
 
 log = logging.getLogger("starguard.bot")
 
@@ -411,7 +411,7 @@ class RoleSyncDrainer:
                 self._users,  # type: ignore[arg-type]
                 entry.get("_id"),
             )
-        except PyMongoError as exc:
+        except StorageError as exc:
             # Nothing was going to happen to this row anyway, so a failed
             # clear costs only the same line again on the next poll.
             log.error("Could not clear the unusable pending role sync: %s", exc)
@@ -436,7 +436,7 @@ class RoleSyncDrainer:
                 discord_id,
                 starred,
             )
-        except PyMongoError as exc:
+        except StorageError as exc:
             # The role is already right and only the bookkeeping failed, so
             # carrying on costs nothing: the next poll reads the row again,
             # finds Discord agrees with it and clears it then.

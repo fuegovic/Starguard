@@ -26,12 +26,12 @@ from authlib.integrations.flask_client import OAuth, OAuthError
 from dotenv import load_dotenv
 from flask import Flask, Response, current_app, render_template, request, session, url_for
 from pymongo import MongoClient
-from pymongo.errors import PyMongoError
 from waitress import serve
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.wrappers import Response as WerkzeugResponse
 
 from common.config import ConfigError
+from common.github_api import REQUEST_TIMEOUT
 from common.linktoken import LinkTokenError, read_link_token
 from common.logging_setup import configure_logging
 from common.ratelimit import RateLimiter
@@ -40,7 +40,9 @@ from common.storage import (
     UserCollection,
     connect,
     link_account,
+    ping,
 )
+from common.storage_errors import StorageError
 from server import messages
 from server.config import ServerConfig, load_server_config
 from server.security import install_security
@@ -256,7 +258,7 @@ def authorize() -> Response:
             discord_id,
         )
         return render_result(messages.ALREADY_LINKED.format(github_username=github_username), 409)
-    except PyMongoError as exc:
+    except StorageError as exc:
         log.error("Could not save the link: %s", exc)
         return render_result(messages.SAVE_FAILED, 503)
 
@@ -279,14 +281,13 @@ def healthz() -> tuple[dict[str, str], int]:
         return {"status": "degraded", "database": "unavailable"}, 503
 
     try:
-        # A handle is not a connection. pymongo connects lazily and connect()
-        # logs a failed preparation rather than raising, so this object
-        # exists whether or not MongoDB is reachable; only a command that
-        # goes to the server tells the two apart. Without one, the compose
-        # healthcheck reads 200 straight through an outage and keeps the
-        # container in service while every link attempt fails.
-        users.database.command("ping")
-    except PyMongoError as exc:
+        # A handle is not a connection, so this asks the server a question
+        # rather than trusting the object's existence; see common.storage.ping
+        # for the whole reason. Without it the compose healthcheck reads 200
+        # straight through an outage and keeps the container in service while
+        # every link attempt fails.
+        ping(users)
+    except StorageError as exc:
         log.error("Health probe could not reach MongoDB: %s", exc)
         return {"status": "degraded", "database": "unavailable"}, 503
 
@@ -303,7 +304,7 @@ def connect_users(config: ServerConfig) -> UserCollection | None:
     try:
         _, users = connect(config.mongo_host, config.mongo_database, MongoClient)
         return users
-    except PyMongoError as exc:
+    except StorageError as exc:
         log.error("Error connecting to MongoDB: %s", exc)
         return None
 
@@ -366,7 +367,30 @@ def create_app(
         # The real secret is config.client_secret, read from the environment.
         access_token_url="https://github.com/login/oauth/access_token",  # nosec B106
         api_base_url="https://api.github.com/",
-        client_kwargs={"scope": GITHUB_OAUTH_SCOPE},
+        client_kwargs={
+            "scope": GITHUB_OAUTH_SCOPE,
+            # Every call this client makes to GitHub gets a deadline: the
+            # token exchange, the profile read and the starred check. Without
+            # one they inherit requests' default of no timeout at all, so a
+            # connection GitHub never closes holds a waitress worker for as
+            # long as the process runs. waitress serves this whole
+            # application from four threads by default, and /login,
+            # /authorize and the webhook receiver all draw on the same four,
+            # so a handful of hung requests is the difference between a slow
+            # GitHub and an unreachable Starguard.
+            #
+            # The spelling matters. Authlib only applies this when it is
+            # called default_timeout: a plain "timeout" here is not one of
+            # the keys it forwards to the session, so it would be swallowed
+            # into the client's metadata and silently do nothing, which is
+            # the worst of the three outcomes. See
+            # authlib.integrations.requests_client.OAuth2Session.request,
+            # which does kwargs.setdefault("timeout", self.default_timeout).
+            #
+            # The value is the bot's REQUEST_TIMEOUT, so both halves of
+            # Starguard wait the same amount of time on the same API.
+            "default_timeout": REQUEST_TIMEOUT,
+        },
     )
 
     app.extensions["starguard"] = ServerContext(config=config, users=users, github=github)

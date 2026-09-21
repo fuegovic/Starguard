@@ -21,7 +21,6 @@ from typing import Any
 from dotenv import load_dotenv
 from interactions import Client, Intents, listen
 from pymongo import MongoClient
-from pymongo.errors import PyMongoError
 
 from bot.commands import register_commands
 from bot.config import BotConfig, load_bot_config
@@ -32,6 +31,7 @@ from bot.starcheck import StarChecker
 from common.config import ConfigError
 from common.logging_setup import configure_logging
 from common.storage import UserCollection, connect
+from common.storage_errors import StorageError
 
 log = logging.getLogger("starguard.bot")
 
@@ -176,7 +176,7 @@ def connect_users(config: BotConfig) -> UserCollection | None:
     try:
         _, users = connect(config.mongo_host, config.mongo_database, MongoClient)
         return users
-    except PyMongoError as exc:
+    except StorageError as exc:
         log.error("Error connecting to MongoDB: %s", exc)
         return None
 

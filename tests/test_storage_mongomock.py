@@ -12,18 +12,21 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pymongo.errors import DuplicateKeyError
 
-from common.storage import (
+from common.deliveries import (
     DELIVERY_RETENTION_SECONDS,
+    claim_delivery,
+    deliveries_for,
+    ensure_delivery_indexes,
+    release_delivery,
+)
+from common.storage import (
     SCHEMA_VERSION,
     STAR_SOURCE_SWEEP,
     STAR_SOURCE_WEBHOOK,
     AccountAlreadyLinkedError,
     all_links,
-    claim_delivery,
     clear_role_sync_pending,
     clear_role_sync_pending_by_id,
-    deliveries_for,
-    ensure_delivery_indexes,
     ensure_indexes,
     find_link,
     find_link_by_github_id,
@@ -33,7 +36,6 @@ from common.storage import (
     read_datetime,
     read_updated_at,
     record_star_event,
-    release_delivery,
     set_starred,
     star_event_is_newer,
     upgrade_documents,

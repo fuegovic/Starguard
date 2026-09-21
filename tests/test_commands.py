@@ -12,7 +12,6 @@ with them. Nothing here reaches GitHub, Discord or MongoDB.
 import asyncio
 
 import pytest
-from pymongo.errors import PyMongoError
 
 from bot import messages
 from bot.commands import (
@@ -25,6 +24,7 @@ from bot.commands import (
 from bot.memberlock import MemberLocks
 from bot.starcheck import CheckAlreadyRunningError
 from common.github_api import GitHubError
+from common.storage_errors import StorageError
 from tests.test_starcheck import make_config
 from tests.test_verification import FakeContext, RecordingClient
 
@@ -218,7 +218,7 @@ def test_checkstars_reports_an_unreachable_github():
 
 
 def test_checkstars_reports_an_unreachable_database(caplog):
-    checker = FakeChecker(error=PyMongoError("no primary available"))
+    checker = FakeChecker(error=StorageError("no primary available"))
     with caplog.at_level("ERROR", logger="starguard.bot"):
         ctx = call(star_client(checker), "checkstars")
 

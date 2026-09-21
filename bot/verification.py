@@ -23,7 +23,6 @@ from interactions import (
     component_callback,
     slash_command,
 )
-from pymongo.errors import PyMongoError
 
 from bot import messages
 from bot.config import BotConfig
@@ -31,6 +30,7 @@ from bot.memberlock import MemberLocks
 from bot.roles import safe_add_role, safe_remove_role
 from common.linktoken import issue_link_token
 from common.storage import UserCollection, find_link
+from common.storage_errors import StorageError
 
 log = logging.getLogger("starguard.bot")
 
@@ -114,6 +114,27 @@ def register_verification(
     @component_callback(CLAIM_BUTTON_ID)
     async def claim_callback(ctx: ComponentContext) -> None:
         """Grant the role if the clicking user has a recorded star."""
+        # Discord invalidates the interaction token unless something answers
+        # inside three seconds, and the answer this handler gave was its
+        # first ctx.send, which sits behind a member lock, a Mongo read and
+        # a Discord role call. Any one of those can outlast the window: the
+        # lock can be held by a sweep or a drain working on this very member,
+        # and the role call can be retried through a 429 with a Retry-After.
+        # The member then read "This interaction failed" while the role had
+        # in fact been granted and recorded, so the message was lost and the
+        # outcome looked like the opposite of what happened. Deferring
+        # answers at once and turns three seconds into fifteen minutes, which
+        # is what /starcount and /checkstars already do ahead of comparable
+        # work.
+        #
+        # Ephemeral, because every outcome below except the thank-you is for
+        # the member who pressed the button and nobody else. That choice
+        # binds the whole interaction rather than one message: deferring
+        # ephemeral makes the first ctx.send ephemeral whatever it asks for.
+        # The thank-you stays public by not being the first send; see the end
+        # of this function.
+        await ctx.defer(ephemeral=True)
+
         if users is None:
             await ctx.send(content=messages.CLAIM_DATABASE_UNAVAILABLE, ephemeral=True)
             return
@@ -151,7 +172,7 @@ def register_verification(
         async with member_locks.hold(ctx.author_id):
             try:
                 user_entry = await asyncio.to_thread(find_link, users, ctx.author_id)
-            except PyMongoError as exc:
+            except StorageError as exc:
                 log.error("Could not read the link for %s: %s", ctx.author_id, exc)
                 await ctx.send(content=messages.CLAIM_LOOKUP_FAILED, ephemeral=True)
                 return
@@ -190,6 +211,18 @@ def register_verification(
                 await ctx.send(content=messages.CLAIM_ROLE_FAILED, ephemeral=True)
                 return
 
+            # Two messages, and the order carries the whole design. After an
+            # ephemeral defer the first send edits the deferred reply, which
+            # Discord fixed as ephemeral when the defer was sent, so it is
+            # private however it is called; every send after that one is a
+            # followup and carries the flags it was given. So the private
+            # confirmation goes first to settle the interaction, and the
+            # thank-you follows as the followup that can still be public.
+            #
+            # Sending the thank-you on its own here would make it ephemeral
+            # and silently undo the one thing in this flow the whole server
+            # is meant to see.
+            await ctx.send(content=messages.CLAIM_GRANTED, ephemeral=True)
             # B311: picks a thank-you message, not a secret. The nosec has
             # to sit on the random.choice line rather than the send, because
             # bandit matches a suppression to the line it reports the issue

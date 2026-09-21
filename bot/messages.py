@@ -104,6 +104,9 @@ CLAIM_ALREADY_HELD = "You already claimed your role 😁\n💫Thanks!"
 CLAIM_ROLE_FAILED = (
     "I could not assign the role. Please ask a moderator to check my permissions and role position."
 )
+# Sent privately to whoever pressed the button. The public thank-you follows
+# it as a second message; see the claim handler for why the two cannot be one.
+CLAIM_GRANTED = "Role granted. You should see it on your profile now."
 
 # --- /checkstars ----------------------------------------------------------
 CHECK_ALREADY_RUNNING = (

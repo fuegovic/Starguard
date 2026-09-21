@@ -81,16 +81,18 @@ from typing import Any, Final, Literal
 from pymongo import ASCENDING, MongoClient, ReturnDocument
 from pymongo.collection import Collection
 from pymongo.database import Database
-from pymongo.errors import DuplicateKeyError, PyMongoError
+from pymongo.errors import DuplicateKeyError
+
+from common.deliveries import ensure_delivery_indexes, get_delivery_collection
+from common.storage_errors import (
+    StorageError,
+    translates_driver_errors,
+    translates_driver_errors_while_iterating,
+)
 
 log = logging.getLogger(__name__)
 
 COLLECTION_NAME: Final = "users"
-
-# Delivery ids seen recently, so a replayed webhook is dropped before it is
-# acted on. Kept out of the users collection because the rows expire and
-# nothing else joins against them.
-DELIVERY_COLLECTION_NAME: Final = "webhook_deliveries"
 
 # pymongo spells a BSON document ``dict[str, Any]``, because a document really
 # can hold anything the driver can encode, and the driver's own generics are
@@ -102,7 +104,6 @@ DELIVERY_COLLECTION_NAME: Final = "webhook_deliveries"
 # documents need.
 MongoDocument = dict[str, Any]
 UserCollection = Collection[MongoDocument]
-DeliveryCollection = Collection[MongoDocument]
 
 # Which path last moved `starred_repo`. Recorded so the two can be told
 # apart: a row the webhook never touches while the sweep keeps correcting it
@@ -124,19 +125,6 @@ STAR_SOURCE_SWEEP: Final[StarSource] = "sweep"
 # older ones forward at startup. Readers still accept version 1 values, so a
 # rollback to the previous release does not lose anybody's link.
 SCHEMA_VERSION: Final = 3
-
-# How long a delivery id is remembered. This is deliberately short. GitHub
-# reuses the same delivery id when an operator redelivers a failed webhook by
-# hand, which is the documented way to recover after this server was down, so
-# deduplicating forever would silently swallow exactly the recovery an
-# operator is reaching for. Ten minutes drops the accidental duplicates (the
-# retry of a delivery that was processed but whose response was lost) and
-# still lets a deliberate redelivery minutes or hours later through.
-#
-# MongoDB's TTL remover is a background job that runs about once a minute, so
-# a row can outlive the window briefly; nothing here depends on the deletion
-# being prompt.
-DELIVERY_RETENTION_SECONDS: Final = 600
 
 # Fields earlier versions wrote that must never be stored again. The OAuth
 # access token in particular was kept in clear text alongside a `repo` scope,
@@ -163,21 +151,7 @@ def get_collection(database: Database[MongoDocument]) -> UserCollection:
     return database[COLLECTION_NAME]
 
 
-def get_delivery_collection(database: Database[MongoDocument]) -> DeliveryCollection:
-    """Return the seen-deliveries collection from ``database``."""
-    return database[DELIVERY_COLLECTION_NAME]
-
-
-def deliveries_for(collection: UserCollection) -> DeliveryCollection:
-    """Return the deliveries collection that sits beside ``collection``.
-
-    Both processes are handed the users collection and nothing else, so this
-    is how the webhook route reaches the second one without a second
-    connection or a second set of configuration.
-    """
-    return get_delivery_collection(collection.database)
-
-
+@translates_driver_errors
 def ensure_indexes(collection: UserCollection) -> None:
     """Create the uniqueness constraints the linking rules rely on.
 
@@ -206,76 +180,7 @@ def ensure_indexes(collection: UserCollection) -> None:
     )
 
 
-def ensure_delivery_indexes(collection: DeliveryCollection) -> None:
-    """Create the uniqueness constraint and the expiry the dedupe relies on.
-
-    The unique index is what makes :func:`claim_delivery` atomic, and the TTL
-    index is what keeps the collection from growing without bound and what
-    reopens the window for a manual redelivery. See
-    :data:`DELIVERY_RETENTION_SECONDS` for why that window is short.
-    """
-    collection.create_index(
-        [("delivery_id", ASCENDING)],
-        unique=True,
-        name="delivery_id_unique",
-    )
-    collection.create_index(
-        [("seen_at", ASCENDING)],
-        name="delivery_seen_at_ttl",
-        expireAfterSeconds=DELIVERY_RETENTION_SECONDS,
-    )
-
-
-def claim_delivery(
-    collection: DeliveryCollection,
-    delivery_id: object,
-    seen_at: datetime,
-) -> bool:
-    """Remember ``delivery_id``, and say whether this is its first sighting.
-
-    True means the caller has the delivery and should act on it; False means
-    another request already claimed it and this one is a replay.
-
-    The insert against the unique index is the whole mechanism, and it is
-    what makes the test and the record one step. A read followed by a write
-    would let two concurrent deliveries of the same id both find nothing and
-    both proceed, which is the case that matters: GitHub retries a delivery
-    whose response it did not get, and the retry can overlap the first
-    attempt that is still running.
-    """
-    try:
-        collection.insert_one({"delivery_id": str(delivery_id), "seen_at": seen_at})
-    except DuplicateKeyError:
-        return False
-    return True
-
-
-def release_delivery(collection: DeliveryCollection, delivery_id: object) -> None:
-    """Forget ``delivery_id``, so a redelivery of it is new work again.
-
-    The inverse of :func:`claim_delivery`, for a caller that claimed a
-    delivery and then could not process it. Without this the claim stands
-    for the whole retention window although nothing was recorded, and an
-    operator following the documented recovery, redelivering the event by
-    hand, is told it has already been handled.
-
-    This makes a claim deliberately non-idempotent, which is the opposite
-    of what the collection is for, so the distinction is worth stating
-    plainly: a row here means "this delivery is being handled", not "this
-    delivery has been handled". A claim that never became a recorded
-    change is not a fact worth keeping, and the only thing keeping it can
-    achieve is swallowing the retry that would have fixed it.
-
-    Errors are left to propagate and the caller swallows them. That is not
-    an oversight to be tidied up later: the database this has to reach is
-    the one that has just refused a write, so failing here is likely in
-    exactly the case this is needed, and a failed release leaves the claim
-    standing, which is the outcome there was anyway. Raising would replace
-    the failure the caller is already reporting with a less useful one.
-    """
-    collection.delete_one({"delivery_id": str(delivery_id)})
-
-
+@translates_driver_errors
 def purge_legacy_secrets(collection: UserCollection) -> int:
     """Delete credentials written by older versions. Returns rows changed.
 
@@ -322,6 +227,7 @@ def read_updated_at(document: Mapping[str, object]) -> datetime | None:
     return read_datetime(document, "updated_at")
 
 
+@translates_driver_errors
 def upgrade_documents(collection: UserCollection) -> int:
     """Bring documents written by older versions up to SCHEMA_VERSION.
 
@@ -369,11 +275,13 @@ def upgrade_documents(collection: UserCollection) -> int:
     return upgraded
 
 
+@translates_driver_errors
 def find_link(collection: UserCollection, discord_id: object) -> MongoDocument | None:
     """Return the link document for ``discord_id``, or None."""
     return collection.find_one({"discord_id": str(discord_id)})
 
 
+@translates_driver_errors
 def find_link_by_github_id(
     collection: UserCollection, github_id: int | str
 ) -> MongoDocument | None:
@@ -388,6 +296,7 @@ def find_link_by_github_id(
     return collection.find_one({"github_id": int(github_id)})
 
 
+@translates_driver_errors_while_iterating
 def iter_links(collection: UserCollection) -> Iterator[MongoDocument]:
     """Yield every link document, without the Mongo ``_id``.
 
@@ -405,6 +314,7 @@ def all_links(collection: UserCollection) -> list[MongoDocument]:
     return list(iter_links(collection))
 
 
+@translates_driver_errors
 def link_account(
     collection: UserCollection,
     discord_id: object,
@@ -578,6 +488,7 @@ def link_account(
     return document
 
 
+@translates_driver_errors
 def set_starred(
     collection: UserCollection,
     discord_id: object,
@@ -714,6 +625,7 @@ def star_event_is_newer(document: Mapping[str, object], observed_at: datetime) -
     return star_event_at is not None and star_event_at > _last_millisecond_before(observed_at)
 
 
+@translates_driver_errors
 def record_star_event(
     collection: UserCollection,
     github_id: int | str,
@@ -799,6 +711,7 @@ def record_star_event(
     return collection.find_one({"github_id": github_id}, {"_id": 0})
 
 
+@translates_driver_errors_while_iterating
 def iter_pending_role_syncs(collection: UserCollection) -> Iterator[MongoDocument]:
     """Yield the links waiting for the bot to move a role, ``_id`` included.
 
@@ -831,6 +744,7 @@ def iter_pending_role_syncs(collection: UserCollection) -> Iterator[MongoDocumen
     yield from collection.find({"role_sync_pending": True})
 
 
+@translates_driver_errors
 def queue_role_sync(collection: UserCollection, discord_id: object) -> None:
     """Hand ``discord_id`` to the drain, for the sweep to admit it was stale.
 
@@ -876,6 +790,7 @@ def queue_role_sync(collection: UserCollection, discord_id: object) -> None:
     )
 
 
+@translates_driver_errors
 def clear_role_sync_pending(
     collection: UserCollection,
     discord_id: object,
@@ -914,6 +829,7 @@ def clear_role_sync_pending(
     return matched > 0
 
 
+@translates_driver_errors
 def clear_role_sync_pending_by_id(collection: UserCollection, document_id: object) -> None:
     """Lower the flag on one row by its Mongo ``_id``, unconditionally.
 
@@ -950,6 +866,25 @@ def clear_role_sync_pending_by_id(collection: UserCollection, document_id: objec
     collection.update_one({"_id": document_id}, {"$set": {"role_sync_pending": False}})
 
 
+@translates_driver_errors
+def ping(collection: UserCollection) -> None:
+    """Ask the server whether it is actually reachable.
+
+    A handle is not a connection. pymongo connects lazily and :func:`connect`
+    logs a failed preparation rather than raising, so this object exists
+    whether or not MongoDB is up; only a command that goes to the server
+    tells the two apart.
+
+    Here rather than in the health route because the route was the one place
+    left outside this module that called the driver directly. A reader
+    looking for everything Starguard asks of its database should find it all
+    in one file, and a future change of store should not have to notice a
+    stray ``database.command`` in a Flask handler.
+    """
+    collection.database.command("ping")
+
+
+@translates_driver_errors
 def connect(
     mongo_host: str,
     mongo_database: str,
@@ -994,7 +929,7 @@ def connect(
     for description, prepare in preparations:
         try:
             prepare()
-        except PyMongoError as exc:
+        except StorageError as exc:
             log.warning("Could not %s: %s", description, exc)
 
     return client, collection

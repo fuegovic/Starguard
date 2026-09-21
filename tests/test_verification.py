@@ -62,7 +62,12 @@ class RecordingClient:
 
 
 class Sent:
-    """One message a handler sent back to the interaction."""
+    """One message a handler sent back to the interaction.
+
+    ``ephemeral`` is what Discord would actually do with the message, not
+    what the call asked for. The two differ on exactly one message per
+    interaction; see FakeContext.send.
+    """
 
     def __init__(self, content, components, ephemeral, embed):
         self.content = content
@@ -112,12 +117,25 @@ class FakeContext:
         self.author_id = self.author.id
         self.sent = []
         self.deferred = False
+        self.deferred_ephemeral = None
 
     async def defer(self, ephemeral=False):
         self.deferred = True
+        self.deferred_ephemeral = ephemeral
 
     async def send(self, content=None, components=None, ephemeral=False, embed=None):
-        self.sent.append(Sent(content, components, ephemeral, embed))
+        # interactions.py routes the first send after a defer to
+        # edit_interaction_message, which edits the reply Discord already
+        # created, and its visibility was fixed by the defer. Only the sends
+        # after that one become followups carrying their own flags. So a
+        # handler that defers ephemeral and then sends the message everybody
+        # is supposed to see gets a private one and no error, which is the
+        # sort of thing a fake that simply believes the argument would never
+        # show. See interactions.models.internal.context._send_http_request.
+        effective = ephemeral
+        if self.deferred and not self.sent:
+            effective = self.deferred_ephemeral
+        self.sent.append(Sent(content, components, effective, embed))
 
     @property
     def last(self):
@@ -257,6 +275,65 @@ def test_claiming_with_a_recorded_star_grants_the_role():
     # The thank you is public: it is the only visible sign the bot works.
     assert ctx.last.ephemeral is False
     assert str(AUTHOR_ID) in ctx.last.content
+
+
+class DeferWatchingUsers(FakeUsers):
+    """Records whether the interaction had been acked by lookup time."""
+
+    def __init__(self, document, ctx):
+        super().__init__(document)
+        self._ctx = ctx
+        self.deferred_at_lookup = None
+
+    def find_one(self, query, projection=None):
+        self.deferred_at_lookup = self._ctx.deferred
+        return super().find_one(query, projection)
+
+
+def test_claiming_acks_the_interaction_before_it_touches_the_database():
+    # The defect this closes. Discord drops the interaction token unless
+    # something answers inside three seconds, and the answer used to be the
+    # final ctx.send, behind a member lock, a Mongo read and a role call. A
+    # lock held by a sweep working on this same member, or a role call
+    # retried through a 429, put the first answer past the window: the member
+    # read "This interaction failed" while the role had been granted and
+    # recorded, so the outcome looked like its own opposite.
+    #
+    # Checked from inside the lookup rather than after the handler returns,
+    # because ctx.deferred is True at the end either way, including if the
+    # defer were the last line in the function.
+    ctx = FakeContext(FakeMember())
+    users = DeferWatchingUsers(linked(starred=True), ctx)
+    client, _ = register(users=users)
+
+    run(client, CLAIM_BUTTON_ID, ctx)
+
+    assert users.deferred_at_lookup is True
+
+
+def test_the_public_thank_you_is_the_second_message_and_not_the_first():
+    # The ordering is the design, not a detail. The defer has to be ephemeral
+    # because every other outcome is for the member alone, and that makes the
+    # first send ephemeral whatever it asks for. So the private confirmation
+    # goes first to settle the interaction and the thank-you follows as a
+    # followup, which is the only send left that can still be public.
+    #
+    # Written as an explicit two-message assertion rather than a check on the
+    # last message, because the way this breaks is by collapsing back into
+    # one send: that version answers, grants the role, records it and passes
+    # every other test here, and the only thing wrong with it is that the
+    # message the whole server is meant to see is visible to one person.
+    client, _ = register(users=FakeUsers(linked(starred=True)))
+    ctx = run(client, CLAIM_BUTTON_ID, FakeContext(FakeMember()))
+
+    assert ctx.deferred_ephemeral is True
+    assert len(ctx.sent) == 2
+
+    confirmation, thanks = ctx.sent
+    assert confirmation.content == messages.CLAIM_GRANTED
+    assert confirmation.ephemeral is True
+    assert thanks.ephemeral is False
+    assert str(AUTHOR_ID) in thanks.content
 
 
 def test_claiming_looks_the_member_up_by_their_own_discord_id():

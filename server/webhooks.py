@@ -44,18 +44,20 @@ from datetime import UTC, datetime
 from typing import Final
 
 from flask import Flask, Response, current_app, request
-from pymongo.errors import PyMongoError
 
+from common.deliveries import (
+    claim_delivery,
+    deliveries_for,
+    release_delivery,
+)
 from common.storage import (
     STAR_SOURCE_WEBHOOK,
     MongoDocument,
     UserCollection,
-    claim_delivery,
-    deliveries_for,
     read_datetime,
     record_star_event,
-    release_delivery,
 )
+from common.storage_errors import StorageError
 
 log = logging.getLogger("starguard.webhooks")
 
@@ -214,7 +216,7 @@ def _release_claim(users: UserCollection, delivery_id: str) -> None:
     """
     try:
         release_delivery(deliveries_for(users), delivery_id)
-    except PyMongoError as exc:
+    except StorageError as exc:
         log.error("Could not release webhook delivery %s: %s", delivery_id, exc)
 
 
@@ -244,7 +246,7 @@ def _was_recorded(document: MongoDocument, occurred_at: datetime) -> bool:
 
 
 def _handle_star(users: UserCollection, payload: Mapping[str, object]) -> Response:
-    """Record one verified star event. Raises PyMongoError to the caller."""
+    """Record one verified star event. Raises StorageError to the caller."""
     delivery_id = request.headers.get(DELIVERY_HEADER)
     if not delivery_id:
         # GitHub always sends one. Without it there is no dedupe key, and
@@ -284,7 +286,7 @@ def _handle_star(users: UserCollection, payload: Mapping[str, object]) -> Respon
             source=STAR_SOURCE_WEBHOOK,
             occurred_at=occurred_at,
         )
-    except PyMongoError:
+    except StorageError:
         # The claim was taken before the work was attempted and the work did
         # not happen, so the claim is a lie the next ten minutes would tell.
         # Redelivering by hand is the documented way to recover from exactly
@@ -377,7 +379,7 @@ def github_webhook() -> Response:
 
     try:
         return _handle_star(context.users, payload)
-    except PyMongoError as exc:
+    except StorageError as exc:
         # The database was reachable at startup and is not now. A 5xx here
         # marks the delivery failed in GitHub's log, which is the one place
         # an operator can redeliver it from once the database is back.

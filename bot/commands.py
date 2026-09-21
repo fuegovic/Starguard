@@ -23,7 +23,6 @@ from interactions import (
     SlashContext,
     slash_command,
 )
-from pymongo.errors import PyMongoError
 
 from bot import messages
 from bot.config import BotConfig
@@ -32,6 +31,7 @@ from bot.starcheck import CheckAlreadyRunningError, StarChecker
 from bot.verification import register_verification
 from common.github_api import GitHubError, fetch_stargazer_logins
 from common.storage import UserCollection
+from common.storage_errors import StorageError
 
 log = logging.getLogger("starguard.bot")
 
@@ -172,7 +172,7 @@ def register_star_commands(client: Client, config: BotConfig, checker: StarCheck
         except GitHubError as exc:
             await ctx.send(messages.GITHUB_UNREACHABLE.format(reason=exc), ephemeral=True)
             return
-        except PyMongoError as exc:
+        except StorageError as exc:
             log.error("checkstars failed: %s", exc)
             await ctx.send(messages.DATABASE_UNREACHABLE, ephemeral=True)
             return

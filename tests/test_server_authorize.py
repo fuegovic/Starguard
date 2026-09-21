@@ -23,6 +23,7 @@ from authlib.integrations.flask_client import OAuthError
 from pymongo.errors import PyMongoError
 
 from common.storage import STAR_SOURCE_WEBHOOK, link_account, record_star_event
+from common.storage_errors import StorageError
 from server import messages
 from server.server import ServerContext, connect_users, create_app, main
 from server.webhooks import MAX_REQUEST_BODY_BYTES
@@ -496,7 +497,7 @@ def test_an_unreachable_database_leaves_the_server_running(monkeypatch, caplog):
     # A degraded /healthz and a clear message beat a process that will not
     # start, because the OAuth flow is the only thing that needs the database.
     def refuse(host, database, factory):
-        raise PyMongoError("no route to host")
+        raise StorageError("no route to host")
 
     monkeypatch.setattr("server.server.connect", refuse)
     with caplog.at_level("ERROR", logger="starguard.server"):

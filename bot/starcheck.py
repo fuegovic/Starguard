@@ -21,7 +21,6 @@ from interactions import (
     Member,
 )
 from interactions.client.errors import Forbidden, HTTPException
-from pymongo.errors import PyMongoError
 
 from bot.config import BotConfig
 from bot.memberlock import MemberLocks
@@ -37,6 +36,7 @@ from common.storage import (
     set_starred,
     star_event_is_newer,
 )
+from common.storage_errors import StorageError
 
 log = logging.getLogger("starguard.bot")
 
@@ -318,7 +318,23 @@ class StarChecker:
 
             for entry in batch:
                 examined += 1
-                name = await self._check_one(guild, channel, entry, listing, observed_at)
+                try:
+                    name = await self._check_one(guild, channel, entry, listing, observed_at)
+                # The rule the drain already follows (see rolesync._drain),
+                # and it matters more here. The drain leaves a failed row's
+                # flag raised and comes back to it; the sweep has no queue,
+                # it walks iter_links from the beginning every cycle. So a
+                # single row that raises did not cost one member a check, it
+                # aborted _run_cycle, and run_forever's retry started the
+                # same walk and reached the same row again. Nobody after it
+                # in the listing was ever checked again, and the only signal
+                # was a repeating traceback in the log.
+                except Exception:  # pylint: disable=broad-except
+                    log.exception(
+                        "Could not check the star for Discord ID %s",
+                        entry.get("discord_id"),
+                    )
+                    continue
                 if name is not None:
                     removed.append(name)
 
@@ -432,7 +448,7 @@ class StarChecker:
                 False,
                 observed_at,
             )
-        except PyMongoError as exc:
+        except StorageError as exc:
             log.error("Could not update star state for %s: %s", discord_id, exc)
             # Only the bookkeeping failed. The role really is gone and
             # nothing newer is known about this member, so the cycle still
@@ -460,7 +476,7 @@ class StarChecker:
                 self._users,  # type: ignore[arg-type]
                 discord_id,
             )
-        except PyMongoError as exc:
+        except StorageError as exc:
             # Caught apart from the write above, and deliberately not read
             # as "the removal stands". This failure leaves the role removed
             # from somebody the row says stars the repository, with nothing

@@ -19,12 +19,12 @@ import sys
 from types import SimpleNamespace
 
 import pytest
-from pymongo.errors import PyMongoError
 
 from bot.bot import connect_users, create_client, main
 from bot.config import load_bot_config
 from bot.health import stale_after_seconds
 from common.config import ConfigError
+from common.storage_errors import StorageError
 from tests.test_starcheck import make_config as make_bot_config
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -362,7 +362,7 @@ def test_an_unreachable_database_does_not_stop_the_bot(monkeypatch, caplog):
     # The bot still answers /ping and /help, and /verify says the database is
     # unavailable, which is more use than a process that refuses to start.
     def refuse(host, database, factory):
-        raise PyMongoError("no route to host")
+        raise StorageError("no route to host")
 
     monkeypatch.setattr("bot.bot.connect", refuse)
     with caplog.at_level("ERROR", logger="starguard.bot"):

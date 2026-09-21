@@ -281,6 +281,49 @@ def test_a_member_who_unstarred_loses_the_role(monkeypatch):
     assert users.documents[0]["starred_repo"] is False
 
 
+class ExplodingMember(FakeMember):
+    """A member whose role removal fails the way nothing below it expects.
+
+    ``safe_remove_role`` catches Forbidden, NotFound and HTTPException, so a
+    RuntimeError is exactly the class of surprise the sweep used to have no
+    answer for.
+    """
+
+    async def remove_role(self, role_id, reason=None):
+        raise RuntimeError("member cache is confused")
+
+
+def test_one_unusable_row_does_not_strand_the_rest_of_the_walk(monkeypatch, caplog):
+    # The sweep's counterpart to the drain's
+    # test_one_unusable_row_does_not_strand_the_rest_of_the_queue, and the
+    # stakes are higher here. The drain leaves a failed row's flag raised and
+    # comes back to it; the sweep has no queue and re-walks iter_links from
+    # the beginning every cycle, so a row that raised aborted the cycle and
+    # the retry reached the same row again. Nobody positioned after it was
+    # ever checked again, for as long as the bot ran.
+    checker, members, channel, users = build(
+        monkeypatch, [link(1, "Gone"), link(2, "AlsoGone")], set()
+    )
+    # FakeGuild holds this very dict, so swapping the entry is what the
+    # sweep's own member lookup sees.
+    members["1"] = ExplodingMember("1")
+
+    with caplog.at_level("ERROR", logger="starguard.bot"):
+        removed = asyncio.run(checker.run_once())
+
+    # The walk continued past the failure and did the rest of its job.
+    assert removed == ["user2"]
+    assert members["2"].roles == set()
+    assert users.documents[1]["starred_repo"] is False
+    assert len(channel.sent) == 1
+
+    # The row that blew up is reported rather than swallowed, and its own
+    # state is left alone for the next cycle to try again.
+    assert "Could not check the star for Discord ID 1" in caplog.text
+    assert "member cache is confused" in caplog.text
+    assert users.documents[0]["starred_repo"] is True
+
+
 def test_a_member_who_still_stars_is_left_alone(monkeypatch):
     checker, members, channel, _ = build(monkeypatch, [link(1, "Kept")], {"kept"})
 

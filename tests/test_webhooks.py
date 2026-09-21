@@ -24,15 +24,18 @@ import pytest
 from pymongo.errors import PyMongoError
 
 from common.config import ConfigError
-from common.storage import (
-    clear_role_sync_pending,
+from common.deliveries import (
     deliveries_for,
     ensure_delivery_indexes,
+)
+from common.storage import (
+    clear_role_sync_pending,
     ensure_indexes,
     find_link,
     link_account,
     read_datetime,
 )
+from common.storage_errors import StorageError
 from server.config import WEBHOOK_SECRET_ENV, load_server_config, optional_secret
 from server.server import create_app
 from server.webhooks import (
@@ -415,7 +418,7 @@ def test_a_database_error_mid_request_is_reported(client, users, monkeypatch, fa
     link(users)
 
     def explode(*_args, **_kwargs):
-        raise PyMongoError("connection lost")
+        raise StorageError("connection lost")
 
     monkeypatch.setattr(f"server.webhooks.{failing}", explode)
     assert post(client, star_body()).status_code == 503
@@ -430,7 +433,7 @@ def test_a_delivery_whose_write_failed_can_still_be_redelivered(client, users, m
     link(users, starred=False)
 
     def explode(*_args, **_kwargs):
-        raise PyMongoError("connection lost")
+        raise StorageError("connection lost")
 
     monkeypatch.setattr("server.webhooks.record_star_event", explode)
     assert post(client, star_body("created"), delivery="same-id").status_code == 503
@@ -448,11 +451,21 @@ def test_a_release_that_fails_too_still_answers_503(client, users, monkeypatch, 
     # the 503 GitHub needs into a traceback.
     link(users, starred=False)
 
-    def explode(*_args, **_kwargs):
+    # Two levels, and the exceptions differ because the levels do. The first
+    # replaces a storage function, which is the thing that raises StorageError.
+    # The second breaks the driver method underneath a real release_delivery,
+    # so it raises what pymongo raises and the translation in
+    # common.storage_errors is what has to turn it into the StorageError the
+    # caller catches. If that seam ever came undone this is the test that
+    # would notice, because the traceback would escape instead of the 503.
+    def storage_fails(*_args, **_kwargs):
+        raise StorageError("connection lost")
+
+    def driver_fails(*_args, **_kwargs):
         raise PyMongoError("connection lost")
 
-    monkeypatch.setattr("server.webhooks.record_star_event", explode)
-    monkeypatch.setattr(deliveries_for(users), "delete_one", explode)
+    monkeypatch.setattr("server.webhooks.record_star_event", storage_fails)
+    monkeypatch.setattr(deliveries_for(users), "delete_one", driver_fails)
 
     with caplog.at_level("ERROR", logger="starguard.webhooks"):
         assert post(client, star_body("created"), delivery="same-id").status_code == 503
