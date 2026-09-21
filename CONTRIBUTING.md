@@ -182,6 +182,15 @@ onto that digest. So a failed build, a failed signature, or a bot image
 that built while the server image did not all leave every tag pointing at
 the last release that completed, rather than at something half-published.
 
+Two things about the first release, because neither is recoverable from
+reading the workflow. `.release-please-manifest.json` records the version
+already released rather than the version to release next, so the `1.0.0` in
+it means release-please starts *after* 1.0.0 and the first release it cuts
+carries the next version up. And because `latest` follows releases rather
+than `main`, it does not exist until that first release pull request has
+been merged; a deployment standing up before then pins
+`STARGUARD_IMAGE_TAG=main`.
+
 Reviewing the release pull request is the whole point of the mechanism: the
 version it proposes is derived from the commit types, so a `feat:` that
 should have been a `fix:` shows up there as a minor bump you can still

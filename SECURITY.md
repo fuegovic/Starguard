@@ -26,6 +26,12 @@ cosign verify ghcr.io/librechat-ai/starguard-bot:latest \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
+The identity is the repository as GitHub spells it, capitals included, which
+is not the same rule as the image path: a container reference has no
+uppercase so the workflow lowercases the owner for `ghcr.io/...`, while the
+certificate records the workflow's own URL unchanged. Running this under a
+differently spelled owner means editing the regexp to match that spelling.
+
 A successful verification establishes that the image came from a workflow in
 this repository and names the commit it was built from. It says nothing about
 whether that commit is free of defects; it rules out substitution between the

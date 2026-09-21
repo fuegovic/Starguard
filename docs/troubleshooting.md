@@ -136,8 +136,11 @@ docker compose pull
 ```
 
 A `manifest unknown` error is a different problem: the package is reachable
-but the tag is not there. Check `STARGUARD_IMAGE_TAG` against the tags the
-repository's releases actually published.
+but the tag is not there. The usual cause on a new deployment is that no
+release has been cut yet, so `latest` does not exist: `latest` follows the
+newest release and not the tip of `main`. Set `STARGUARD_IMAGE_TAG=main`
+until there is a release to move to. Otherwise check `STARGUARD_IMAGE_TAG`
+against the tags the repository's releases actually published.
 
 ## The bot is online but has no slash commands
 

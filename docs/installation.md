@@ -39,6 +39,13 @@ machine and the install does not depend on your having a working build
 environment. Images are published for `linux/amd64` and `linux/arm64`;
 Docker picks the right one.
 
+`STARGUARD_IMAGE_TAG` defaults to `latest`, and `latest` follows the newest
+release rather than the tip of `main`. Until the repository's first release
+has been cut there is no `latest` to pull, and `docker compose pull` reports
+`manifest unknown`. Set `STARGUARD_IMAGE_TAG=main` in `.env` to run the tip
+of the default branch in the meantime, and move back to `latest` once a
+release exists.
+
 The two packages have to be public for that pull to work without
 credentials, and GitHub does not make them public on its own: a container
 package is created **private** the first time a workflow publishes it, even
@@ -996,6 +1003,12 @@ cosign verify ghcr.io/librechat-ai/starguard-bot:latest \
     '^https://github.com/LibreChat-AI/Starguard/.github/workflows/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
+
+The identity is the repository as GitHub spells it, capitals included, which
+is not the same rule as the image path: a container reference has no
+uppercase so the workflow lowercases the owner for `ghcr.io/...`, while the
+certificate records the workflow's own URL unchanged. Running this under a
+differently spelled owner means editing the regexp to match that spelling.
 
 A successful verification tells you the image was built by a workflow in this
 repository, and prints the commit it was built from. It does **not** tell you
