@@ -39,6 +39,23 @@ machine and the install does not depend on your having a working build
 environment. Images are published for `linux/amd64` and `linux/arm64`;
 Docker picks the right one.
 
+The two packages have to be public for that pull to work without
+credentials, and GitHub does not make them public on its own: a container
+package is created **private** the first time a workflow publishes it, even
+when the repository is public, and nothing the publishing workflow can do
+changes that. `GITHUB_TOKEN` cannot set package visibility. Somebody with
+admin rights on the account has to open each package once, under **Packages**
+on the owner's profile, and set its visibility to public under **Package
+settings**. If `docker compose pull` reports `denied` or `unauthorized` for
+`ghcr.io/librechat-ai/starguard-bot`, that is what has not been done yet.
+
+Running a fork whose packages you would rather keep private is supported;
+authenticate before pulling, with a token carrying `read:packages`:
+
+```sh
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+```
+
 If you would rather build from this checkout, see
 [Building from source](#building-from-source) at the end.
 

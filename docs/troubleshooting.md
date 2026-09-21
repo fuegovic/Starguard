@@ -114,6 +114,31 @@ Both start anyway and run degraded; see
 A `MONGO_HOST` the driver cannot parse at all is the exception, and it is the
 case above.
 
+## `docker compose pull` says `denied` or `unauthorized`
+
+The images are there, but the package is private. GitHub creates a container
+package private the first time it is published, whatever the repository's own
+visibility, and the publishing workflow cannot change that: `GITHUB_TOKEN`
+carries no permission to set package visibility.
+
+Somebody with admin rights on the owning account opens each of
+`starguard-bot` and `starguard-server` under **Packages** on the owner's
+profile and sets **Package settings** to public. It is a one-time action per
+package, and until it is done the default install cannot start either
+container.
+
+To pull a private package instead, log in first with a token that has
+`read:packages`:
+
+```sh
+echo "$GITHUB_TOKEN" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+docker compose pull
+```
+
+A `manifest unknown` error is a different problem: the package is reachable
+but the tag is not there. Check `STARGUARD_IMAGE_TAG` against the tags the
+repository's releases actually published.
+
 ## The bot is online but has no slash commands
 
 **Symptom.** The bot shows as online in the member list, but `/verify` does
