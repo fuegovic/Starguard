@@ -20,9 +20,9 @@ signature is bound to the identity of the workflow that produced the image
 and is recorded in the public Rekor transparency log.
 
 ```sh
-cosign verify ghcr.io/fuegovic/starguard-bot:latest \
+cosign verify ghcr.io/librechat-ai/starguard-bot:latest \
   --certificate-identity-regexp \
-    '^https://github.com/fuegovic/Starguard/.github/workflows/' \
+    '^https://github.com/LibreChat-AI/Starguard/.github/workflows/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 

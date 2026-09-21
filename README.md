@@ -134,8 +134,8 @@ Both processes expose a health endpoint, and the compose files probe them.
 
 1. 🧑‍🤝‍🧑 Clone the repository, for the compose files and
    `.env.example`. The two containers are pulled ready-built from
-   `ghcr.io/fuegovic/starguard-bot` and
-   `ghcr.io/fuegovic/starguard-server`, for `linux/amd64` and
+   `ghcr.io/librechat-ai/starguard-bot` and
+   `ghcr.io/librechat-ai/starguard-server`, for `linux/amd64` and
    `linux/arm64`, so nothing is built on your machine.
 2. ✏️ Copy `.env.example` to `.env` and configure it, including a real
    `SECRET_KEY`:

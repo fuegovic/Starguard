@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **Prebuilt container images**, published to the GitHub Packages registry
-  as `ghcr.io/fuegovic/starguard-bot` and `ghcr.io/fuegovic/starguard-server`.
+  as `ghcr.io/librechat-ai/starguard-bot` and
+  `ghcr.io/librechat-ai/starguard-server`.
   They are built for `linux/amd64` and `linux/arm64`, carry an SBOM and a
   `mode=max` provenance attestation, and are signed with cosign keyless, so a
   pulled image can be traced back to the workflow run and the commit that

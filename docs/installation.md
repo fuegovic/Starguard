@@ -33,8 +33,8 @@ cd Starguard
 
 You are cloning for the compose files and `.env.example`, not for the
 source. The two containers are pulled ready-built from the GitHub
-Packages registry, as `ghcr.io/fuegovic/starguard-bot` and
-`ghcr.io/fuegovic/starguard-server`, so nothing here is compiled on your
+Packages registry, as `ghcr.io/librechat-ai/starguard-bot` and
+`ghcr.io/librechat-ai/starguard-server`, so nothing here is compiled on your
 machine and the install does not depend on your having a working build
 environment. Images are published for `linux/amd64` and `linux/arm64`;
 Docker picks the right one.
@@ -974,9 +974,9 @@ workflow's own identity and recorded in the public Rekor transparency log.
 Verifying is optional, and worth doing once on the machine that will run this:
 
 ```sh
-cosign verify ghcr.io/fuegovic/starguard-bot:latest \
+cosign verify ghcr.io/librechat-ai/starguard-bot:latest \
   --certificate-identity-regexp \
-    '^https://github.com/fuegovic/Starguard/.github/workflows/' \
+    '^https://github.com/LibreChat-AI/Starguard/.github/workflows/' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
@@ -989,7 +989,7 @@ The images also carry an SBOM and a build provenance attestation, which list
 what is inside them and how they were produced:
 
 ```sh
-docker buildx imagetools inspect ghcr.io/fuegovic/starguard-bot:latest \
+docker buildx imagetools inspect ghcr.io/librechat-ai/starguard-bot:latest \
   --format '{{ json .SBOM }}'
 ```
 

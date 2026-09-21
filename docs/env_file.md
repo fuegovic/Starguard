@@ -70,7 +70,7 @@ pulled](./installation.md#verifying-what-you-pulled).
 
 ### `STARGUARD_IMAGE_OWNER`
 
-**Optional. Compose only.** Default: `fuegovic`.
+**Optional. Compose only.** Default: `librechat-ai`.
 
 The GitHub account the images were published under, which is the first path
 segment of the registry reference. Leave it alone to run the official builds.
