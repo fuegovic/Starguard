@@ -1,30 +1,27 @@
 name: CI
 
 on:
-  push:
-    # Scoped to main only, on purpose, for two reasons. First, a bare push
-    # trigger also matches tag pushes, which would run this workflow
-    # standalone on a v* tag in addition to the run release.yml starts
-    # through workflow_call for that same tag, doubling the matrix; tags
-    # now reach these jobs, once, via release.yml instead. Second, every
-    # other branch already gets these same jobs through pull_request, so
-    # triggering push on them too doubled every PR's CI. The publish job
-    # below needs exactly this: it only runs on a push to main.
-    # Trade-off: a branch with no open pull request no longer gets CI on
-    # push. If you push a branch and see no checks, that is why; open the
-    # PR and pull_request will run them.
-    branches: [main]
+  # No push trigger. Every push to main, including the merge of a
+  # release-please pull request, reaches these jobs through release.yml,
+  # which calls this workflow as its gate and then publishes. A bare push
+  # trigger here would run the whole matrix a second time on that same
+  # commit, and a push trigger also matches tag pushes, which would run
+  # this workflow standalone on a tag as well.
+  #
+  # Trade-off, unchanged from before: a branch with no open pull request
+  # gets no CI on push. If you push a branch and see no checks, that is
+  # why; open the pull request and pull_request will run them.
   pull_request:
   workflow_call:
 
 concurrency:
+  # github.workflow resolves to the calling workflow's name, so a run
+  # started by release.yml lands in a different group from a pull request's
+  # own run and the two cannot wait on each other.
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  # A run that has already reached the main-branch publish job pushes the
-  # shared :latest tag for one image at a time; cancelling it mid-flight is
-  # what lets a superseding push kill only the remaining matrix leg and
-  # leave the bot and server :latest tags on different commits. Only cancel
-  # in-progress runs outside main (PRs and other branches), where nothing
-  # publishes and losing a superseded run has no lasting effect.
+  # Nothing in this workflow publishes any more, so cancelling a superseded
+  # run costs nothing outside main. On main the run is the gate release.yml
+  # waits on, and cancelling it would cancel the release.
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
@@ -137,6 +134,7 @@ jobs:
     name: Docker build (${{ matrix.image }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - image: starguard-bot
@@ -145,54 +143,93 @@ jobs:
             dockerfile: Dockerfile.server
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The filter below diffs against the pull request's base commit,
+          # which the default shallow fetch does not make reachable.
+          fetch-depth: 0
+
+      - name: Decide whether this change can reach an image
+        id: changes
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        # Prose, a screenshot or an issue template cannot change what is
+        # inside a container, and building and scanning two images to prove
+        # that is the slowest thing a documentation pull request waits on.
+        #
+        # The filter is deliberately one-sided: it lists the paths that are
+        # certainly irrelevant and runs the build the moment anything else
+        # appears, so a new top-level file or a path nobody thought of is
+        # built rather than skipped. Anything that is not a pull request,
+        # including the push to main that release.yml gates, is always built.
+        #
+        # The steps below stay in this job rather than moving behind a job
+        # level `if`, so this check still reports success on a documentation
+        # pull request instead of reporting "skipped" at a branch protection
+        # rule that requires it.
+        run: |
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "Not a pull request; building." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          echo "Changed files:" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "$changed" | sed 's/^/- /' >> "$GITHUB_STEP_SUMMARY"
+
+          if printf '%s\n' "$changed" \
+            | grep -qvE '(^docs/|\.md$|^\.github/ISSUE_TEMPLATE/|^LICENSE$|\.png$)'
+          then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Something outside the documentation changed; building." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "Documentation only; skipping the image build and scan." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: hadolint (${{ matrix.dockerfile }})
+        if: steps.changes.outputs.relevant == 'true'
         uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
         with:
           dockerfile: ${{ matrix.dockerfile }}
           config: .hadolint.yaml
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.changes.outputs.relevant == 'true'
       - name: Build ${{ matrix.image }} (no push)
+        if: steps.changes.outputs.relevant == 'true'
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ${{ matrix.dockerfile }}
           push: false
+          # Loaded into the local daemon so the scan below has something to
+          # read. Only the host platform is built here; the two-platform
+          # build lives in publish.yml, where the arm64 leg is worth the
+          # emulation time because the result is actually kept.
+          load: true
           tags: ${{ matrix.image }}:ci
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
-
-  publish:
-    name: Publish (${{ matrix.image }})
-    needs: [quality, security, test, docker, lockfile]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    strategy:
-      matrix:
-        include:
-          - image: starguard-bot
-            dockerfile: Dockerfile.bot
-          - image: starguard-server
-            dockerfile: Dockerfile.server
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-      - name: Log in to the GitHub Packages registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      - name: Scan ${{ matrix.image }} for known vulnerabilities
+        if: steps.changes.outputs.relevant == 'true'
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push ${{ matrix.image }}
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ github.sha }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:latest
-          cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+          image-ref: ${{ matrix.image }}:ci
+          format: table
+          severity: HIGH,CRITICAL
+          # Fail the build on a vulnerability there is something to do about,
+          # and stay quiet about one there is not. A HIGH in the Debian base
+          # layer with no fixed version available would otherwise block every
+          # pull request in the repository until some upstream maintainer
+          # acted, which trains people to ignore the job. A fixable one is a
+          # base image digest bump away and should block.
+          ignore-unfixed: true
+          exit-code: "1"
+          # The vulnerability database is a few hundred megabytes and is
+          # pulled from a registry that rate-limits anonymous clients.
+          # Caching it keeps a busy day's pull requests off that limit.
+          cache: "true"

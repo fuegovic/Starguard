@@ -1,0 +1,29 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "starguard",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": false,
+      "include-v-in-tag": true,
+      "bump-minor-pre-major": false,
+      "draft": false,
+      "prerelease": false,
+      "changelog-sections": [
+        { "type": "feat", "section": "Added" },
+        { "type": "fix", "section": "Fixed" },
+        { "type": "perf", "section": "Changed" },
+        { "type": "refactor", "section": "Changed" },
+        { "type": "revert", "section": "Changed" },
+        { "type": "deps", "section": "Dependencies" },
+        { "type": "docs", "section": "Documentation" },
+        { "type": "build", "section": "Build", "hidden": true },
+        { "type": "chore", "section": "Chores", "hidden": true },
+        { "type": "ci", "section": "Continuous Integration", "hidden": true },
+        { "type": "style", "section": "Styles", "hidden": true },
+        { "type": "test", "section": "Tests", "hidden": true }
+      ]
+    }
+  }
+}
