@@ -292,11 +292,22 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
         # The signature covers a digest, not a name, so the guarantee this
         # workflow offers holds only while the tags resolve to the digest the
-        # build job signed. "imagetools create" is expected to copy the index
-        # rather than rebuild it, which preserves the digest, but that is an
-        # assumption about another tool's internals and it is cheap to stop
-        # assuming: read each tag back and say which ones were checked, so a
-        # silent pass and a check that examined nothing cannot look alike.
+        # build job signed.
+        #
+        # They do, and the condition is worth stating because it is easy to
+        # break from here. buildx's Combine has an explicit shortcut: "on
+        # single source, return original bytes", taken when there is exactly
+        # one source, that source is an image index or manifest list, and no
+        # annotations were passed. The step above passes one IMAGE@DIGEST and
+        # only --tag flags, so the index is copied rather than rebuilt and the
+        # digest survives. Adding a single --annotation to that command would
+        # send it down the rebuild path, mint a new digest, and leave every
+        # tag pointing at something cosign never signed. Index annotations
+        # belong on the build step, which is where they are.
+        #
+        # Checked anyway rather than trusted, and the check names how many
+        # tags it examined, so a silent pass and a check that examined nothing
+        # cannot look alike.
         run: |
           set -euo pipefail
 
