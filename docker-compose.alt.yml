@@ -1,43 +1,133 @@
-version: "3.9"
-
-# Includes Nginx Proxy Manager, Mongodb and Mongo Express
+# Everything in one file: bot, OAuth server, MongoDB, Mongo Express and
+# Nginx Proxy Manager for TLS termination.
+#
+# Run with: docker compose -f docker-compose.alt.yml up -d
 services:
   discord-bot:
     container_name: Bot
-    image: bot
+    image: starguard-bot
     build:
       context: .
-      dockerfile: Dockerfile_bot
+      # This used to name Dockerfile_bot, which does not exist in this repo,
+      # so the alternative stack could never be built.
+      dockerfile: Dockerfile.bot
     restart: always
     env_file:
       - .env
+    depends_on:
+      - mongodb
+    healthcheck:
+      # python:3.12-slim has neither curl nor wget, so this uses the stdlib.
+      # BOT_HEALTH_HOST/PORT default to 127.0.0.1:8080, reachable from inside
+      # the container without publishing anything on the host. A generous
+      # start_period because the bot has to connect to the Discord gateway
+      # before /healthz reports ready.
+      test: ["CMD", "python", "-c",
+             "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:${BOT_HEALTH_PORT:-8080}/healthz', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - Starguard
 
   server:
     container_name: Server
-    image: server
+    image: starguard-server
     ports:
-      - ${SERVER_PORT}:5000
+      # Host port only. SERVER_BIND_PORT is the port the application listens
+      # on internally (default 5000); this mapping tracks it if you change it.
+      # Bound to the loopback interface, so the only thing that can reach
+      # the application is a reverse proxy on this host. That is not a
+      # restriction: DOMAIN has to be an absolute https URL and is checked
+      # at startup, so a proxy terminating TLS is already required, and
+      # nothing legitimate ever arrives on this port from off the machine.
+      # It also makes TRUSTED_PROXY_COUNT=1 mean what it says. Published on
+      # every interface, a client could skip the proxy, reach ProxyFix
+      # directly, and put any address it liked in X-Forwarded-For, taking a
+      # fresh rate-limit bucket per request. If your proxy runs on another
+      # machine, drop the 127.0.0.1 here and set TRUSTED_PROXY_COUNT to
+      # match your real hop count, knowing the origin is then reachable
+      # without TLS by anything that can route to it.
+      - 127.0.0.1:${SERVER_PORT:-5000}:${SERVER_BIND_PORT:-5000}
     build:
       context: .
-      dockerfile: Dockerfile_server
+      dockerfile: Dockerfile.server
     restart: always
     env_file:
       - .env
+    depends_on:
+      - mongodb
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${SERVER_BIND_PORT:-5000}/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - Starguard
 
   mongodb:
     container_name: mongo
-    image: mongo:4.4.18 # for compatibility with older hardware, feel free to use latest
-    # uncomment the 2 following lines to make accessible from outside docker
-    # ports:
-    #   - ${MONGO_PORT}:27017
+    # MongoDB 5.0 and newer require a CPU with AVX support. The 4.x series is
+    # past end of life and no longer receives security fixes.
+    image: mongo:7
     volumes:
       - ./server/mongo-data:/data/db
-    command: mongod --noauth
+    # Setting the root username and password makes the official image create
+    # that user and turn on authentication by itself; no --noauth default
+    # that left the database open to anything able to reach the network.
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: "${MONGO_INITDB_ROOT_USERNAME:?set MONGO_INITDB_ROOT_USERNAME in .env}"
+      MONGO_INITDB_ROOT_PASSWORD: "${MONGO_INITDB_ROOT_PASSWORD:?set MONGO_INITDB_ROOT_PASSWORD in .env}"
     restart: always
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet",
+             "-u", "${MONGO_INITDB_ROOT_USERNAME:?set MONGO_INITDB_ROOT_USERNAME in .env}",
+             "-p", "${MONGO_INITDB_ROOT_PASSWORD:?set MONGO_INITDB_ROOT_PASSWORD in .env}",
+             "--authenticationDatabase", "admin",
+             "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - Starguard
 
@@ -45,28 +135,65 @@ services:
     container_name: mongo-express
     image: mongo-express
     ports:
-      - ${MONGO_EXPRESS_PORT}:8081
+      # Loopback only: the database admin UI should not face the internet.
+      - 127.0.0.1:${MONGO_EXPRESS_PORT:-8081}:8081
     environment:
       ME_CONFIG_MONGODB_SERVER: mongodb
       ME_CONFIG_MONGODB_PORT: 27017
       ME_CONFIG_MONGODB_ENABLE_ADMIN: "true"
-      ME_CONFIG_BASICAUTH_USERNAME: ${MONGO_EXPRESS_USERNAME}
-      ME_CONFIG_BASICAUTH_PASSWORD: ${MONGO_EXPRESS_PASSWORD}
+      # The database now requires authentication; Mongo Express connects as
+      # the same root user.
+      ME_CONFIG_MONGODB_ADMINUSERNAME: "${MONGO_INITDB_ROOT_USERNAME:?set MONGO_INITDB_ROOT_USERNAME in .env}"
+      ME_CONFIG_MONGODB_ADMINPASSWORD: "${MONGO_INITDB_ROOT_PASSWORD:?set MONGO_INITDB_ROOT_PASSWORD in .env}"
+      ME_CONFIG_BASICAUTH_USERNAME: "${MONGO_EXPRESS_USERNAME:?set MONGO_EXPRESS_USERNAME in .env}"
+      ME_CONFIG_BASICAUTH_PASSWORD: "${MONGO_EXPRESS_PASSWORD:?set MONGO_EXPRESS_PASSWORD in .env}"
+    depends_on:
+      - mongodb
     restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 128M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - Starguard
 
   nginx-proxy-manager:
     container_name: nginx-proxy-manager
-    image: 'jc21/nginx-proxy-manager:latest'
+    # Pinned to a specific release instead of :latest, which could silently
+    # move to an image nobody here has tested or a compromised tag.
+    image: jc21/nginx-proxy-manager:2.15.1
     restart: unless-stopped
+    environment:
+      # Without these, NPM falls back to its well-known default login
+      # (admin@example.com / changeme) until someone signs in and changes it,
+      # which on a public HTTP/HTTPS listener is a real window. Optional
+      # because the wizard also lets you set the first admin manually; if you
+      # skip both, do it before exposing 80/443.
+      INITIAL_ADMIN_EMAIL: "${NPM_INITIAL_ADMIN_EMAIL:-}"
+      INITIAL_ADMIN_PASSWORD: "${NPM_INITIAL_ADMIN_PASSWORD:-}"
     ports:
-      - '80:80' # Public HTTP Port
-      - '443:443' # Public HTTPS Port
-      - '81:81' # Admin Web Port
+      - '80:80'    # Public HTTP port; required to terminate TLS for the OAuth callback
+      - '443:443'  # Public HTTPS port
+      - '127.0.0.1:81:81'  # Admin UI, loopback only
     volumes:
       - ./data:/data
       - ./letsencrypt:/etc/letsencrypt
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     networks:
       - Starguard
 

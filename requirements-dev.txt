@@ -1,0 +1,28 @@
+-r requirements.txt
+
+pylint==3.3.9
+# 9.0.3 is the fix for PYSEC-2026-1845: predictable /tmp/pytest-of-{user}
+# directories, a local privilege escalation. Dev only, never shipped in an
+# image, but CI and maintainer machines run it.
+pytest==9.0.3
+mongomock==4.3.0
+
+# Static analysis. CI runs each of these over the tree, so they are pinned as
+# exactly as the runtime dependencies are: a checker that changes underneath a
+# green build is a build that fails for reasons nobody changed.
+bandit==1.9.4
+mypy==2.3.1
+pip-audit==2.10.1
+ruff==0.16.8
+
+# Coverage measurement. The gate is fail_under = 100; see [tool.coverage] in
+# pyproject.toml.
+pytest-cov==7.1.0
+
+# Type stubs for the two dependencies that ship none of their own. Everything
+# else Starguard imports (pymongo, flask, werkzeug, itsdangerous,
+# interactions.py, python-dotenv) carries py.typed. Authlib has neither, and
+# no stub package exists for it, so mypy is told to ignore that one import in
+# pyproject.toml.
+types-requests==2.33.0.20260906
+types-waitress==3.0.1.20260724

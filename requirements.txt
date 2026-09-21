@@ -1,7 +1,15 @@
-authlib==1.2.1
-discord_py_interactions==5.10.0
-Flask==2.3.2
-Interactions.py==5.8.0
-pymongo==4.6.3
-python-dotenv==1.0.0
-requests==2.31.0
+# Runtime dependencies, shared by the bot and the OAuth server.
+# Human-edited source of truth. requirements.lock is generated from this file
+# and is what the images install, with hashes enforced (see CONTRIBUTING.md).
+# Do not hand edit the lock: change a pin here, then regenerate.
+authlib==1.8.0
+Flask==3.1.3
+interactions.py==5.16.0
+itsdangerous==2.2.0
+pymongo==4.18.1
+# 1.2.2 is the fix for PYSEC-2026-2270: set_key/unset_key followed
+# symlinks when rewriting a .env file. Starguard only reads, but shipping a
+# pinned vulnerable version is not worth the argument.
+python-dotenv==1.2.2
+requests==2.34.2
+waitress==3.0.2

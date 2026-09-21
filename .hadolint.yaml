@@ -1,0 +1,4 @@
+# Hadolint configuration for the Docker build job in CI.
+# Style-only findings (info) do not fail the build; anything at warning
+# severity or above does.
+failure-threshold: warning
