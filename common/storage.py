@@ -35,8 +35,20 @@ read as None, and the pending index is partial on ``True``, so a row without
 the field is simply not in the queue. `upgrade_documents` bumps an older
 row's version without materialising them, so there is one shape rather than
 two. `record_star_event` and `set_starred` are their only writers, except
-that `link_account` clears them when a row changes GitHub account, since
-all three describe a row and an account together.
+that `link_account` clears `star_event_at` and `star_source` when a row
+changes GitHub account, since both describe a row and an account together.
+
+`role_sync_pending` is deliberately not cleared there, and the asymmetry
+is the point rather than an omission. The flag does not only stand for a
+webhook about the account being replaced: `queue_role_sync` raises it on
+the Discord ID when the sweep has removed a role on information a newer
+event proved stale, and that work is about the member's role rather than
+about which GitHub account the row names, so it survives a re-link. The
+drain reads `starred_repo` off the row when it gets there rather than
+trusting anything the raiser believed, so a flag left standing costs one
+reconciliation against the state the row actually holds. Clearing it would
+instead drop the sweep's own correction, and nothing else would put that
+role back: a sweep only ever takes roles away.
 
 `star_event_at` is load-bearing beyond bookkeeping. It is how the sweep and
 the webhook are ordered against each other, since they observe the same fact
