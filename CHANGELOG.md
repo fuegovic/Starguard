@@ -5,6 +5,47 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0](https://github.com/LibreChat-AI/Starguard/compare/v1.0.0...v1.1.0) (2026-09-22)
+
+
+### Added
+
+* **bot:** drain the role sync queue ([c209afb](https://github.com/LibreChat-AI/Starguard/commit/c209afbddb4f95c16b10204d8cbb8c19f5696cb1))
+* **common:** add shared config, storage, GitHub and link token package ([a5e5e9c](https://github.com/LibreChat-AI/Starguard/commit/a5e5e9cc257a71f2747ffcfd41932892e3a8071a))
+* Docker support 🐳 ([69ee09e](https://github.com/LibreChat-AI/Starguard/commit/69ee09e1d1e57a893afabc1d8429f0f825792ecb))
+* new page for successful login and invalid link ([e6cbdcd](https://github.com/LibreChat-AI/Starguard/commit/e6cbdcd39a53ecd6f6697c1d5d45a1fcb7327788))
+* save information to MongoDB ([01dfc3c](https://github.com/LibreChat-AI/Starguard/commit/01dfc3ca734279ca07da0d7b7a0d017304d2e195))
+* **server:** receive GitHub star webhooks ([80291a7](https://github.com/LibreChat-AI/Starguard/commit/80291a7564d569b7d385e53195c6eb33b765e341))
+* **web:** rebuild the OAuth pages without JavaScript ([a4437cf](https://github.com/LibreChat-AI/Starguard/commit/a4437cff3e4409c5c20e96af3b28a8ef4b726fa8))
+
+
+### Fixed
+
+* 🐳 ([df7f88a](https://github.com/LibreChat-AI/Starguard/commit/df7f88a0adc6eeab9112176883999655fa92fee4))
+* 🐳 ([30cc391](https://github.com/LibreChat-AI/Starguard/commit/30cc391d1b934ff7eb927503eb18ff5f628bfee2))
+* 🐳 ([e88936f](https://github.com/LibreChat-AI/Starguard/commit/e88936fb26f75dd1d4d910d6fabe1a999e0f281d))
+* **bot:** stop reading GitHub's 40,000 stargazer cap as un-stars ([cf396eb](https://github.com/LibreChat-AI/Starguard/commit/cf396eb920a48f3833ff62d2ba8d3314ba21b35e))
+* **ci:** publish main even when the release pull request cannot be opened ([#53](https://github.com/LibreChat-AI/Starguard/issues/53)) ([f7c7129](https://github.com/LibreChat-AI/Starguard/commit/f7c71294c8901b9a9207ab8e0ba09720c762f48d))
+* **docker:** bind the OAuth server to loopback ([2dbe908](https://github.com/LibreChat-AI/Starguard/commit/2dbe908b83ef3d54c58b30fa3ab72f544a792beb))
+* **docker:** repair image builds, compose wiring, CI and docs ([df09873](https://github.com/LibreChat-AI/Starguard/commit/df0987393af230864aa39d484364ee33c1fe4f7d))
+* harden OAuth flow and fix bot and server crashes ([bf9e016](https://github.com/LibreChat-AI/Starguard/commit/bf9e0164852486f8b44f2a147b08db104e2406f8))
+* https 🌐 ([f6555bd](https://github.com/LibreChat-AI/Starguard/commit/f6555bd46847f841181e72295b85002ef62e3fe8))
+* match stargazers on the immutable account id, and guard the sweep ([124a24e](https://github.com/LibreChat-AI/Starguard/commit/124a24e3d872eeb70f7c9aec822e8c713e41ae25))
+* redirect 🌐 ([49cfdf4](https://github.com/LibreChat-AI/Starguard/commit/49cfdf4a59412b46c70f8d02dbf039fa5d467873))
+
+
+### Changed
+
+* ✏️ ([f164e06](https://github.com/LibreChat-AI/Starguard/commit/f164e06d021881650fba2c17de4e91c75a6abc24))
+* bot.py and gitub_oauth.py ([#6](https://github.com/LibreChat-AI/Starguard/issues/6)) ([6f386cc](https://github.com/LibreChat-AI/Starguard/commit/6f386cc161ddb662c5b04b0f0d730b2fd2d5cfc4))
+* rebuild the bot and server around explicit construction ([d8a458d](https://github.com/LibreChat-AI/Starguard/commit/d8a458d3dcf6fcd696cc5927409df373c0375cae))
+
+
+### Documentation
+
+* 🖋️ ([8ce242c](https://github.com/LibreChat-AI/Starguard/commit/8ce242cacab9681e58e3cc96ac4ffd7f668733f7))
+* rewrite the operator documentation ([a682a53](https://github.com/LibreChat-AI/Starguard/commit/a682a531c9cbe7a0980fb5ef645f555edffa0a35))
+
 ## [1.0.0] - 2026-09-21
 
 ### Added
