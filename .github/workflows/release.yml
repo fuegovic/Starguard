@@ -89,6 +89,25 @@ jobs:
   publish:
     name: Publish images
     needs: [ci, release-please]
+    # release-please decides which version tags move. It does not decide
+    # whether main is publishable at all, and this job used to let it.
+    #
+    # The first run of this workflow proved the difference. Opening the
+    # release pull request needs a repository setting that was off, so the
+    # job failed with "GitHub Actions is not permitted to create or approve
+    # pull requests", and publish, which required it to succeed, was
+    # skipped. Nothing was published: not the version tags release-please
+    # owns, and not :main or the commit sha, which it has no say over. A
+    # pull request that could not be opened stopped main being runnable.
+    #
+    # Gated on the CI result, so nothing untested is published, and
+    # !cancelled() rather than always() so a cancelled run still cancels
+    # this. A failed release-please leaves outputs.version empty, which is
+    # exactly what an ordinary push to main produces, so this publishes
+    # :main and the sha and moves no version tag. announce still needs
+    # release-please to have succeeded, so a release is never announced
+    # unless it was really cut.
+    if: ${{ !cancelled() && needs.ci.result == 'success' }}
     permissions:
       contents: read
       packages: write
