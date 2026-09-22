@@ -1,6 +1,7 @@
 """Minimal GitHub REST helpers.
 
-Only the stargazer listing lives here. It is kept free of Discord and database
+The stargazer listing, the stargazer count and a per-account star lookup live
+here. It is kept free of Discord and database
 concerns so the pagination, the retries and the conditional requests can be
 tested directly.
 """
@@ -94,7 +95,14 @@ class StargazerListing:
 
     ``ids`` and ``logins`` describe the same set of accounts: the id is what
     the un-star check matches on, because it cannot be renamed, and the login
-    is what /starcount counts and what the logs are readable by.
+    is what the logs are readable by.
+
+    ``truncated`` means GitHub stopped serving the listing before its end.
+    It will not page past the 40,000 oldest stargazers, and the last page it
+    does serve carries no next link, so a walk over a larger repository
+    ends there looking complete. When this is set, an account missing from
+    the listing is not evidence that it un-starred; see
+    :func:`account_stars_repo` for the question to ask instead.
     """
 
     logins: frozenset[str]
@@ -103,6 +111,7 @@ class StargazerListing:
     pages_fetched: int = 0
     pages_unchanged: int = 0
     rate_limit_remaining: int | None = None
+    truncated: bool = False
 
 
 @dataclass
@@ -343,6 +352,10 @@ def _get_page(
 class _Walk:
     """What one pass over the paginated listing has accumulated so far."""
 
+    # Tallies of one walk, each read once by result(). Grouping them into
+    # sub-objects would add indirection without separating any concern.
+    # pylint: disable=too-many-instance-attributes
+
     logins: set[str]
     ids: set[int]
     pages: dict[str, CachedPage]
@@ -350,6 +363,8 @@ class _Walk:
     pages_fetched: int = 0
     pages_unchanged: int = 0
     rate_limit_remaining: int | None = None
+    last_page_full: bool = False
+    truncated: bool = False
 
     def result(self) -> StargazerListing:
         """Freeze the walk into the listing the caller gets."""
@@ -360,6 +375,7 @@ class _Walk:
             pages_fetched=self.pages_fetched,
             pages_unchanged=self.pages_unchanged,
             rate_limit_remaining=self.rate_limit_remaining,
+            truncated=self.truncated,
         )
 
 
@@ -412,6 +428,7 @@ def _absorb_page(walk: _Walk, url: str, response: requests.Response, caching: bo
         raise GitHubError("Unexpected response shape from the GitHub API.")
 
     walk.pages_fetched += 1
+    walk.last_page_full = len(page) >= PER_PAGE
     identities = [_extract_identity(entry) for entry in page]
     readable = [identity for identity in identities if identity is not None]
     if len(readable) != len(identities):
@@ -487,6 +504,10 @@ def fetch_stargazer_listing(
             walk.logins |= cached.logins
             walk.ids |= cached.ids
             walk.pages[url] = cached
+            # A cached page is never a full last page, see
+            # _hides_a_future_page, so a walk that ends on one reached the
+            # real end of the listing.
+            walk.last_page_full = False
             # Trusting the cached link is only safe because of the rule in
             # _hides_a_future_page: a page that was both full and last was
             # never cached, so a cached None really does mean the listing
@@ -498,6 +519,8 @@ def fetch_stargazer_listing(
         if not next_url:
             if cache is not None:
                 cache.replace(walk.pages)
+            if walk.last_page_full:
+                _check_for_truncation(http, owner, repo, base_headers, walk, sleep)
             return walk.result()
 
         # The next URL already carries per_page and page.
@@ -505,6 +528,146 @@ def fetch_stargazer_listing(
 
     raise GitHubError(
         f"Stopped after {MAX_PAGES} pages of stargazers; this looks like a pagination loop."
+    )
+
+
+def _check_for_truncation(
+    http: SupportsGet,
+    owner: str,
+    repo: str,
+    headers: Mapping[str, str],
+    walk: _Walk,
+    sleep: Callable[[float], object],
+) -> None:
+    """Mark ``walk`` truncated when GitHub holds back part of the listing.
+
+    GitHub serves the oldest 40,000 stargazers and no more: the page after
+    that answers 422, and the page before it carries no next link at all,
+    so the walk has no way to tell from the pages alone that it stopped
+    early. On danny-avila/LibreChat that hid 4,671 stargazers, and the
+    check read every linked member among them as having un-starred.
+
+    Only a walk that ended on a full page can have been cut off, because a
+    page with room left is the true end of the listing. That is also the
+    one case a repository whose star count is an exact multiple of the page
+    size lands in, so the count settles it for one extra request. A count
+    above what the walk saw marks the listing truncated; a star arriving
+    during the walk can do the same, and that is harmless, because a
+    truncated listing only makes the check ask about each missing account
+    directly instead of reading its absence as an un-star.
+    """
+    count, calls = _fetch_count(http, owner, repo, headers, sleep)
+    walk.api_calls += calls
+    walk.truncated = count > len(walk.ids)
+    if walk.truncated:
+        log.info(
+            "GitHub served %s of %s stargazers; accounts missing from the listing "
+            "will be checked one by one.",
+            len(walk.ids),
+            count,
+        )
+
+
+def _fetch_count(
+    http: SupportsGet,
+    owner: str,
+    repo: str,
+    headers: Mapping[str, str],
+    sleep: Callable[[float], object],
+) -> tuple[int, int]:
+    """Return ``(stargazer count, api calls spent)`` for ``owner/repo``."""
+    url = f"{API_ROOT}/repos/{owner}/{repo}/stargazers/count"
+    response, calls = _get_page(http, url, headers, None, sleep)
+    if response.status_code != OK:
+        raise GitHubError(_describe_failure(response))
+    try:
+        body = response.json()
+    except ValueError as exc:
+        raise GitHubError("The stargazer count came back with a body that is not JSON.") from exc
+    count = body.get("count") if isinstance(body, dict) else None
+    if not isinstance(count, int) or isinstance(count, bool):
+        raise GitHubError("Unexpected response shape from the GitHub API.")
+    return count, calls
+
+
+def fetch_stargazer_count(
+    owner: str,
+    repo: str,
+    token: str | None = None,
+    session: SupportsGet | None = None,
+    sleep: Callable[[float], object] = time.sleep,
+) -> int:
+    """Return how many accounts have starred ``owner/repo``, in one request.
+
+    The listing cannot answer this for a large repository: it takes a
+    request per hundred stargazers and stops at 40,000 of them.
+    """
+    count, _ = _fetch_count(session or requests, owner, repo, _headers(token), sleep)
+    return count
+
+
+def account_stars_repo(
+    owner: str,
+    repo: str,
+    github_id: int | None = None,
+    login: str | None = None,
+    token: str | None = None,
+    session: SupportsGet | None = None,
+    sleep: Callable[[float], object] = time.sleep,
+) -> bool:
+    """Whether one account stars ``owner/repo``, from its own starred list.
+
+    This is the question to ask about an account that a truncated listing
+    does not show. It walks the account's starred repositories rather than
+    the repository's stargazers, so its cost is set by how much that one
+    person has starred, not by how popular the repository is.
+
+    The account is addressed by id when there is one, because a login can
+    be renamed and the id cannot, and by login only for rows old enough to
+    have no id. Anything short of a complete, readable answer raises
+    :class:`GitHubError`: the caller must read that as "no evidence", never
+    as "not starred".
+    """
+    if github_id is not None:
+        url = f"{API_ROOT}/user/{github_id}/starred"
+    elif login:
+        url = f"{API_ROOT}/users/{login}/starred"
+    else:
+        raise GitHubError("No account id or login to look the star up by.")
+
+    http: SupportsGet = session or requests
+    headers = _headers(token)
+    params: Mapping[str, int] | None = {"per_page": PER_PAGE}
+    target = f"{owner}/{repo}".lower()
+
+    for _ in range(MAX_PAGES):
+        response, _calls = _get_page(http, url, headers, params, sleep)
+        if response.status_code == 404:
+            # The account, not the repository: a login that was renamed
+            # away or an account that was deleted.
+            raise GitHubError("GitHub has no such account (404); it was renamed or deleted.")
+        if response.status_code != OK:
+            raise GitHubError(_describe_failure(response))
+        try:
+            page = response.json()
+        except ValueError as exc:
+            raise GitHubError("A page of starred repositories was not JSON.") from exc
+        if not isinstance(page, list):
+            raise GitHubError("Unexpected response shape from the GitHub API.")
+        for entry in page:
+            full_name = entry.get("full_name") if isinstance(entry, dict) else None
+            if not isinstance(full_name, str):
+                raise GitHubError("A starred repository carried no usable name.")
+            if full_name.lower() == target:
+                return True
+        next_url = response.links.get("next", {}).get("url")
+        if not next_url:
+            return False
+        url, params = next_url, None
+
+    raise GitHubError(
+        f"Stopped after {MAX_PAGES} pages of starred repositories; "
+        "this looks like a pagination loop."
     )
 
 

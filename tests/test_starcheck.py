@@ -14,7 +14,7 @@ from pymongo.errors import PyMongoError
 from bot.config import BotConfig
 from bot.memberlock import MemberLocks
 from bot.starcheck import CheckAlreadyRunningError, StarChecker
-from common.github_api import StargazerListing
+from common.github_api import GitHubError, StargazerListing
 from common.storage import STAR_SOURCE_SWEEP, STAR_SOURCE_WEBHOOK, record_star_event
 from tests.test_roles import discord_error
 
@@ -214,7 +214,7 @@ def legacy_link(discord_id, username, starred=True):
     return document
 
 
-def listing(*logins, ids=None):
+def listing(*logins, ids=None, truncated=False):
     """A stargazer listing for ``logins``, carrying the matching ids.
 
     The ids default to the ones :func:`link` stores, so a test that names
@@ -226,6 +226,7 @@ def listing(*logins, ids=None):
         ids=frozenset(account_id(login) for login in logins) if ids is None else frozenset(ids),
         api_calls=1,
         pages_fetched=1,
+        truncated=truncated,
     )
 
 
@@ -895,3 +896,73 @@ def test_a_database_write_that_fails_does_not_stop_the_sweep(monkeypatch, caplog
     assert removed == ["user1", "user2"]
     assert all(member.roles == set() for member in members.values())
     assert caplog.text.count("Could not update star state") == 2
+
+
+def truncated_build(monkeypatch, documents, stargazers, direct):
+    """A checker whose listing GitHub cut short, with ``direct`` answering
+    the per-account lookup. Returns what :func:`build` does plus the list of
+    lookups made."""
+    asked = []
+
+    def lookup(owner, repo, github_id=None, login=None, token=None):
+        asked.append(github_id)
+        if isinstance(direct, Exception):
+            raise direct
+        return direct
+
+    monkeypatch.setattr("bot.starcheck.account_stars_repo", lookup)
+    built = build(
+        monkeypatch,
+        documents,
+        stargazers,
+        fetch=lambda owner, repo, token=None, cache=None: listing(*stargazers, truncated=True),
+    )
+    return (*built, asked)
+
+
+def test_a_member_beyond_a_truncated_listing_who_still_stars_keeps_the_role(monkeypatch):
+    # GitHub serves only the oldest 40,000 stargazers, so everybody who
+    # starred after that is missing from the listing without having
+    # un-starred. On danny-avila/LibreChat that was 84 linked members.
+    checker, members, channel, users, asked = truncated_build(
+        monkeypatch, [link(1, "Recent"), link(2, "Old")], {"old"}, direct=True
+    )
+
+    assert asyncio.run(checker.run_once()) == []
+    assert members["1"].roles == {ROLE_ID}
+    assert users.documents[0]["starred_repo"] is True
+    assert not channel.sent
+    # Only the member the listing could not vouch for was looked up.
+    assert asked == [account_id("recent")]
+
+
+def test_a_member_beyond_a_truncated_listing_who_unstarred_loses_the_role(monkeypatch):
+    checker, members, _, users, _ = truncated_build(
+        monkeypatch, [link(1, "Gone")], set(), direct=False
+    )
+
+    assert asyncio.run(checker.run_once()) == ["user1"]
+    assert members["1"].roles == set()
+    assert users.documents[0]["starred_repo"] is False
+
+
+def test_a_failed_direct_lookup_leaves_the_role_alone(monkeypatch, caplog):
+    checker, members, _, users, _ = truncated_build(
+        monkeypatch, [link(1, "Unknown")], set(), direct=GitHubError("HTTP 422")
+    )
+
+    with caplog.at_level("WARNING", logger="starguard.bot"):
+        assert asyncio.run(checker.run_once()) == []
+    assert members["1"].roles == {ROLE_ID}
+    assert users.documents[0]["starred_repo"] is True
+    assert "leaving the role" in caplog.text
+
+
+def test_a_complete_listing_needs_no_direct_lookup(monkeypatch):
+    def lookup(*args, **kwargs):
+        raise AssertionError("a complete listing is evidence on its own")
+
+    monkeypatch.setattr("bot.starcheck.account_stars_repo", lookup)
+    checker, members, _, _ = build(monkeypatch, [link(1, "Gone")], set())
+    assert asyncio.run(checker.run_once()) == ["user1"]
+    assert members["1"].roles == set()

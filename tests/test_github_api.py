@@ -4,6 +4,7 @@
 # deliberately mirror signatures they do not use.
 # pylint: disable=missing-function-docstring,unused-argument
 
+import zlib
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
 
@@ -15,6 +16,8 @@ from common.github_api import (
     PER_PAGE,
     GitHubError,
     StargazerCache,
+    account_stars_repo,
+    fetch_stargazer_count,
     fetch_stargazer_listing,
     fetch_stargazer_logins,
 )
@@ -57,7 +60,7 @@ def account_id(login):
     on every page and in every cycle, which is the property the listing's id
     set is there to preserve.
     """
-    return 1000 + sum(ord(character) for character in login.lower())
+    return 1000 + zlib.crc32(login.lower().encode())
 
 
 def user_page(*logins):
@@ -410,6 +413,7 @@ def test_an_untagged_page_is_simply_not_cached():
 
 FIRST_PAGE_URL = "https://api.github.com/repos/o/r/stargazers"
 SECOND_PAGE_URL = "https://api.github.com/page2"
+COUNT_URL = "https://api.github.com/repos/o/r/stargazers/count"
 
 
 def full_page_logins():
@@ -447,7 +451,13 @@ def test_a_full_last_page_cannot_hide_the_page_the_next_star_opens():
     logins = full_page_logins()
     cache = StargazerCache()
     assert fetch(
-        EtagAwareSession({FIRST_PAGE_URL: page(*logins, etag='W/"full"')}), cache=cache
+        EtagAwareSession(
+            {
+                FIRST_PAGE_URL: page(*logins, etag='W/"full"'),
+                COUNT_URL: FakeResponse(payload={"count": PER_PAGE}),
+            }
+        ),
+        cache=cache,
     ) == set(logins)
 
     session = EtagAwareSession(
@@ -646,3 +656,103 @@ def test_the_retry_loop_never_falls_through_without_an_answer(monkeypatch):
     monkeypatch.setattr("common.github_api.MAX_ATTEMPTS_PER_PAGE", 0)
     with pytest.raises(GitHubError, match="retry budget"):
         fetch(FakeSession([]))
+
+
+def test_a_listing_github_cut_short_is_marked_truncated():
+    # GitHub stops serving stargazers after the 40,000 oldest, and the last
+    # page it serves has no next link, so the pages alone look complete.
+    # The count is what gives it away.
+    logins = full_page_logins()
+    session = EtagAwareSession(
+        {
+            FIRST_PAGE_URL: page(*logins),
+            COUNT_URL: FakeResponse(payload={"count": PER_PAGE + 4671}),
+        }
+    )
+    listing = fetch_stargazer_listing("o", "r", session=session, sleep=no_sleep)
+
+    assert listing.truncated is True
+    assert listing.logins == set(logins)
+    assert listing.api_calls == 2
+
+
+def test_a_listing_ending_exactly_on_a_page_boundary_is_complete():
+    logins = full_page_logins()
+    session = EtagAwareSession(
+        {FIRST_PAGE_URL: page(*logins), COUNT_URL: FakeResponse(payload={"count": PER_PAGE})}
+    )
+    assert fetch_stargazer_listing("o", "r", session=session, sleep=no_sleep).truncated is False
+
+
+def test_a_listing_ending_on_a_partial_page_costs_no_count_request():
+    session = FakeSession([FakeResponse(payload=user_page("alice"))])
+    listing = fetch_stargazer_listing("o", "r", session=session)
+    assert listing.truncated is False
+    assert len(session.calls) == 1
+
+
+def test_an_unreadable_count_refuses_the_listing():
+    # Refused rather than read as complete: a listing that might be short
+    # must not be acted on as though it were whole.
+    session = EtagAwareSession(
+        {FIRST_PAGE_URL: page(*full_page_logins()), COUNT_URL: FakeResponse(payload=["?"])}
+    )
+    with pytest.raises(GitHubError):
+        fetch_stargazer_listing("o", "r", session=session, sleep=no_sleep)
+
+
+def test_the_star_count_is_one_request():
+    session = FakeSession([FakeResponse(payload={"count": 44671})])
+    assert fetch_stargazer_count("o", "r", token="t", session=session) == 44671
+    assert session.calls[0]["url"] == COUNT_URL
+    assert session.calls[0]["headers"]["Authorization"] == "Bearer t"
+
+
+@pytest.mark.parametrize("payload", [{"count": "44671"}, {"count": True}, {}, [1]])
+def test_a_malformed_star_count_is_an_error(payload):
+    with pytest.raises(GitHubError):
+        fetch_stargazer_count("o", "r", session=FakeSession([FakeResponse(payload=payload)]))
+
+
+def starred(*names):
+    return [{"full_name": name} for name in names]
+
+
+def test_an_account_found_in_its_own_starred_list_stars_the_repo():
+    session = FakeSession(
+        [
+            FakeResponse(
+                payload=starred("x/y"), links={"next": {"url": "https://api.github.com/s2"}}
+            ),
+            FakeResponse(payload=starred("O/R")),
+        ]
+    )
+    assert account_stars_repo("o", "r", github_id=42, session=session) is True
+    # Addressed by id, which survives a rename.
+    assert session.calls[0]["url"] == "https://api.github.com/user/42/starred"
+
+
+def test_an_account_whose_starred_list_ends_without_the_repo_does_not_star_it():
+    session = FakeSession([FakeResponse(payload=starred("x/y"))])
+    assert account_stars_repo("o", "r", login="alice", session=session) is False
+    assert session.calls[0]["url"] == "https://api.github.com/users/alice/starred"
+
+
+@pytest.mark.parametrize(
+    "response",
+    [FakeResponse(status_code=404), FakeResponse(payload={"oops": 1}), FakeResponse(payload=[{}])],
+)
+def test_an_incomplete_starred_list_is_an_error_not_a_no(response):
+    with pytest.raises(GitHubError):
+        account_stars_repo("o", "r", github_id=42, session=FakeSession([response]), sleep=no_sleep)
+
+
+def test_a_missing_account_is_named_as_the_account_not_the_repository():
+    session = FakeSession([FakeResponse(status_code=404)])
+    with pytest.raises(GitHubError, match="no such account"):
+        account_stars_repo("o", "r", login="renamed", session=session, sleep=no_sleep)
+
+
+def test_an_account_with_nothing_to_address_it_by_is_an_error():
+    with pytest.raises(GitHubError):
+        account_stars_repo("o", "r")

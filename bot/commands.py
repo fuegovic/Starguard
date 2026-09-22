@@ -29,7 +29,7 @@ from bot.config import BotConfig
 from bot.memberlock import MemberLocks
 from bot.starcheck import CheckAlreadyRunningError, StarChecker
 from bot.verification import register_verification
-from common.github_api import GitHubError, fetch_stargazer_logins
+from common.github_api import GitHubError, fetch_stargazer_count
 from common.storage import UserCollection
 from common.storage_errors import StorageError
 
@@ -140,11 +140,11 @@ def register_star_commands(client: Client, config: BotConfig, checker: StarCheck
         """Report how many accounts have starred the repository."""
         await ctx.defer(ephemeral=True)
         try:
-            # Deliberately uncached: the checker's ETag cache belongs to the
-            # cycle that holds its lock, and sharing it with a command that
-            # can run at any moment would mutate it from under a cycle.
-            stargazers = await asyncio.to_thread(
-                fetch_stargazer_logins,
+            # One request for the number GitHub keeps, rather than walking
+            # the listing: that took a request per hundred stargazers and
+            # stops at 40,000 of them, so it was both slow and short.
+            count = await asyncio.to_thread(
+                fetch_stargazer_count,
                 config.owner,
                 config.repo,
                 token=config.github_token,
@@ -155,7 +155,7 @@ def register_star_commands(client: Client, config: BotConfig, checker: StarCheck
             log.warning("starcount failed: %s", exc)
             await ctx.send(messages.GITHUB_UNREACHABLE.format(reason=exc), ephemeral=True)
             return
-        await ctx.send(messages.STARCOUNT.format(count=len(stargazers)), ephemeral=True)
+        await ctx.send(messages.STARCOUNT.format(count=count), ephemeral=True)
 
     @slash_command(
         name="checkstars",

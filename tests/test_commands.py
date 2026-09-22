@@ -110,8 +110,8 @@ def test_help_describes_the_custom_command_only_when_it_exists():
 
 def test_starcount_reports_how_many_accounts_have_starred(monkeypatch):
     monkeypatch.setattr(
-        "bot.commands.fetch_stargazer_logins",
-        lambda owner, repo, token=None: {"alice", "bob", "carol"},
+        "bot.commands.fetch_stargazer_count",
+        lambda owner, repo, token=None: 3,
     )
     ctx = call(star_client(FakeChecker()), "starcount")
 
@@ -125,9 +125,9 @@ def test_starcount_passes_the_configured_repository_and_token(monkeypatch):
 
     def record(owner, repo, token=None):
         seen.update(owner=owner, repo=repo, token=token)
-        return set()
+        return 0
 
-    monkeypatch.setattr("bot.commands.fetch_stargazer_logins", record)
+    monkeypatch.setattr("bot.commands.fetch_stargazer_count", record)
     call(
         star_client(FakeChecker(), owner="fuegovic", repo="Starguard", github_token="t"),
         "starcount",
@@ -141,7 +141,7 @@ def test_starcount_survives_a_rate_limited_github(monkeypatch, caplog):
     def refuse(owner, repo, token=None):
         raise GitHubError("GitHub API rate limit exceeded.")
 
-    monkeypatch.setattr("bot.commands.fetch_stargazer_logins", refuse)
+    monkeypatch.setattr("bot.commands.fetch_stargazer_count", refuse)
     with caplog.at_level("WARNING", logger="starguard.bot"):
         ctx = call(star_client(FakeChecker()), "starcount")
 

@@ -26,7 +26,13 @@ from bot.config import BotConfig
 from bot.memberlock import MemberLocks
 from bot.messages import SORRY
 from bot.roles import safe_remove_role
-from common.github_api import StargazerCache, StargazerListing, fetch_stargazer_listing
+from common.github_api import (
+    GitHubError,
+    StargazerCache,
+    StargazerListing,
+    account_stars_repo,
+    fetch_stargazer_listing,
+)
 from common.storage import (
     MongoDocument,
     UserCollection,
@@ -382,6 +388,11 @@ class StarChecker:
         if not discord_id:
             return None
 
+        # Absence from a listing GitHub cut short says nothing, so the
+        # account is asked about directly before anything is taken away.
+        if listing.truncated and await self._stars_beyond_listing(entry):
+            return None
+
         # The account _still_stars just ruled on, kept from the row as this
         # cycle read it. Everything below can wait on a lock, and the row
         # can change account while it waits, so the write has to say which
@@ -480,6 +491,32 @@ class StarChecker:
 
             return _display_name(entry, member)
 
+    async def _stars_beyond_listing(self, entry: MongoDocument) -> bool:
+        """Whether ``entry``'s account stars the repository, asked directly.
+
+        Only called for an account a truncated listing does not show. A
+        lookup that fails answers True, meaning "leave the role alone":
+        failing to find out is not finding out that somebody un-starred.
+        """
+        github_id = entry.get("github_id")
+        login = entry.get("github_username")
+        try:
+            return await asyncio.to_thread(
+                account_stars_repo,
+                self._config.owner,
+                self._config.repo,
+                github_id=github_id if isinstance(github_id, int) else None,
+                login=login if isinstance(login, str) else None,
+                token=self._config.github_token,
+            )
+        except GitHubError as exc:
+            log.warning(
+                "Could not look up the star for Discord ID %s directly; leaving the role: %s",
+                entry.get("discord_id"),
+                exc,
+            )
+            return True
+
     async def _record_unstarred(
         self, discord_id: object, observed_at: datetime, github_id: object
     ) -> bool:
@@ -576,6 +613,7 @@ class StarChecker:
             "pages_fetched": listing.pages_fetched,
             "pages_unchanged": listing.pages_unchanged,
             "rate_limit_remaining": listing.rate_limit_remaining,
+            "listing_truncated": listing.truncated,
             "duration_seconds": round(duration, 2),
         }
         log.info(
