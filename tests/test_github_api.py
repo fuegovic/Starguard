@@ -756,3 +756,42 @@ def test_a_missing_account_is_named_as_the_account_not_the_repository():
 def test_an_account_with_nothing_to_address_it_by_is_an_error():
     with pytest.raises(GitHubError):
         account_stars_repo("o", "r")
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (FakeResponse(status_code=401), "401"),
+        (UnparseableResponse(), "not JSON"),
+    ],
+)
+def test_a_failed_star_count_is_an_error(response, message):
+    with pytest.raises(GitHubError, match=message):
+        fetch_stargazer_count("o", "r", session=FakeSession([response]), sleep=no_sleep)
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        (FakeResponse(status_code=401), "401"),
+        (UnparseableResponse(), "not JSON"),
+    ],
+)
+def test_a_starred_list_that_cannot_be_read_is_an_error(response, message):
+    with pytest.raises(GitHubError, match=message):
+        account_stars_repo("o", "r", github_id=42, session=FakeSession([response]), sleep=no_sleep)
+
+
+def test_the_starred_list_walk_is_bounded(monkeypatch):
+    monkeypatch.setattr("common.github_api.MAX_PAGES", 3)
+
+    class LoopingSession:
+        """Always reports another page, to prove the walk is bounded."""
+
+        def get(self, url, headers=None, params=None, timeout=None):
+            return FakeResponse(
+                payload=starred("x/y"), links={"next": {"url": "https://api.github.com/same"}}
+            )
+
+    with pytest.raises(GitHubError, match="pagination loop"):
+        account_stars_repo("o", "r", github_id=42, session=LoopingSession())
